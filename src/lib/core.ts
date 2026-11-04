@@ -23,6 +23,9 @@ export type Access = 'read' | 'write'
 export type Agent = { id: string; name: string; created_at: number; wake?: string | null }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
 export type AgentAccess = { agent: Agent; access: Access | null }
+/** An MCP client on this computer that gild can set an agent up in. */
+export type ClientStatus = { id: string; name: string; installed: boolean; connected: boolean; wake: string }
+export type Connected = { token: string; endpoint: string; clients: ClientStatus[]; errors: string[] }
 export type AuditEntry = { agent: string; action: string; detail: string; ok: boolean; at: number }
 
 export const inApp = () => isTauri()
@@ -58,6 +61,9 @@ export const core = {
   rejectProposal: (channelId: string, id: string) => invoke<ChannelDocs>('reject_proposal', { channelId, id }),
   agents: () => invoke<Agent[]>('agents'),
   createAgent: (name: string) => invoke<NewAgent>('create_agent', { name }),
+  agentClients: (agentId: string) => invoke<ClientStatus[]>('agent_clients', { agentId }),
+  connectAgent: (agentId: string, clients: string[]) => invoke<Connected>('connect_agent', { agentId, clients }),
+  removeAgent: (agentId: string) => invoke<Agent[]>('remove_agent', { agentId }),
   setWake: (agentId: string, command: string) => invoke<Agent[]>('set_wake', { agentId, command }),
   channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
   setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),

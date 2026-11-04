@@ -1,3 +1,4 @@
+mod clients;
 mod export;
 mod mcp;
 mod records;
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
 use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Store, Workspace, DEMO_NAME};
 use tauri::{Manager, State};
@@ -154,10 +156,64 @@ fn set_wake(core: State<Core>, agent_id: String, command: String) -> Result<Vec<
     })
 }
 
+fn endpoint() -> String {
+    format!("http://127.0.0.1:{}/mcp", mcp::PORT)
+}
+
 #[tauri::command]
 fn create_agent(core: State<Core>, name: String) -> Result<NewAgent, String> {
     let (agent, token) = with(&core, |s| s.create_agent(&name))?;
-    Ok(NewAgent { agent, token, endpoint: format!("http://127.0.0.1:{}/mcp", mcp::PORT) })
+    Ok(NewAgent { agent, token, endpoint: endpoint() })
+}
+
+/// The MCP clients on this computer, and which already have the agent.
+#[tauri::command]
+async fn agent_clients(core: State<'_, Core>, agent_id: String) -> Result<Vec<ClientStatus>, String> {
+    let agent = with(&core, |s| s.agent(&agent_id))?;
+    Ok(Clients::for_this_computer().status(&agent.name).await)
+}
+
+#[derive(Serialize)]
+struct Connected {
+    /// The agent's new token, for a client gild can't set up itself.
+    token: String,
+    endpoint: String,
+    clients: Vec<ClientStatus>,
+    errors: Vec<String>,
+}
+
+/// Set the agent up in the chosen clients with a new token, and take it out
+/// of the others (their token stopped working).
+#[tauri::command]
+async fn connect_agent(core: State<'_, Core>, agent_id: String, clients: Vec<String>) -> Result<Connected, String> {
+    let token = with(&core, |s| s.new_token(&agent_id))?;
+    let agent = with(&core, |s| s.agent(&agent_id))?;
+    let (here, endpoint) = (Clients::for_this_computer(), endpoint());
+    let mut errors = Vec::new();
+    for kind in KINDS {
+        if clients.iter().any(|c| c == kind.id()) {
+            if let Err(e) = here.connect(kind, &agent.name, &endpoint, &token).await {
+                errors.push(e);
+            }
+        } else {
+            here.disconnect(kind, &agent.name).await;
+        }
+    }
+    Ok(Connected { token, endpoint, clients: here.status(&agent.name).await, errors })
+}
+
+/// Remove the agent from gild and from the clients gild set it up in.
+#[tauri::command]
+async fn remove_agent(core: State<'_, Core>, agent_id: String) -> Result<Vec<AgentInfo>, String> {
+    let agent = with(&core, |s| s.agent(&agent_id))?;
+    let here = Clients::for_this_computer();
+    for kind in KINDS {
+        here.disconnect(kind, &agent.name).await;
+    }
+    with(&core, |s| {
+        s.remove_agent(&agent_id, DEMO_NAME)?;
+        s.agent_infos()
+    })
 }
 
 #[tauri::command]
@@ -219,7 +275,7 @@ pub fn run() {
             store.seed_if_empty()?;
             let core = Arc::new(Mutex::new(store));
             mcp::serve(mcp::Gild { core: core.clone(), app: Some(app.handle().clone()) });
-            tauri::async_runtime::spawn(wake::run(core.clone(), Some(app.handle().clone()), format!("http://127.0.0.1:{}/mcp", mcp::PORT)));
+            tauri::async_runtime::spawn(wake::run(core.clone(), Some(app.handle().clone()), endpoint()));
             app.manage(Core(core));
             Ok(())
         })
@@ -245,6 +301,9 @@ pub fn run() {
             agents,
             set_wake,
             create_agent,
+            agent_clients,
+            connect_agent,
+            remove_agent,
             channel_access,
             set_access,
             activity,

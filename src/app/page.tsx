@@ -160,7 +160,7 @@ function WorkspaceView({ account, workspace, onBack }: { account: Account; works
           <span className="label">Members</span>
           <div className="member"><span className="dot" aria-hidden="true" />{account.name} (you)</div>
         </div>
-        <AgentsSidebar />
+        <AgentsSidebar channels={channels} current={current} />
         <ExportWorkspace workspace={workspace} />
         <div className="foot"><Who account={account} /></div>
       </nav>

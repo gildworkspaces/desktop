@@ -112,7 +112,7 @@ fn now_ms() -> i64 {
 }
 
 /// Unique and time-ordered: milliseconds, then a per-process counter.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:012x}{:06x}{:04x}", now_ms(), std::process::id() & 0xff_ffff, n & 0xffff)
@@ -834,6 +834,12 @@ pub struct AuditEntry {
     pub at: i64,
 }
 
+fn new_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| err("making a token", e))?;
+    Ok(format!("gild_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
 fn sha256_hex(s: &str) -> String {
     Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -855,9 +861,7 @@ impl Store {
         if self.agents()?.iter().any(|a| a.name == name) {
             return Err(format!("There is already an agent called {name}."));
         }
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|e| err("making a token", e))?;
-        let token = format!("gild_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let token = new_token()?;
         let agent = Agent { id: new_id(), name, created_at: now_ms() };
         self.run(
             "INSERT INTO agents (id, name, token_sha256, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -869,6 +873,38 @@ impl Store {
             ],
         )?;
         Ok((agent, token))
+    }
+
+    /// A new token for the agent; the old one stops working at once. gild
+    /// keeps only the new one's hash, so the caller hands it on (to the MCP
+    /// clients it sets up, or to the person) and forgets it.
+    pub fn new_token(&self, agent_id: &str) -> Result<String, String> {
+        self.agent(agent_id)?;
+        let token = new_token()?;
+        self.run(
+            "UPDATE agents SET token_sha256 = ?1 WHERE id = ?2",
+            &[Value::from_text(sha256_hex(&token)), Value::from_text(agent_id.to_string())],
+        )?;
+        Ok(token)
+    }
+
+    pub fn agent(&self, agent_id: &str) -> Result<Agent, String> {
+        self.agents()?.into_iter().find(|a| a.id == agent_id).ok_or_else(|| "That agent no longer exists.".to_string())
+    }
+
+    /// Remove an agent: its access to every channel (each removal a commit in
+    /// that channel's history), its wake command, its waiting mentions, and
+    /// its token. What it did stays in the channels' activity.
+    pub fn remove_agent(&self, agent_id: &str, author: &str) -> Result<Agent, String> {
+        let agent = self.agent(agent_id)?;
+        let id = Value::from_text(agent_id.to_string());
+        for row in self.query("SELECT channel_id FROM grants WHERE agent_id = ?1", std::slice::from_ref(&id))? {
+            self.set_access(&text(&row[0]), author, agent_id, None)?;
+        }
+        self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agents WHERE id = ?1", &[id])?;
+        Ok(agent)
     }
 
     pub fn agent_for_token(&self, token: &str) -> Result<Option<Agent>, String> {
@@ -1577,6 +1613,51 @@ mod tests {
 
         store.set_access(&general.id, DEMO_NAME, &agent.id, None).unwrap();
         assert!(store.require(&agent, &general.id, Access::Read).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_token_replaces_the_old_and_a_removed_agent_is_gone_everywhere() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let payroll = store.create_channel(&ws.id, "payroll", "").unwrap();
+        let (agent, old) = store.create_agent("ava").unwrap();
+        let (other, _) = store.create_agent("intake").unwrap();
+
+        let new = store.new_token(&agent.id).unwrap();
+        assert_ne!(new, old);
+        assert!(store.agent_for_token(&old).unwrap().is_none(), "the old token stops working");
+        assert_eq!(store.agent_for_token(&new).unwrap().unwrap().id, agent.id);
+
+        for c in [&general, &payroll] {
+            store.set_access(&c.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+            store.set_access(&c.id, DEMO_NAME, &other.id, Some(Access::Read)).unwrap();
+        }
+        store.set_wake(&agent.id, "claude -p").unwrap();
+        store.post(&general.id, DEMO_NAME, "person", "@ava hello").unwrap();
+        assert_eq!(store.pending_mentions(&agent.id).unwrap().len(), 1);
+
+        store.remove_agent(&agent.id, DEMO_NAME).unwrap();
+        assert!(store.agent_for_token(&new).unwrap().is_none());
+        assert_eq!(store.agents().unwrap().into_iter().map(|a| a.name).collect::<Vec<_>>(), ["intake"]);
+        assert!(store.agents_to_wake().unwrap().is_empty());
+        assert!(store.pending_mentions(&agent.id).unwrap().is_empty());
+        for c in [&general, &payroll] {
+            assert_eq!(store.access(&agent.id, &c.id).unwrap(), None);
+            assert_eq!(store.access(&other.id, &c.id).unwrap(), Some(Access::Read), "other agents keep theirs");
+            let log: Vec<String> = records::history(&dir, &c.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+            assert_eq!(log[0], "Remove ava's access");
+        }
+        // Its access doesn't come back from history when the index is rebuilt.
+        store.run("DELETE FROM indexed", &[]).unwrap();
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.access(&agent.id, &general.id).unwrap(), None);
+        // The name is free again.
+        store.create_agent("ava").unwrap();
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

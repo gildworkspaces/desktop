@@ -1,14 +1,13 @@
 'use client'
-// Agents: adding one (its token and how to connect it), what it may do in a
-// channel, and what agents did there.
+// Agents: adding one (gild sets it up in the AI tools on this computer),
+// what it may do in a channel, and what agents did there.
 import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type NewAgent } from '@/lib/core'
+import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected } from '@/lib/core'
 
-export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
+export function AgentsSidebar({ channels, current }: { channels: Channel[]; current: Channel | null }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [name, setName] = useState('')
-  const [created, setCreated] = useState<NewAgent | null>(null)
-  const [editing, setEditing] = useState<Agent | null>(null)
+  const [open, setOpen] = useState<{ agent: Agent; fresh: boolean } | null>(null)
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null)
   const [error, setError] = useState('')
 
@@ -23,18 +22,17 @@ export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
     try {
       const made = await core.createAgent(name)
       setAgents(a => [...a, made.agent])
-      setCreated(made)
+      setOpen({ agent: made.agent, fresh: true })
       setName('')
-      onAdded?.()
     } catch (err) { setError(errorText(err)) }
   }
 
   return (
     <div className="group">
       <span className="label">Agents</span>
-      {agents.length === 0 && <p className="note">No agents yet. Add one, then share channels with it.</p>}
+      {agents.length === 0 && <p className="note">No agents yet. Add one and gild sets it up.</p>}
       {agents.map(a => (
-        <button key={a.id} className="member agentrow" onClick={() => setEditing(a)} aria-label={`${a.name}: settings`}>
+        <button key={a.id} className="member agentrow" onClick={() => setOpen({ agent: a, fresh: false })} aria-label={`${a.name}: settings`}>
           <span className="dot agent" aria-hidden="true" />{a.name}
           {a.wake && <span className="badge" title="Wakes when mentioned">wakes on @</span>}
         </button>
@@ -45,67 +43,241 @@ export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
       </form>
       {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
       {status && !status.ok && <p className="error" style={{ padding: '0 10px' }}>{status.text}</p>}
-      {created && <ConnectAgent made={created} onClose={() => setCreated(null)} />}
-      {editing && <AgentSettings agent={editing} onSaved={list => { setAgents(list); setEditing(null) }} onClose={() => setEditing(null)} />}
+      {open && (
+        <AgentSetup
+          key={open.agent.id}
+          agent={open.agent}
+          fresh={open.fresh}
+          channels={channels}
+          current={current}
+          onAgents={setAgents}
+          onClose={() => setOpen(null)}
+        />
+      )}
     </div>
   )
 }
 
-function AgentSettings({ agent, onSaved, onClose }: { agent: Agent; onSaved: (agents: Agent[]) => void; onClose: () => void }) {
+const STEPS = [
+  { key: 'connect', label: 'Connect' },
+  { key: 'wake', label: 'When mentioned' },
+  { key: 'channels', label: 'Channels' },
+  { key: 'done', label: 'Done' },
+] as const
+type Step = (typeof STEPS)[number]['key']
+
+/** Setting an agent up, in order: gild adds it to the MCP clients on this
+ *  computer, sets what wakes it, shares channels with it, and says how to
+ *  use it. Opened again from the sidebar, the same steps are its settings. */
+function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
+  agent: Agent; fresh: boolean; channels: Channel[]; current: Channel | null; onAgents: (agents: Agent[]) => void; onClose: () => void
+}) {
+  const [step, setStep] = useState<Step>('connect')
+  const [clients, setClients] = useState<ClientStatus[] | null>(null)
+  const [chosen, setChosen] = useState<Set<string>>(new Set())
+  const [connected, setConnected] = useState<Connected | null>(null)
   const [command, setCommand] = useState(agent.wake ?? '')
+  const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [busy, setBusy] = useState(false)
+  const [removing, setRemoving] = useState(false)
   const [error, setError] = useState('')
-  const example = `claude -p --allowedTools mcp__gild-${agent.name}`
-  async function save(value: string) {
-    setError('')
-    try { onSaved(await core.setWake(agent.id, value)) } catch (err) { setError(errorText(err)) }
-  }
-  return (
-    <div className="modalback" role="dialog" aria-modal="true" aria-labelledby="agent-title">
-      <form className="modal" onSubmit={e => { e.preventDefault(); save(command) }}>
-        <h2 id="agent-title">{agent.name}</h2>
-        <span className="label">When mentioned, run</span>
-        <p className="soft">
-          When someone writes <span className="mention">@{agent.name}</span> in a channel shared with {agent.name}, gild runs this command on this computer, as you, with the
-          mention as the prompt on its input. The agent then reads the channel and answers there through gild's tools.
-        </p>
-        <label htmlFor="wake-command" className="sr">Command</label>
-        <input id="wake-command" className="field mono" placeholder={example} value={command} onChange={e => setCommand(e.target.value)} spellCheck={false} />
-        <p className="faint" style={{ fontSize: 12 }}>
-          For Claude Code: <code>{example}</code> (connect it first with the command from when you added it). One run at a time; a run has ten minutes. Runs and failures show in the channel's Activity.
-        </p>
-        {error && <p className="error">{error}</p>}
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="primary">Save</button>
-          {!command && <button type="button" className="ghost" onClick={() => setCommand(example)}>Use the Claude Code command</button>}
-          {agent.wake && <button type="button" className="ghost" onClick={() => save('')}>Stop waking it</button>}
-          <span className="spacer" />
-          <button type="button" className="ghost" onClick={onClose}>Cancel</button>
-        </div>
-      </form>
-    </div>
-  )
-}
 
-function ConnectAgent({ made, onClose }: { made: NewAgent; onClose: () => void }) {
-  // User scope: the tools are found from any folder, including the home
-  // folder gild runs an agent's wake command in.
-  const command = `claude mcp add --scope user --transport http gild-${made.agent.name} ${made.endpoint} --header "Authorization: Bearer ${made.token}"`
-  const [copied, setCopied] = useState('')
-  async function copy(what: string, text: string) {
-    try { await navigator.clipboard.writeText(text); setCopied(what) } catch { setCopied('') }
+  useEffect(() => {
+    core.agentClients(agent.id).then(cs => {
+      setClients(cs)
+      setChosen(new Set(cs.filter(c => c.installed).map(c => c.id)))
+    }, e => setError(errorText(e)))
+    Promise.all(channels.map(c => core.channelAccess(c.id).then(rows => [c.id, rows.find(r => r.agent.id === agent.id)?.access ?? null] as const)))
+      .then(pairs => {
+        const m = new Map(pairs)
+        setShared(m)
+        const on = new Set(pairs.filter(([, a]) => a).map(([id]) => id))
+        if (fresh && current) on.add(current.id)
+        setPicked(on)
+      }, e => setError(errorText(e)))
+  }, [agent.id, channels, current, fresh])
+
+  const usable = (cs: ClientStatus[] | null) => cs?.filter(c => c.connected) ?? []
+  const firstWake = (cs: ClientStatus[]) => usable(cs)[0]?.wake ?? ''
+
+  async function act(f: () => Promise<void>) {
+    setBusy(true)
+    setError('')
+    try { await f() } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
   }
+
+  const connect = () => act(async () => {
+    const made = await core.connectAgent(agent.id, [...chosen])
+    setConnected(made)
+    setClients(made.clients)
+    if (!agent.wake && !command) setCommand(firstWake(made.clients))
+    if (made.errors.length === 0 && chosen.size > 0) setStep('wake')
+  })
+
+  const saveWake = (value: string) => act(async () => {
+    onAgents(await core.setWake(agent.id, value))
+    setStep('channels')
+  })
+
+  const share = () => act(async () => {
+    for (const c of channels) {
+      const had = shared?.get(c.id) ?? null
+      const want = picked.has(c.id)
+      // Checked means it can answer there, which takes write access; a
+      // channel already shared read-only stays read-only.
+      if (want && !had) await core.setAccess(c.id, agent.id, 'write')
+      if (!want && had) await core.setAccess(c.id, agent.id, null)
+    }
+    setShared(new Map(channels.map(c => [c.id, picked.has(c.id) ? (shared?.get(c.id) ?? 'write') : null])))
+    setStep('done')
+  })
+
+  const remove = () => act(async () => {
+    onAgents(await core.removeAgent(agent.id))
+    onClose()
+  })
+
+  const where = channels.filter(c => picked.has(c.id))
+  const here = where.find(c => c.id === current?.id) ?? where[0]
+  const installed = clients?.filter(c => c.installed) ?? []
+  const index = STEPS.findIndex(s => s.key === step)
+
   return (
-    <div className="modalback" role="dialog" aria-modal="true" aria-labelledby="connect-title">
-      <div className="modal">
-        <h2 id="connect-title">Connect {made.agent.name}</h2>
-        <p className="soft">This is {made.agent.name}'s token. It's shown once: gild keeps only a fingerprint of it. {made.agent.name} sees no channels until you share them, from a channel's <b>Access</b> button.</p>
-        <span className="label">Token</span>
-        <div className="secret"><code>{made.token}</code><button className="ghost" onClick={() => copy('token', made.token)}>{copied === 'token' ? 'Copied' : 'Copy'}</button></div>
-        <span className="label">Claude Code</span>
-        <div className="secret"><code>{command}</code><button className="ghost" onClick={() => copy('command', command)}>{copied === 'command' ? 'Copied' : 'Copy'}</button></div>
-        <p className="faint" style={{ fontSize: 12 }}>Any MCP client works: Streamable HTTP at {made.endpoint}, header <code>Authorization: Bearer &lt;token&gt;</code>. The endpoint only answers on this computer.</p>
-        <p className="faint" style={{ fontSize: 12 }}>To have {made.agent.name} answer when someone writes @{made.agent.name}, click it in the sidebar and set what to run.</p>
-        <div><button className="primary" onClick={onClose}>Done</button></div>
+    <div className="modalback" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+      <div className="modal setup">
+        <h2 id="setup-title">{fresh ? `Set up ${agent.name}` : agent.name}</h2>
+        <ol className="steps" aria-label="Steps">
+          {STEPS.map((s, i) => (
+            <li key={s.key} className={s.key === step ? 'on' : i < index ? 'past' : ''}>
+              <button type="button" className="link" onClick={() => setStep(s.key)} disabled={fresh && i > index} aria-current={s.key === step ? 'step' : undefined}>
+                <span className="num">{i + 1}</span>{s.label}
+              </button>
+            </li>
+          ))}
+        </ol>
+
+        {step === 'connect' && (
+          <>
+            <p className="soft">gild adds {agent.name} to the AI tools on this computer, so they can work in the channels you share. Nothing to copy or paste.</p>
+            {!clients && <p className="faint">Looking for AI tools on this computer…</p>}
+            {clients && (
+              <div className="clients">
+                {clients.map(c => (
+                  <label key={c.id} className={c.installed ? 'clientrow' : 'clientrow off'}>
+                    <input
+                      type="checkbox"
+                      disabled={!c.installed || busy}
+                      checked={chosen.has(c.id)}
+                      onChange={e => setChosen(s => { const n = new Set(s); if (e.target.checked) n.add(c.id); else n.delete(c.id); return n })}
+                    />
+                    <span className="clientname">{c.name}</span>
+                    <span className="faint">{!c.installed ? 'not on this computer' : c.connected ? `has ${agent.name}` : 'found'}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {clients && installed.length === 0 && (
+              <p className="faint" style={{ fontSize: 13 }}>No AI tool gild can set up was found. Install Claude Code or Codex and open this again, or connect another tool by hand below.</p>
+            )}
+            {connected && connected.errors.map(e => <p key={e} className="error">{e}</p>)}
+            {connected && connected.errors.length === 0 && usable(connected.clients).length > 0 && (
+              <p className="ok">{agent.name} is set up in {usable(connected.clients).map(c => c.name).join(' and ')}.</p>
+            )}
+            <div className="row">
+              {installed.length > 0 && (
+                <button className="primary" onClick={connect} disabled={busy || chosen.size === 0}>
+                  {busy ? 'Setting up…' : usable(clients).length > 0 ? 'Set up again' : `Set up ${agent.name}`}
+                </button>
+              )}
+              {(usable(clients).length > 0 || connected) && <button className="ghost" onClick={() => setStep('wake')}>Next</button>}
+            </div>
+            <details className="manual">
+              <summary>Another MCP client</summary>
+              {connected ? (
+                <>
+                  <p className="faint" style={{ fontSize: 12 }}>Streamable HTTP at <code>{connected.endpoint}</code>, header <code>Authorization: Bearer &lt;token&gt;</code>. The endpoint only answers on this computer. This token replaces any earlier one.</p>
+                  <div className="secret"><code>{connected.token}</code></div>
+                </>
+              ) : (
+                <>
+                  <p className="faint" style={{ fontSize: 12 }}>gild makes {agent.name} a new token for it. Tools gild set up get the new token too.</p>
+                  <div><button className="ghost" onClick={() => act(async () => { const made = await core.connectAgent(agent.id, usable(clients).map(c => c.id)); setConnected(made); setClients(made.clients) })} disabled={busy}>Show a token</button></div>
+                </>
+              )}
+            </details>
+          </>
+        )}
+
+        {step === 'wake' && (
+          <form onSubmit={e => { e.preventDefault(); saveWake(command) }} className="stepform">
+            <p className="soft">When someone writes <span className="mention">@{agent.name}</span>, gild runs this on this computer, with the message as its input. You don't keep anything open.</p>
+            <label htmlFor="wake-command" className="sr">Command</label>
+            <input id="wake-command" className="field mono" value={command} onChange={e => setCommand(e.target.value)} spellCheck={false} placeholder="claude -p --allowedTools mcp__gild-…" />
+            {clients && usable(clients).length > 1 && (
+              <p className="faint" style={{ fontSize: 12 }}>
+                Use {usable(clients).map((c, i) => <span key={c.id}>{i > 0 && ' or '}<button type="button" className="link" onClick={() => setCommand(c.wake)}>{c.name}</button></span>)}
+              </p>
+            )}
+            <p className="faint" style={{ fontSize: 12 }}>One run at a time, up to ten minutes. Runs and failures show in the channel’s Activity.</p>
+            <div className="row">
+              <button className="primary" disabled={busy || !command.trim()}>Save</button>
+              <button type="button" className="ghost" onClick={() => saveWake('')} disabled={busy}>Don’t wake it</button>
+            </div>
+          </form>
+        )}
+
+        {step === 'channels' && (
+          <>
+            <p className="soft">Which channels can {agent.name} work in? It sees nothing else, and every change here is saved in the channel’s history.</p>
+            <div className="clients">
+              {channels.map(c => (
+                <label key={c.id} className="clientrow">
+                  <input type="checkbox" checked={picked.has(c.id)} disabled={!shared || busy}
+                    onChange={e => setPicked(s => { const n = new Set(s); if (e.target.checked) n.add(c.id); else n.delete(c.id); return n })} />
+                  <span className="clientname">#{c.name}</span>
+                  {shared?.get(c.id) === 'read' && <span className="faint">can read only</span>}
+                </label>
+              ))}
+            </div>
+            <p className="faint" style={{ fontSize: 12 }}>A checked channel lets {agent.name} read, answer and change it. For read-only, use the channel’s Access button.</p>
+            <div className="row"><button className="primary" onClick={share} disabled={busy || !shared}>Save</button></div>
+          </>
+        )}
+
+        {step === 'done' && (
+          <>
+            {here && command ? (
+              <p className="big">Now write <span className="mention">@{agent.name}</span> in #{here.name} and you’re set.</p>
+            ) : (
+              <p className="soft">
+                {!command ? `${agent.name} won't wake when mentioned until it has a command (step 2).` : ''}
+                {!here ? ` ${agent.name} can't see any channel yet (step 3).` : ''}
+              </p>
+            )}
+            <div className="row"><button className="primary" onClick={onClose}>Done</button></div>
+          </>
+        )}
+
+        {error && <p className="error">{error}</p>}
+        {!fresh && step !== 'done' && (
+          <div className="row removebar">
+            {removing ? (
+              <>
+                <span className="soft" style={{ fontSize: 13 }}>Remove {agent.name}? It loses every channel and is taken out of {installed.map(c => c.name).join(' and ') || 'gild'}.</span>
+                <button className="danger" onClick={remove} disabled={busy}>Remove</button>
+                <button className="ghost" onClick={() => setRemoving(false)}>Keep</button>
+              </>
+            ) : (
+              <>
+                <button className="ghost" onClick={() => setRemoving(true)}>Remove agent</button>
+                <span className="spacer" />
+                <button className="ghost" onClick={onClose}>Close</button>
+              </>
+            )}
+          </div>
+        )}
+        {fresh && step !== 'done' && <div className="row"><span className="spacer" /><button className="ghost" onClick={onClose}>Finish later</button></div>}
       </div>
     </div>
   )
