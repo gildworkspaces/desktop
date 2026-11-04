@@ -41,8 +41,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: gild desktop ${{ github.ref_name }}
           releaseBody: |
-            Install gild into your own Cloudflare account with one API token, then work in it.
-            macOS: open the .dmg and drag gild to Applications. The app is signed and notarized by Apple.
+            gild: the open workspace where people and agents work together.
+            macOS: open the .dmg and drag gild to Applications.
             Linux: the .AppImage or .deb.
           releaseDraft: false
           args: --target ${{ matrix.target }}

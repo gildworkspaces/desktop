@@ -5,49 +5,41 @@ on:
   pull_request:
 permissions:
   contents: read
+# Addis APS 11: CI runs in fresh mirab VMs.
 jobs:
   web:
-    runs-on: ubuntu-latest
-    environment: public-ci
+    runs-on: mirab-linux-arm64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: npm ci
-      - run: npm test
       - run: npm run check
       - run: npm run build
   native:
-    runs-on: ubuntu-latest
-    environment: public-ci
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
+    runs-on: mirab-linux-arm64
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          components: clippy
       - uses: actions/setup-node@v4
         with:
           node-version: 24
       - run: npm ci
       - run: npm run build
-      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
   app:
-    # The real app on Linux, through tauri-driver: Tauri's HTTP client, the
-    # Rust commands and the bundled template (tests/e2e/smoke.mjs).
-    runs-on: ubuntu-22.04
-    environment: public-ci
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
+    # The real app on Linux, through tauri-driver: the window, the Rust
+    # commands and the database together (tests/e2e/smoke.mjs).
+    runs-on: mirab-linux-arm64
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf webkit2gtk-driver xvfb
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: actions/setup-node@v4
         with:
           node-version: 24

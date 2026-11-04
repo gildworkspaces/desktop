@@ -1,35 +1,32 @@
 {
   "name": "gild-desktop",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.2.0",
   "license": "Apache-2.0",
+  "type": "module",
   "scripts": {
-    "predev": "node scripts/template.mjs",
-    "dev": "next dev --port 1430",
-    "prebuild": "node scripts/template.mjs",
-    "build": "next build",
+    "dev": "vite dev --port 1430 --strictPort",
+    "build": "vite build",
     "check": "tsc --noEmit",
-    "tauri": "tauri",
-    "test": "node --test tests/*.test.mjs"
+    "tauri": "tauri"
   },
   "dependencies": {
-    "@gildforge/kit": "0.7.11",
     "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-http": "^2.5.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
-    "@tauri-apps/plugin-websocket": "^2.4.0",
-    "next": "16.3.3",
-    "react": "19.2.0",
-    "react-dom": "19.2.0"
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-server-dom-webpack": "19.3.1",
+    "vinext": "1.4.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "@types/node": "^24",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "playwright": "1.63.0",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "@vitejs/plugin-rsc": "0.5.38",
     "selenium-webdriver": "^4.51.0",
-    "typescript": "^5",
-    "ws": "^8.18.3"
+    "typescript": "5.9.3",
+    "vite": "8.3.0"
   }
 }

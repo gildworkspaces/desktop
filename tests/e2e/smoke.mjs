@@ -1,7 +1,6 @@
 // The built app, driven through tauri-driver (Linux CI, under Xvfb): the
-// parts a browser run cannot reach. Tauri's HTTP client reaches Cloudflare
-// without CORS, the Rust commands answer, and the app carries the template
-// it installs.
+// window opens on the seeded demo workspace, and what you type reaches the
+// Rust core and comes back from its database.
 //   tauri-driver &   node tests/e2e/smoke.mjs <path to the built binary>
 import { Builder, By, until } from 'selenium-webdriver'
 import assert from 'node:assert/strict'
@@ -12,32 +11,36 @@ const driver = await new Builder()
   .withCapabilities({ browserName: 'wry', 'tauri:options': { application } })
   .build()
 try {
-  await driver.wait(until.elementLocated(By.css('#token')), 30000)
+  // First run: the demo workspace is there, signed in as the demo account.
+  const card = await driver.wait(until.elementLocated(By.css('button.card')), 30000)
+  assert.match(await card.getText(), /Demo workspace/)
+  assert.match(await driver.findElement(By.css('.who')).getText(), /demo account/)
 
-  // A token Cloudflare refuses: the answer has to come back from
-  // api.cloudflare.com through the HTTP plugin and be shown.
-  await driver.findElement(By.css('#token')).sendKeys('not-a-real-token')
-  await driver.findElement(By.css('form button.primary')).click()
-  const refused = await driver.wait(until.elementLocated(By.css('.error')), 30000)
-  const text = await refused.getText()
-  assert.match(text, /Cloudflare did not accept this token/, text)
-  assert.doesNotMatch(text, /Failed to fetch|NetworkError|not allowed|scope/i, text)
-  console.log('http plugin:', text)
+  // Open it: #general holds the welcome message from the seed.
+  await card.click()
+  await driver.wait(until.elementLocated(By.css('.msg')), 10000)
+  assert.match(await driver.findElement(By.css('.list')).getText(), /Welcome to gild/)
 
-  // The Rust side answers, and the template the installer uploads is in the app.
-  const result = await driver.executeAsyncScript(`
+  // A new channel and a message, through the window like a person would.
+  await driver.findElement(By.css('#new-channel')).sendKeys('Student Intake\n')
+  await driver.wait(until.elementLocated(By.xpath("//h2[contains(., 'student-intake')]")), 10000)
+  await driver.findElement(By.css('#composer')).sendKeys('Northside sent three more students.\n')
+  await driver.wait(until.elementLocated(By.xpath("//span[@class='text' and contains(., 'Northside sent three more students.')]")), 10000)
+
+  // The core has it: read back through the command, not the screen.
+  const saved = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
-    Promise.all([
-      window.__TAURI_INTERNALS__.invoke('identity'),
-      window.__TAURI_INTERNALS__.invoke('instance_read'),
-      fetch('/template/worker/manifest.json').then(r => r.json()),
-    ]).then(([identity, instance, manifest]) => done({ identity, instance, modules: manifest.modules.map(m => m.name) }), e => done({ error: String(e) }))
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    call('workspaces').then(async ws => {
+      const chans = await call('channels', { workspaceId: ws[0].id })
+      const intake = chans.find(c => c.name === 'student-intake')
+      done({ channels: chans.map(c => c.name), messages: (await call('messages', { channelId: intake.id })).map(m => m.author + ': ' + m.body) })
+    }, e => done({ error: String(e) }))
   `)
-  assert.equal(result.error, undefined, result.error)
-  assert.match(result.identity.key_path, /\.config\/gild\/identity\.json$/)
-  assert.equal(result.instance, null)
-  assert.ok(result.modules.includes('worker.js'), JSON.stringify(result.modules))
-  console.log('commands + template:', JSON.stringify({ key_path: result.identity.key_path, modules: result.modules }))
+  assert.equal(saved.error, undefined, saved.error)
+  assert.deepEqual(saved.channels, ['general', 'student-intake'])
+  assert.deepEqual(saved.messages, ['Demo: Northside sent three more students.'])
+  console.log('saved:', JSON.stringify(saved))
 } finally {
   await driver.quit()
 }
