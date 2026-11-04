@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS agent_context (agent_id TEXT PRIMARY KEY, messages IN
 CREATE TABLE IF NOT EXISTS thread_replies (message_id TEXT PRIMARY KEY, root_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS held_mentions (mention_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, root TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -110,9 +112,26 @@ fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
-/// Agent messages in a row, with no person writing, after which gild stops
-/// waking agents there: two agents can't keep each other going.
-pub const MAX_AGENT_RUN: usize = 5;
+/// Agent messages in a row, with no person or coordinator writing, after
+/// which gild holds agents there unless Settings › Agents says otherwise:
+/// agents can work through long exchanges, but can't keep each other going
+/// for ever.
+pub const DEFAULT_AGENT_LIMIT: i64 = 100;
+pub const MAX_AGENT_LIMIT: i64 = 10_000;
+
+/// Settings › Agents › Runaway loops.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LoopRules {
+    /// Agent messages in a row before gild holds agents.
+    pub limit: i64,
+    /// @mention the channel's coordinators, so they can decide.
+    pub ask_coordinator: bool,
+    /// A desktop notification for the person.
+    pub notify_me: bool,
+}
+
+/// Called when agents are held and the person wants to be notified.
+pub type HoldHook = Box<dyn Fn(&str) + Send + Sync>;
 
 /// A channel's view and records, as the index has them.
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -129,6 +148,7 @@ pub struct Store {
     // Held so the database outlives every statement on `conn`.
     _db: Arc<Database>,
     signals: Signals,
+    on_hold: Option<HoldHook>,
 }
 
 /// Rung when an agent is mentioned: `waiters` wakes every agent blocked in
@@ -200,7 +220,7 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default() };
+        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
@@ -1009,7 +1029,9 @@ impl Store {
         }
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM held_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agents WHERE id = ?1", &[id])?;
         Ok(agent)
@@ -1267,6 +1289,10 @@ pub struct AgentInfo {
     pub wake: Option<String>,
     /// How many of the channel's recent messages come with a mention.
     pub context: i64,
+    /// A coordinator directs other agents: its messages count like a
+    /// person's (they reset the run of agent messages and reach agents in
+    /// its threads untagged).
+    pub coordinator: bool,
 }
 
 /// Recent messages sent with a mention, unless the agent's settings say
@@ -1365,6 +1391,29 @@ impl Store {
         self.profile()
     }
 
+    /// How a desktop notification is shown, when the person wants one.
+    pub fn on_hold(&mut self, hook: HoldHook) {
+        self.on_hold = Some(hook);
+    }
+
+    pub fn loop_rules(&self) -> Result<LoopRules, String> {
+        Ok(LoopRules {
+            limit: self.setting("agent_limit")?.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_AGENT_LIMIT),
+            ask_coordinator: self.setting("ask_coordinator")?.map(|v| v == "1").unwrap_or(true),
+            notify_me: self.setting("notify_me")?.map(|v| v == "1").unwrap_or(false),
+        })
+    }
+
+    pub fn set_loop_rules(&self, rules: &LoopRules) -> Result<LoopRules, String> {
+        if !(1..=MAX_AGENT_LIMIT).contains(&rules.limit) {
+            return Err(format!("The limit is between 1 and {MAX_AGENT_LIMIT} messages."));
+        }
+        self.set_setting("agent_limit", Some(&rules.limit.to_string()))?;
+        self.set_setting("ask_coordinator", Some(if rules.ask_coordinator { "1" } else { "0" }))?;
+        self.set_setting("notify_me", Some(if rules.notify_me { "1" } else { "0" }))?;
+        self.loop_rules()
+    }
+
     /// What rings when an agent is mentioned.
     pub fn signals(&self) -> Signals {
         self.signals.clone()
@@ -1372,13 +1421,15 @@ impl Store {
 
     /// Note who a message mentions. An agent the channel isn't shared with
     /// isn't told, and gild says so in the channel.
-    /// Tell agents about a message: those it @mentions, and, for a person's
-    /// reply in a thread, the agents already in that thread (they posted
-    /// there or were mentioned there), untagged: they answer if it helps.
-    /// After MAX_AGENT_RUN agent messages in a row there, no agent is told
-    /// until a person writes.
+    /// Tell agents about a message: those it @mentions, and, for a reply in
+    /// a thread by a person or a coordinator, the agents already in that
+    /// thread (they posted there or were mentioned there), untagged: they
+    /// answer if it helps. After the limit in Settings › Agents (agent messages in a row there),
+    /// no agent is told until a person or a coordinator writes.
     fn record_mentions(&self, message: &Message) -> Result<(), String> {
         let agents = self.agents()?;
+        let coordinators = self.coordinator_names()?;
+        let directs = self.directs(message, &coordinators);
         let mut tagged: Vec<&Agent> = Vec::new();
         let mut unshared = Vec::new();
         for name in mentioned_names(&message.body) {
@@ -1393,7 +1444,7 @@ impl Store {
             tagged.push(agent);
         }
         let mut quiet: Vec<&Agent> = Vec::new();
-        if let (Some(root), "person") = (&message.thread, message.kind.as_str()) {
+        if let (Some(root), true) = (&message.thread, directs) {
             let thread = self.thread(&message.channel_id, root)?;
             let mentioned: Vec<String> = self
                 .query(
@@ -1405,21 +1456,29 @@ impl Store {
                 .map(|r| text(&r[0]))
                 .collect();
             for agent in &agents {
-                let in_thread = mentioned.contains(&agent.id) || thread.iter().any(|m| m.kind == "agent" && m.author == agent.name);
-                if in_thread && !tagged.iter().any(|t| t.id == agent.id) && self.access(&agent.id, &message.channel_id)?.is_some() {
+                let author = message.kind == "agent" && message.author == agent.name;
+                if author || tagged.iter().any(|t| t.id == agent.id) || self.access(&agent.id, &message.channel_id)?.is_none() {
+                    continue;
+                }
+                // A reply in the thread of an agent's own message is said
+                // to it, as if it were @mentioned.
+                if thread.first().is_some_and(|m| m.kind == "agent" && m.author == agent.name) {
+                    tagged.push(agent);
+                } else if mentioned.contains(&agent.id) || thread.iter().any(|m| m.kind == "agent" && m.author == agent.name) {
                     quiet.push(agent);
                 }
             }
         }
-        if !tagged.is_empty() && message.kind == "agent" && self.agent_run(message)? >= MAX_AGENT_RUN {
-            self.post_in(
-                &message.channel_id,
-                message.thread.as_deref(),
-                "gild",
-                "system",
-                &format!("Agents have written {MAX_AGENT_RUN} messages in a row here, so gild isn't waking {} until someone replies.", tagged.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" or ")),
-            )?;
-            tagged.clear();
+        // Where this message is: its thread, or the channel ("").
+        let root = message.thread.clone().unwrap_or_default();
+        let place = [Value::from_text(message.channel_id.clone()), Value::from_text(root.clone())];
+        // At the limit, an agent's mentions are held, not dropped, until a
+        // person or a coordinator says to go on.
+        let rules = self.loop_rules()?;
+        let hold = message.kind == "agent" && !directs && !tagged.is_empty() && self.agent_run(message, &coordinators)? as i64 >= rules.limit;
+        let already_held = hold && !self.query("SELECT 1 FROM held_mentions WHERE channel_id = ?1 AND root = ?2", &place)?.is_empty();
+        if directs {
+            self.run("DELETE FROM held_mentions WHERE channel_id = ?1 AND root = ?2", &place)?;
         }
         for (agent, is_quiet) in tagged.iter().map(|a| (a, false)).chain(quiet.iter().map(|a| (a, true))) {
             let id = new_id();
@@ -1435,6 +1494,32 @@ impl Store {
             )?;
             if is_quiet {
                 self.run("INSERT INTO quiet_mentions (mention_id) VALUES (?1)", &[Value::from_text(id)])?;
+            } else if hold {
+                self.run("INSERT INTO held_mentions (mention_id, channel_id, root) VALUES (?1, ?2, ?3)", &[Value::from_text(id), place[0].clone(), place[1].clone()])?;
+            }
+        }
+        if hold && !already_held {
+            // Ask: the coordinators who can see this channel are tagged, so
+            // they're woken to decide; people see it and a Continue button.
+            let mut asked = Vec::new();
+            for name in coordinators.iter().filter(|_| rules.ask_coordinator) {
+                if let Some(a) = agents.iter().find(|a| &a.name == name) {
+                    if self.access(&a.id, &message.channel_id)?.is_some() {
+                        asked.push(format!("@{name}"));
+                    }
+                }
+            }
+            let who = if asked.is_empty() { "A person".to_string() } else { format!("A person or {}", asked.join(" or ")) };
+            let note = format!(
+                "Agents have written {} messages in a row here, so gild is holding {} for now. {who} can let them continue by replying here.",
+                rules.limit,
+                tagged.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" and ")
+            );
+            self.post_in(&message.channel_id, message.thread.as_deref(), "gild", "system", &note)?;
+            if rules.notify_me {
+                if let Some(hook) = &self.on_hold {
+                    hook(&note);
+                }
             }
         }
         for name in unshared {
@@ -1446,21 +1531,37 @@ impl Store {
                 &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} from Access."),
             )?;
         }
-        if !tagged.is_empty() || !quiet.is_empty() {
+        if !tagged.is_empty() || !quiet.is_empty() || directs {
             self.signals.waiters.notify_waiters();
             self.signals.runner.notify_one();
         }
         Ok(())
     }
 
+    /// How many agents' mentions are held in a place (a thread, or the
+    /// channel with `thread` None) after a long run of agent messages.
+    pub fn held(&self, channel_id: &str, thread: Option<&str>) -> Result<i64, String> {
+        let rows = self.query(
+            "SELECT COUNT(*) FROM held_mentions WHERE channel_id = ?1 AND root = ?2",
+            &[Value::from_text(channel_id.to_string()), Value::from_text(thread.unwrap_or("").to_string())],
+        )?;
+        Ok(rows.first().map(|r| int(&r[0])).unwrap_or(0))
+    }
+
+    /// A person lets held agents continue: said in the place, which releases them.
+    pub fn let_agents_continue(&self, channel_id: &str, thread: Option<&str>, author: &str) -> Result<Message, String> {
+        self.post_in(channel_id, thread, author, "person", "Go ahead, keep going.")
+    }
+
     /// Agent messages in a row up to and including `message`, in its thread
-    /// (or the channel, outside threads). gild's own notes don't count.
-    fn agent_run(&self, message: &Message) -> Result<usize, String> {
+    /// (or the channel, outside threads), since a person or a coordinator
+    /// last wrote. gild's own notes don't count.
+    fn agent_run(&self, message: &Message, coordinators: &[String]) -> Result<usize, String> {
         let here: Vec<Message> = match &message.thread {
             Some(root) => self.thread(&message.channel_id, root)?,
             None => self.messages(&message.channel_id)?,
         };
-        Ok(here.iter().rev().filter(|m| m.kind != "system").take_while(|m| m.kind == "agent").count())
+        Ok(here.iter().rev().filter(|m| m.kind != "system").take_while(|m| !self.directs(m, coordinators)).count())
     }
 
     /// An agent's mentions that haven't reached it yet, oldest first.
@@ -1469,7 +1570,8 @@ impl Store {
             "SELECT n.id, n.agent_id, n.channel_id, c.name, w.name, m.author, m.body, m.id, m.created_at, t.root_id, q.mention_id
              FROM mentions n JOIN messages m ON m.id = n.message_id JOIN channels c ON c.id = n.channel_id JOIN workspaces w ON w.id = c.workspace_id
              LEFT JOIN thread_replies t ON t.message_id = m.id LEFT JOIN quiet_mentions q ON q.mention_id = n.id
-             WHERE n.agent_id = ?1 AND n.delivered_at = 0 ORDER BY n.created_at, n.id",
+             WHERE n.agent_id = ?1 AND n.delivered_at = 0 AND NOT EXISTS (SELECT 1 FROM held_mentions h WHERE h.mention_id = n.id)
+             ORDER BY n.created_at, n.id",
             &[Value::from_text(agent_id.to_string())],
         )?;
         Ok(rows
@@ -1510,7 +1612,8 @@ impl Store {
     pub fn agents_to_wake(&self) -> Result<Vec<(Agent, String)>, String> {
         let rows = self.query(
             "SELECT a.id, a.name, a.created_at, k.command FROM agents a JOIN agent_wake k ON k.agent_id = a.id
-             WHERE EXISTS (SELECT 1 FROM mentions n WHERE n.agent_id = a.id AND n.delivered_at = 0) ORDER BY a.created_at",
+             WHERE EXISTS (SELECT 1 FROM mentions n WHERE n.agent_id = a.id AND n.delivered_at = 0
+               AND NOT EXISTS (SELECT 1 FROM held_mentions h WHERE h.mention_id = n.id)) ORDER BY a.created_at",
             &[],
         )?;
         Ok(rows.iter().map(|r| (Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }, text(&r[3]))).collect())
@@ -1518,8 +1621,8 @@ impl Store {
 
     pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command, c.messages FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
-             LEFT JOIN agent_context c ON c.agent_id = a.id ORDER BY a.created_at",
+            "SELECT a.id, a.name, a.created_at, k.command, c.messages, r.agent_id FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
+             LEFT JOIN agent_context c ON c.agent_id = a.id LEFT JOIN coordinators r ON r.agent_id = a.id ORDER BY a.created_at",
             &[],
         )?;
         Ok(rows
@@ -1534,8 +1637,31 @@ impl Store {
                     Value::Null => DEFAULT_CONTEXT,
                     v => int(v),
                 },
+                coordinator: !matches!(r[5], Value::Null),
             })
             .collect())
+    }
+
+    /// Make an agent a coordinator, or a regular agent again. Only the
+    /// window calls this.
+    pub fn set_coordinator(&self, agent_id: &str, on: bool) -> Result<(), String> {
+        self.agent(agent_id)?;
+        let id = Value::from_text(agent_id.to_string());
+        self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        if on {
+            self.run("INSERT INTO coordinators (agent_id) VALUES (?1)", &[id])?;
+        }
+        Ok(())
+    }
+
+    fn coordinator_names(&self) -> Result<Vec<String>, String> {
+        Ok(self.query("SELECT a.name FROM coordinators r JOIN agents a ON a.id = r.agent_id", &[])?.iter().map(|r| text(&r[0])).collect())
+    }
+
+    /// Whether a message speaks with a person's weight: a person's, or a
+    /// coordinator's.
+    fn directs(&self, m: &Message, coordinators: &[String]) -> bool {
+        m.kind == "person" || (m.kind == "agent" && coordinators.contains(&m.author))
     }
 
     /// How many recent messages come with a mention (0: only the mention).
@@ -1600,6 +1726,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX_AGENT_RUN: usize = DEFAULT_AGENT_LIMIT as usize;
 
     fn temp() -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("gild-store-{}", new_id()));
@@ -2070,39 +2198,77 @@ mod tests {
     }
 
     #[test]
-    fn two_agents_can_t_keep_each_other_going() {
+    fn two_agents_can_t_keep_each_other_going_but_a_coordinator_resets_them() {
         let (dir, file) = temp();
         let store = Store::open(&file).unwrap();
         let ws = store.create_workspace("W").unwrap();
         let general = store.channels(&ws.id).unwrap()[0].clone();
         let (ava, _) = store.create_agent("ava").unwrap();
         let (bob, _) = store.create_agent("bob").unwrap();
-        for a in [&ava, &bob] {
+        let (lead, _) = store.create_agent("lead").unwrap();
+        for a in [&ava, &bob, &lead] {
             store.set_access(&general.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
         }
         let root = store.post(&general.id, DEMO_NAME, "person", "@ava @bob sort this out between you").unwrap();
         store.take_mentions(&ava).unwrap();
         store.take_mentions(&bob).unwrap();
-        // They tag each other, back and forth.
-        let mut told = Vec::new();
-        for i in 0..8 {
-            let (from, to) = if i % 2 == 0 { ("ava", &bob) } else { ("bob", &ava) };
-            let other = if i % 2 == 0 { "bob" } else { "ava" };
-            store.post_in(&general.id, Some(&root.id), from, "agent", &format!("@{other} over to you ({i})")).unwrap();
-            told.push(!store.take_mentions(to).unwrap().is_empty());
-        }
-        assert_eq!(told, [true, true, true, true, false, false, false, false], "the fifth agent message in a row wakes no one");
-        let notes = store.thread(&general.id, &root.id).unwrap().into_iter().filter(|m| m.kind == "system").count();
-        assert!(notes >= 1, "gild says why");
-        // A person writing starts it again.
+        // They tag each other, back and forth, MAX_AGENT_RUN + 3 times.
+        let volley = |store: &Store, n: usize| -> Vec<bool> {
+            (0..n)
+                .map(|i| {
+                    let (from, to, other) = if i % 2 == 0 { ("ava", &bob, "bob") } else { ("bob", &ava, "ava") };
+                    store.post_in(&general.id, Some(&root.id), from, "agent", &format!("@{other} over to you ({i})")).unwrap();
+                    !store.take_mentions(to).unwrap().is_empty()
+                })
+                .collect()
+        };
+        let told = volley(&store, MAX_AGENT_RUN + 3);
+        let expected: Vec<bool> = (0..MAX_AGENT_RUN + 3).map(|i| i + 1 < MAX_AGENT_RUN).collect();
+        assert_eq!(told, expected, "the {MAX_AGENT_RUN}th agent message in a row wakes no one");
+        let notes: Vec<String> = store.thread(&general.id, &root.id).unwrap().into_iter().filter(|m| m.kind == "system").map(|m| m.body).collect();
+        assert_eq!(notes.len(), 1, "gild asks once, not on every held message: {notes:?}");
+        assert!(notes[0].contains("holding") && notes[0].starts_with(&format!("Agents have written {MAX_AGENT_RUN}")), "{}", notes[0]);
+        // Nothing was dropped: the mentions past the limit wait.
+        assert_eq!(store.held(&general.id, Some(&root.id)).unwrap(), 4);
+        assert_eq!(store.held(&general.id, None).unwrap(), 0, "only in that thread");
+        // A person writing lets them continue: the held mentions are delivered.
         store.post_in(&general.id, Some(&root.id), DEMO_NAME, "person", "@ava one more thing").unwrap();
+        assert_eq!(store.held(&general.id, Some(&root.id)).unwrap(), 0);
         let m = store.take_mentions(&ava).unwrap();
-        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("@ava one more thing", true)]);
-        // bob is in the thread too, so it hears the person, untagged.
+        let tagged: Vec<&str> = m.iter().filter(|m| m.tagged).map(|m| m.text.as_str()).collect();
+        assert_eq!(tagged.last(), Some(&"@ava one more thing"));
+        assert!(tagged.len() >= 2, "the held ones came too: {tagged:?}");
+        // bob is in the thread too, so it hears the person, untagged (and
+        // gets its held mentions).
         let m = store.take_mentions(&bob).unwrap();
-        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("@ava one more thing", false)]);
+        assert!(m.iter().any(|m| m.text == "@ava one more thing" && !m.tagged), "{m:?}");
         store.post_in(&general.id, Some(&root.id), "ava", "agent", "@bob your turn").unwrap();
         assert_eq!(store.take_mentions(&bob).unwrap().len(), 1);
+
+        // A regular agent at the limit is stopped; a coordinator isn't, and
+        // its message resets the run like a person's.
+        assert!(volley(&store, MAX_AGENT_RUN + 1).iter().rev().take(2).all(|t| !t));
+        store.post_in(&general.id, Some(&root.id), "lead", "agent", "@ava status?").unwrap();
+        assert!(store.take_mentions(&ava).unwrap().is_empty(), "lead is a regular agent here: held too");
+        store.set_coordinator(&lead.id, true).unwrap();
+        assert!(store.agent_infos().unwrap().iter().any(|a| a.agent.name == "lead" && a.coordinator));
+        store.post_in(&general.id, Some(&root.id), "lead", "agent", "@ava status?").unwrap();
+        // A coordinator always gets through, and lets the held ones go too.
+        let m = store.take_mentions(&ava).unwrap();
+        assert_eq!(m.last().map(|m| m.text.as_str()), Some("@ava status?"), "{m:?}");
+        assert!(m.len() > 1, "the held mentions came with it");
+        assert_eq!(store.held(&general.id, Some(&root.id)).unwrap(), 0);
+        // bob, in the thread, hears the coordinator untagged, as from a person.
+        let m = store.take_mentions(&bob).unwrap();
+        assert!(m.iter().any(|m| m.from == "lead" && !m.tagged), "{m:?}");
+        assert!(store.take_mentions(&lead).unwrap().is_empty(), "not woken by its own message");
+        // ...and the run starts again from it.
+        assert!(volley(&store, 3).iter().all(|t| *t));
+        // Agents' untagged replies still reach no one, the coordinator included.
+        store.post_in(&general.id, Some(&root.id), "ava", "agent", "done").unwrap();
+        assert!(store.take_mentions(&lead).unwrap().is_empty() && store.take_mentions(&bob).unwrap().is_empty());
+        store.set_coordinator(&lead.id, false).unwrap();
+        assert!(!store.agent_infos().unwrap().iter().any(|a| a.coordinator));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2128,6 +2294,87 @@ mod tests {
         assert!(store.set_status("away").is_err() && store.set_theme("blue").is_err());
         // Removing the picture.
         assert_eq!(store.save_profile("Sami", "", None, "#f38020").unwrap().picture, None);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_person_can_let_held_agents_continue() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (lead, _) = store.create_agent("lead").unwrap();
+        store.set_coordinator(&lead.id, true).unwrap();
+        for a in [&ava, &lead] {
+            store.set_access(&general.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
+        }
+        for i in 0..MAX_AGENT_RUN {
+            store.post(&general.id, "bob", "agent", &format!("@ava step {i}")).unwrap();
+        }
+        assert_eq!(store.held(&general.id, None).unwrap(), 1);
+        // gild asks the coordinator by name, which wakes it to decide.
+        let note = store.messages(&general.id).unwrap().into_iter().rev().find(|m| m.kind == "system").unwrap().body;
+        assert!(note.contains("A person or @lead can let them continue"), "{note}");
+        assert_eq!(store.take_mentions(&lead).unwrap().len(), 1);
+        let waiting: Vec<String> = store.pending_mentions(&ava.id).unwrap().into_iter().map(|m| m.text).collect();
+        assert_eq!(waiting.len(), MAX_AGENT_RUN - 1, "the held one isn't handed out");
+        assert!(!waiting.contains(&format!("@ava step {}", MAX_AGENT_RUN - 1)));
+        store.let_agents_continue(&general.id, None, DEMO_NAME).unwrap();
+        assert_eq!(store.held(&general.id, None).unwrap(), 0);
+        let m = store.take_mentions(&ava).unwrap();
+        assert_eq!(m.last().unwrap().text, format!("@ava step {}", MAX_AGENT_RUN - 1));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_loop_rules_are_settings() {
+        let (dir, file) = temp();
+        let mut store = Store::open(&file).unwrap();
+        assert_eq!(store.loop_rules().unwrap(), LoopRules { limit: DEFAULT_AGENT_LIMIT, ask_coordinator: true, notify_me: false });
+        let told: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let t = told.clone();
+        store.on_hold(Box::new(move |note| t.lock().unwrap().push(note.to_string())));
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (lead, _) = store.create_agent("lead").unwrap();
+        store.set_coordinator(&lead.id, true).unwrap();
+        for a in [&ava, &lead] {
+            store.set_access(&general.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
+        }
+        store.set_loop_rules(&LoopRules { limit: 3, ask_coordinator: false, notify_me: true }).unwrap();
+        for i in 0..3 {
+            store.post(&general.id, "bob", "agent", &format!("@ava step {i}")).unwrap();
+        }
+        assert_eq!(store.held(&general.id, None).unwrap(), 1, "held at the third");
+        let note = store.messages(&general.id).unwrap().into_iter().rev().find(|m| m.kind == "system").unwrap().body;
+        assert!(note.starts_with("Agents have written 3 messages") && note.contains("A person can"), "the coordinator isn't asked: {note}");
+        assert!(store.pending_mentions(&lead.id).unwrap().is_empty());
+        assert_eq!(*told.lock().unwrap(), [note], "the person is notified");
+        assert!(store.set_loop_rules(&LoopRules { limit: 0, ask_coordinator: true, notify_me: false }).is_err());
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.loop_rules().unwrap(), LoopRules { limit: 3, ask_coordinator: false, notify_me: true }, "kept");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reply_in_the_thread_of_an_agent_s_message_reaches_it() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        store.set_access(&general.id, DEMO_NAME, &ava.id, Some(Access::Write)).unwrap();
+        let said = store.post(&general.id, "ava", "agent", "Here's how it works from my side.").unwrap();
+        store.post_in(&general.id, Some(&said.id), DEMO_NAME, "person", "im just testing out our threads feature").unwrap();
+        let m = store.take_mentions(&ava).unwrap();
+        // Replying under ava's message is talking to ava: as if tagged.
+        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("im just testing out our threads feature", true)]);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

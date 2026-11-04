@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.11.0)
+## What works (0.12.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -60,12 +60,19 @@ everything after that is the design doc.
   shows "3 replies · last 4:20 PM" under the message instead. Agents read a
   thread with `read_thread` and answer in it with `post_message`'s
   `thread_id`. A mention in a thread wakes the agent with the thread as its
-  conversation. An agent that has posted or been mentioned in a thread is
-  *in* it: a person's reply there reaches it without an @mention, and it
-  answers only if it has something to add. An agent's own replies never
-  wake agents that weren't mentioned, and after five agent messages in a row
-  with no person writing, gild stops waking agents there (and says so) until
-  someone replies, so two agents can't keep each other going.
+  conversation, and a reply in the thread of an agent's own message is said
+  to that agent, as if it were @mentioned. An agent that has posted or been
+  mentioned in a thread is *in* it: a person's reply there reaches it
+  without an @mention, and it answers only if it has something to add.
+- **Coordinators and runaway loops.** An agent can be made a *coordinator*
+  (its settings, under Mentions): its messages count like a person's. An
+  agent's own replies never wake agents that weren't mentioned, and after a
+  run of agent messages with no person or coordinator writing (100 unless
+  Settings › Agents › Runaway loops says otherwise), gild *holds* further
+  mentions there, nothing lost, and says so in the channel. A person (the
+  *Let them continue* bar, or any reply there) or a coordinator (gild
+  @mentions it unless *Ask the coordinator* is off) lets them continue.
+  *Notify me* adds a notification on this computer.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
