@@ -29,6 +29,7 @@ th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
 .msg b { font-weight: 600; }
 .msg .t { color: var(--soft); font: 11px ui-monospace, Menlo, monospace; margin-left: 6px; }
 .msg .x { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.reply { margin-left: 22px; padding-left: 10px; border-left: 2px solid var(--rule); }
 .doc { margin: 0; padding: 14px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.6 ui-monospace, Menlo, monospace; }
 .files { color: var(--soft); font-size: 12px; }
 .files code { font: 12px ui-monospace, Menlo, monospace; }
@@ -78,7 +79,7 @@ th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
     })
     main.append(el('span', c.messages.length === 1 ? '1 message' : c.messages.length + ' messages', 'label'))
     c.messages.forEach(m => {
-      const d = el('div', null, 'msg'), line = el('div')
+      const d = el('div', null, m.thread ? 'msg reply' : 'msg'), line = el('div')
       line.append(el('b', m.author + (m.kind === 'agent' ? ' (agent)' : '')), el('span', new Date(m.created_at).toLocaleString(), 't'))
       d.append(line, el('div', m.body, 'x'))
       main.append(d)

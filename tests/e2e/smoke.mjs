@@ -78,7 +78,9 @@ try {
   writeFileSync(join(work, 'agent.mjs'), `
     import { readFileSync } from 'node:fs'
     const prompt = readFileSync(0, 'utf8')
-    const channel = /channel_id (\\S+)\\)/.exec(prompt)[1]
+    const channel = /channel_id ([^,)\\s]+)/.exec(prompt)[1]
+    const thread = /thread_id ([^,)\\s]+)/.exec(prompt)?.[1]
+    const latest = prompt.split('\\n').filter(l => l.startsWith('→ ')).pop() || ''
     const token = readFileSync(process.argv[2], 'utf8').trim()
     const post = async (body, session) => {
       const res = await fetch('http://127.0.0.1:4747/mcp', { method: 'POST', body: JSON.stringify(body), headers: {
@@ -88,9 +90,12 @@ try {
     }
     const session = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'woken', version: '1' } } })
     await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session)
-    const asked = (prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.')
-      + (prompt.includes(': Northside sent three more students.') ? ' I saw Northside sent three more.' : '')
-    await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked } } }, session)
+    const asked = latest.includes('where do the forms go?')
+      ? 'They go in the red folder (Intake SOP, Step 2).' + (prompt.includes(': Northside sent three more students.') ? ' I saw Northside sent three more.' : '')
+      : latest.includes('transfers') ? 'Transfers use the red folder too.'
+      : latest.includes('blue forms') && prompt.includes("You weren't @mentioned") ? 'Blue forms go back to Northside.'
+      : 'I could not find the question.'
+    await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked, ...(thread ? { thread_id: thread } : {}) } } }, session)
   `)
   await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//h2[.='Set up intake']")), 10000)
@@ -201,6 +206,25 @@ try {
     window.__TAURI_INTERNALS__.invoke('activity', { channelId: ${JSON.stringify(intakeId)} }).then(a => done(a.filter(x => x.action === 'woken').map(x => x.agent + ': ' + x.detail + ' ' + x.ok)), e => done({ error: String(e) }))
   `)
   assert.deepEqual(woken, ['intake: woken by Demo true'])
+
+  // Threads: reply to a message in its thread. A mention there wakes the
+  // agent, which answers in the thread; then a reply with no mention reaches
+  // it too, because it's in the thread. Neither shows in the channel.
+  await driver.executeScript(`
+    const row = [...document.querySelectorAll('.msgs .msg')].find(r => r.textContent.includes('Northside sent three more students.'))
+    row.querySelector('.replybtn').click()
+  `)
+  const threadBox = await driver.wait(until.elementLocated(By.css('#thread-composer')), 10000)
+  await threadBox.sendKeys('@intake which folder for transfers?', Key.ENTER)
+  const inThread = (text) => By.xpath(`//aside[contains(@class,'threadpanel')]//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., '${text}')]`)
+  await driver.wait(until.elementLocated(inThread('Transfers use the red folder too.')), 30000)
+  await driver.findElement(By.css('#thread-composer')).sendKeys('and the blue forms?', Key.ENTER)
+  await driver.wait(until.elementLocated(inThread('Blue forms go back to Northside.')), 30000)
+  const channelText = await driver.findElement(By.css('.msgs .list')).getText()
+  assert.ok(!channelText.includes('Transfers use the red folder') && !channelText.includes('Blue forms go back'), 'replies stay in the thread')
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'msgs')]//button[contains(@class,'threadlink') and starts-with(., '4 replies')]")), 10000)
+  console.log('thread: tagged and untagged replies answered in the thread')
+  await driver.findElement(By.xpath("//aside[contains(@class,'threadpanel')]//button[normalize-space(.)='Close']")).click()
 
   // Removing it, from its settings: gone from the sidebar, and its token
   // refused.

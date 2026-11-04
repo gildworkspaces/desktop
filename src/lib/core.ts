@@ -6,7 +6,12 @@ import { listen } from '@tauri-apps/api/event'
 export type Account = { name: string; demo: boolean }
 export type Workspace = { id: string; name: string; channels: number; messages: number; created_at: number }
 export type Channel = { id: string; workspace_id: string; name: string; topic: string; created_at: number }
-export type Message = { id: string; channel_id: string; author: string; kind: 'person' | 'system' | 'agent'; body: string; created_at: number }
+/** `thread`: a reply, in the thread of that message. `replies` and
+ *  `last_reply_at`: a message with a thread. */
+export type Message = {
+  id: string; channel_id: string; author: string; kind: 'person' | 'system' | 'agent'; body: string; created_at: number
+  thread?: string; replies?: number; last_reply_at?: number
+}
 
 export type View = { kind: 'table'; fields: string[]; statuses: string[] }
 export type DataRecord = { id: string; title: string; status: string; fields: Record<string, string>; created_at: number }
@@ -47,6 +52,8 @@ export const core = {
   createChannel: (workspaceId: string, name: string, topic = '') => invoke<Channel>('create_channel', { workspaceId, name, topic }),
   messages: (channelId: string) => invoke<Message[]>('messages', { channelId }),
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
+  thread: (channelId: string, threadId: string) => invoke<Message[]>('thread', { channelId, threadId }),
+  reply: (channelId: string, threadId: string, body: string) => invoke<Message>('send_reply', { channelId, threadId, body }),
   channelData: (channelId: string) => invoke<ChannelData>('channel_data', { channelId }),
   setView: (channelId: string, fields: string[], statuses: string[]) => invoke<ChannelData>('set_view', { channelId, fields, statuses }),
   addRecord: (channelId: string, title: string, status: string, fields: Record<string, string> = {}) =>

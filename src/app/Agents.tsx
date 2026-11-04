@@ -339,6 +339,7 @@ export function AccessPanel({ channelId, channelName, onClose }: { channelId: st
 const ACTIONS: Record<string, string> = {
   list_channels: 'listed its channels',
   read_channel: 'read the channel',
+  read_thread: 'read a thread',
   post_message: 'posted',
   add_record: 'added',
   update_record: 'changed a record',

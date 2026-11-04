@@ -65,6 +65,17 @@ fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<M
     with(&core, |s| s.post(&channel_id, DEMO_NAME, "person", &body))
 }
 
+/// A thread: the message it hangs off, then its replies.
+#[tauri::command]
+fn thread(core: State<Core>, channel_id: String, thread_id: String) -> Result<Vec<Message>, String> {
+    with(&core, |s| s.thread(&channel_id, &thread_id))
+}
+
+#[tauri::command]
+fn send_reply(core: State<Core>, channel_id: String, thread_id: String, body: String) -> Result<Message, String> {
+    with(&core, |s| s.post_in(&channel_id, Some(&thread_id), DEMO_NAME, "person", &body))
+}
+
 #[tauri::command]
 fn channel_data(core: State<Core>, channel_id: String) -> Result<ChannelData, String> {
     with(&core, |s| s.channel_data(&channel_id))
@@ -308,6 +319,8 @@ pub fn run() {
             create_channel,
             messages,
             send_message,
+            thread,
+            send_reply,
             channel_data,
             set_view,
             add_record,
