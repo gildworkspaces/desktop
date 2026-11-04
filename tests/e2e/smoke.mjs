@@ -50,7 +50,7 @@ try {
   await stats.sendKeys('New, Docs needed, Enrolled')
   await driver.findElement(By.css('form.columns button.primary')).click()
   await driver.wait(until.elementLocated(By.css('#rec-title')), 10000)
-  await driver.findElement(By.css('#rec-title')).sendKeys('Jordan Lee\n')
+  await driver.findElement(By.css('#rec-title')).sendKeys('Jordan Lee', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//td//button[contains(., 'Jordan Lee')]")), 10000)
   const history = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
