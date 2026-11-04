@@ -160,6 +160,15 @@ fn endpoint() -> String {
     format!("http://127.0.0.1:{}/mcp", mcp::PORT)
 }
 
+/// How many recent messages come with a mention.
+#[tauri::command]
+fn set_context(core: State<Core>, agent_id: String, messages: i64) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.set_context(&agent_id, messages)?;
+        s.agent_infos()
+    })
+}
+
 #[tauri::command]
 fn create_agent(core: State<Core>, name: String) -> Result<NewAgent, String> {
     let (agent, token) = with(&core, |s| s.create_agent(&name))?;
@@ -180,6 +189,7 @@ struct Connected {
     endpoint: String,
     clients: Vec<ClientStatus>,
     errors: Vec<String>,
+    agents: Vec<AgentInfo>,
 }
 
 /// Set the agent up in the chosen clients with a new token, and take it out
@@ -199,7 +209,18 @@ async fn connect_agent(core: State<'_, Core>, agent_id: String, clients: Vec<Str
             here.disconnect(kind, &agent.name).await;
         }
     }
-    Ok(Connected { token, endpoint, clients: here.status(&agent.name).await, errors })
+    let clients = here.status(&agent.name).await;
+    // What wakes it follows the tool it's set up in, unless the person wrote
+    // their own command.
+    let ours: Vec<String> = KINDS.iter().map(|k| clients::wake_command(*k, &agent.name)).collect();
+    let agents = with(&core, |s| {
+        let current = s.agent_infos()?.into_iter().find(|a| a.agent.id == agent_id).and_then(|a| a.wake);
+        if current.as_ref().is_none_or(|w| ours.contains(w)) {
+            s.set_wake(&agent_id, clients.iter().find(|c| c.connected).map(|c| c.wake.as_str()).unwrap_or(""))?;
+        }
+        s.agent_infos()
+    })?;
+    Ok(Connected { token, endpoint, clients, errors, agents })
 }
 
 /// Remove the agent from gild and from the clients gild set it up in.
@@ -300,6 +321,7 @@ pub fn run() {
             reject_proposal,
             agents,
             set_wake,
+            set_context,
             create_agent,
             agent_clients,
             connect_agent,

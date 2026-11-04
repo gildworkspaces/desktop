@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, toke
 CREATE TABLE IF NOT EXISTS docs (channel_id TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (channel_id, path));
 CREATE TABLE IF NOT EXISTS mentions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, delivered_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_wake (agent_id TEXT PRIMARY KEY, command TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_context (agent_id TEXT PRIMARY KEY, messages INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -902,6 +903,7 @@ impl Store {
             self.set_access(&text(&row[0]), author, agent_id, None)?;
         }
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agents WHERE id = ?1", &[id])?;
         Ok(agent)
@@ -1121,7 +1123,14 @@ pub struct AgentInfo {
     #[serde(flatten)]
     pub agent: Agent,
     pub wake: Option<String>,
+    /// How many of the channel's recent messages come with a mention.
+    pub context: i64,
 }
+
+/// Recent messages sent with a mention, unless the agent's settings say
+/// otherwise.
+pub const DEFAULT_CONTEXT: i64 = 20;
+pub const MAX_CONTEXT: i64 = 200;
 
 /// The names after `@` in a message (`@intake`, `@front-desk`), lower case,
 /// each once. An `@` inside a word (an email address) doesn't count.
@@ -1240,7 +1249,8 @@ impl Store {
 
     pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id ORDER BY a.created_at",
+            "SELECT a.id, a.name, a.created_at, k.command, c.messages FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
+             LEFT JOIN agent_context c ON c.agent_id = a.id ORDER BY a.created_at",
             &[],
         )?;
         Ok(rows
@@ -1251,8 +1261,49 @@ impl Store {
                     Value::Null => None,
                     v => Some(text(v)),
                 },
+                context: match &r[4] {
+                    Value::Null => DEFAULT_CONTEXT,
+                    v => int(v),
+                },
             })
             .collect())
+    }
+
+    /// How many recent messages come with a mention (0: only the mention).
+    pub fn set_context(&self, agent_id: &str, messages: i64) -> Result<(), String> {
+        self.agent(agent_id)?;
+        if !(0..=MAX_CONTEXT).contains(&messages) {
+            return Err(format!("Between 0 and {MAX_CONTEXT} messages."));
+        }
+        self.run(
+            "INSERT INTO agent_context (agent_id, messages) VALUES (?1, ?2) ON CONFLICT (agent_id) DO UPDATE SET messages = excluded.messages",
+            &[Value::from_text(agent_id.to_string()), Value::from_i64(messages)],
+        )
+    }
+
+    /// For each channel the mentions are in: its last `context` messages up
+    /// to the latest mention there, oldest first.
+    pub fn mention_context(&self, agent_id: &str, mentions: &[Mention]) -> Result<Vec<(String, Vec<Message>)>, String> {
+        let n = self.agent_infos()?.into_iter().find(|a| a.agent.id == agent_id).map(|a| a.context).unwrap_or(DEFAULT_CONTEXT);
+        let mut out: Vec<(String, Vec<Message>)> = Vec::new();
+        for m in mentions {
+            if n == 0 || out.iter().any(|(c, _)| c == &m.channel_id) {
+                continue;
+            }
+            let last = mentions.iter().filter(|x| x.channel_id == m.channel_id).map(|x| x.at).max().unwrap_or(m.at);
+            let rows = self.query(
+                "SELECT id, channel_id, author, kind, body, created_at FROM messages WHERE channel_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, id DESC LIMIT ?3",
+                &[Value::from_text(m.channel_id.clone()), Value::from_i64(last), Value::from_i64(n)],
+            )?;
+            let mut msgs: Vec<Message> = rows
+                .iter()
+                .map(|r| Message { id: text(&r[0]), channel_id: text(&r[1]), author: text(&r[2]), kind: text(&r[3]), body: text(&r[4]), created_at: int(&r[5]) })
+                .collect();
+            msgs.reverse();
+            out.push((m.channel_id.clone(), msgs));
+        }
+        Ok(out)
     }
 
     /// Set (or, empty, remove) the command gild runs when the agent is
@@ -1658,6 +1709,37 @@ mod tests {
         assert_eq!(store.access(&agent.id, &general.id).unwrap(), None);
         // The name is free again.
         store.create_agent("ava").unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_mention_comes_with_the_agent_s_number_of_recent_messages() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (agent, _) = store.create_agent("ava").unwrap();
+        store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+        assert_eq!(store.agent_infos().unwrap()[0].context, DEFAULT_CONTEXT);
+        for body in ["one", "two", "three", "@ava what did I just say?"] {
+            store.post(&general.id, DEMO_NAME, "person", body).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mentions = store.pending_mentions(&agent.id).unwrap();
+        let bodies = |store: &Store| -> Vec<String> {
+            store.mention_context(&agent.id, &mentions).unwrap().into_iter().flat_map(|(_, m)| m).map(|m| m.body).collect()
+        };
+        assert_eq!(bodies(&store), ["one", "two", "three", "@ava what did I just say?"]);
+        store.set_context(&agent.id, 2).unwrap();
+        assert_eq!(bodies(&store), ["three", "@ava what did I just say?"]);
+        // Later messages aren't part of what it was asked.
+        store.post(&general.id, DEMO_NAME, "person", "later").unwrap();
+        assert_eq!(bodies(&store), ["three", "@ava what did I just say?"]);
+        store.set_context(&agent.id, 0).unwrap();
+        assert!(bodies(&store).is_empty());
+        assert!(store.set_context(&agent.id, MAX_CONTEXT + 1).is_err());
+        assert_eq!(store.agent_infos().unwrap()[0].context, 0);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

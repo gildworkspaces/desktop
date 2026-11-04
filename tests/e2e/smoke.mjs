@@ -88,7 +88,8 @@ try {
     }
     const session = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'woken', version: '1' } } })
     await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session)
-    const asked = prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.'
+    const asked = (prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.')
+      + (prompt.includes(': Northside sent three more students.') ? ' I saw Northside sent three more.' : '')
     await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked } } }, session)
   `)
   await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
@@ -100,18 +101,33 @@ try {
   assert.match(token, /^gild_[0-9a-f]{64}$/)
   writeFileSync(join(work, 'token'), token)
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Next']")).click()
-  const wake = await driver.wait(until.elementLocated(By.css('#wake-command')), 10000)
-  await wake.clear()
-  await wake.sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
-  await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
   const intakeBox = await driver.wait(until.elementLocated(By.xpath("//label[contains(@class,'clientrow') and contains(., '#student-intake')]/input")), 10000)
   assert.ok(await intakeBox.isSelected(), 'the channel you are in is ticked')
   assert.ok(!(await driver.findElement(By.xpath("//label[contains(@class,'clientrow') and contains(., '#general')]/input")).isSelected()))
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Save']")).click()
-  const doneText = await driver.wait(until.elementLocated(By.css('.setup .big')), 10000)
-  assert.match(await doneText.getText(), /Now write @intake in #student-intake and you’re set\./)
+  // No AI tool here, so nothing can wake it yet, and the last step says so.
+  const doneText = await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//p[contains(., 'can’t wake it yet')]")), 10000)
+  assert.match(await doneText.getText(), /under Mentions/)
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Done']")).click()
+
+  // Its settings, under Mentions: what runs (this test's stand-in for an AI
+  // tool) and how much of the conversation comes with a mention.
+  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//ol[contains(@class,'steps')]//button[contains(., 'Mentions')]")), 10000).click()
+  const ctx = await driver.wait(until.elementLocated(By.css('#context')), 10000)
+  assert.equal(await ctx.getAttribute('value'), '20')
+  await ctx.clear()
+  await ctx.sendKeys('50')
+  await driver.findElement(By.css('#wake-command')).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
+  await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//span[@class='ok' and .='Saved.']")), 10000)
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Close']")).click()
   await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
+  const agentsNow = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context)), e => done({ error: String(e) }))
+  `)
+  assert.deepEqual(agentsNow, ['intake:50'])
   const mcp = async (body, session) => {
     const res = await fetch('http://127.0.0.1:4747/mcp', {
       method: 'POST',
@@ -178,6 +194,7 @@ try {
   await driver.findElement(By.css('#composer')).sendKeys('@intake where do the forms go?', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//span[@class='mention' and .='@intake']")), 10000)
   const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000)
+  assert.match(await reply.getText(), /I saw Northside sent three more\./, 'the conversation came with the mention')
   console.log('agent answered:', await reply.getText())
   const woken = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]

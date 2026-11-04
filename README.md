@@ -19,25 +19,26 @@ everything after that is the design doc.
   edit them, move them between statuses, and open a record to see its full
   history: who changed what, and when.
 - **Agents, set up by gild.** Add an agent in the sidebar and gild walks
-  through four steps, with nothing to copy or paste:
+  through three steps, with nothing to copy or paste:
   1. **Connect:** gild finds the AI tools on this computer (Claude Code,
      Codex), shows which already have the agent, and adds it to the ones you
      tick with one button: a new token, set up through each tool's own CLI
      (Codex: two tables appended to `~/.codex/config.toml`, the rest of the
-     file left exactly as it was). *Another MCP client* shows the endpoint
-     and a token for anything else.
-  2. **When mentioned:** what gild runs when the agent is mentioned, filled
-     in for the tool it was set up in.
-  3. **Channels:** tick the channels it can work in (the one you're in is
+     file left exactly as it was). That also sets what wakes the agent when
+     it's mentioned. *Another MCP client* shows the endpoint and a token for
+     anything else.
+  2. **Channels:** tick the channels it can work in (the one you're in is
      ticked). Agents see nothing else; finer access is in a channel's
      **Access** button: *can read*, or *can read and change*.
-  4. **Done:** "Now write @intake in #student-intake and you're set."
+  3. **Done:** "Now write @intake in #student-intake and you're set."
 
-  Clicking an agent later opens the same steps as its settings, with
-  **Remove agent**: it loses every channel (each a commit in that channel's
-  history) and is taken out of the tools gild set it up in. What agents do
-  appears in the channel as it happens, and every call they make, allowed
-  or refused, is in the channel's **Activity**.
+  Clicking an agent later opens its settings: the same steps, plus
+  **Mentions** (how many of the channel's recent messages come with a
+  mention, 20 unless you change it, and under *Advanced* the command gild
+  runs), and **Remove agent**: it loses every channel (each a commit in that
+  channel's history) and is taken out of the tools gild set it up in. What
+  agents do appears in the channel as it happens, and every call they make,
+  allowed or refused, is in the channel's **Activity**.
 - **Docs.** A channel's **Docs** tab holds markdown docs: SOPs, notes,
   plans. Write and edit them in the window; each save is a commit, and
   **History** shows them all. Agents search docs (`search_docs` answers with
@@ -48,7 +49,8 @@ everything after that is the design doc.
 - **@mentions wake agents.** Write `@intake` in a channel shared with
   intake and gild runs its wake command (from setup; for Claude Code
   `claude -p --allowedTools mcp__gild-intake`) on this computer with the
-  mention as the prompt on stdin, and the agent answers in the channel.
+  mention and the channel's recent messages as the prompt on stdin, and the
+  agent answers in the channel.
   Nothing stays open in the background. Only the window can set that
   command, never an agent. An agent that's already running can call
   `wait_for_mentions` instead. Mentioning an agent the channel isn't shared

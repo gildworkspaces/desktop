@@ -58,17 +58,23 @@ export function AgentsSidebar({ channels, current }: { channels: Channel[]; curr
   )
 }
 
-const STEPS = [
+type Step = 'connect' | 'channels' | 'mentions' | 'done'
+// Setting up: connect (which also sets what wakes it), channels, and how to
+// use it. Settings: the same, plus what comes with a mention.
+const SETUP: { key: Step; label: string }[] = [
   { key: 'connect', label: 'Connect' },
-  { key: 'wake', label: 'When mentioned' },
   { key: 'channels', label: 'Channels' },
   { key: 'done', label: 'Done' },
-] as const
-type Step = (typeof STEPS)[number]['key']
+]
+const SETTINGS: { key: Step; label: string }[] = [
+  { key: 'connect', label: 'Connect' },
+  { key: 'channels', label: 'Channels' },
+  { key: 'mentions', label: 'Mentions' },
+]
 
-/** Setting an agent up, in order: gild adds it to the MCP clients on this
- *  computer, sets what wakes it, shares channels with it, and says how to
- *  use it. Opened again from the sidebar, the same steps are its settings. */
+/** Setting an agent up: gild adds it to the AI tools on this computer (and
+ *  wakes it through the first of them), shares channels with it, and says
+ *  how to use it. Opened again from the sidebar, it's the agent's settings. */
 function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   agent: Agent; fresh: boolean; channels: Channel[]; current: Channel | null; onAgents: (agents: Agent[]) => void; onClose: () => void
 }) {
@@ -77,6 +83,8 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   const [chosen, setChosen] = useState<Set<string>>(new Set())
   const [connected, setConnected] = useState<Connected | null>(null)
   const [command, setCommand] = useState(agent.wake ?? '')
+  const [context, setContext] = useState(String(agent.context ?? 20))
+  const [saved, setSaved] = useState('')
   const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
@@ -99,7 +107,6 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   }, [agent.id, channels, current, fresh])
 
   const usable = (cs: ClientStatus[] | null) => cs?.filter(c => c.connected) ?? []
-  const firstWake = (cs: ClientStatus[]) => usable(cs)[0]?.wake ?? ''
 
   async function act(f: () => Promise<void>) {
     setBusy(true)
@@ -111,13 +118,18 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
     const made = await core.connectAgent(agent.id, [...chosen])
     setConnected(made)
     setClients(made.clients)
-    if (!agent.wake && !command) setCommand(firstWake(made.clients))
-    if (made.errors.length === 0 && chosen.size > 0) setStep('wake')
+    onAgents(made.agents)
+    setCommand(made.agents.find(a => a.id === agent.id)?.wake ?? '')
+    if (made.errors.length === 0 && chosen.size > 0) setStep('channels')
   })
 
-  const saveWake = (value: string) => act(async () => {
-    onAgents(await core.setWake(agent.id, value))
-    setStep('channels')
+  const saveMentions = (wake: string) => act(async () => {
+    const n = Number(context)
+    if (!Number.isInteger(n) || n < 0 || n > 200) throw new Error('Between 0 and 200 messages.')
+    await core.setContext(agent.id, n)
+    onAgents(await core.setWake(agent.id, wake))
+    setCommand(wake)
+    setSaved('Saved.')
   })
 
   const share = () => act(async () => {
@@ -130,7 +142,8 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
       if (!want && had) await core.setAccess(c.id, agent.id, null)
     }
     setShared(new Map(channels.map(c => [c.id, picked.has(c.id) ? (shared?.get(c.id) ?? 'write') : null])))
-    setStep('done')
+    if (fresh) setStep('done')
+    else setSaved('Saved.')
   })
 
   const remove = () => act(async () => {
@@ -141,16 +154,18 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   const where = channels.filter(c => picked.has(c.id))
   const here = where.find(c => c.id === current?.id) ?? where[0]
   const installed = clients?.filter(c => c.installed) ?? []
-  const index = STEPS.findIndex(s => s.key === step)
+  const steps = fresh ? SETUP : SETTINGS
+  const index = steps.findIndex(s => s.key === step)
+  const go = (s: Step) => { setSaved(''); setError(''); setStep(s) }
 
   return (
     <div className="modalback top" role="dialog" aria-modal="true" aria-labelledby="setup-title">
       <div className="modal setup">
         <h2 id="setup-title">{fresh ? `Set up ${agent.name}` : agent.name}</h2>
         <ol className="steps" aria-label="Steps">
-          {STEPS.map((s, i) => (
+          {steps.map((s, i) => (
             <li key={s.key} className={s.key === step ? 'on' : i < index ? 'past' : ''}>
-              <button type="button" className="link" onClick={() => setStep(s.key)} disabled={fresh && i > index} aria-current={s.key === step ? 'step' : undefined}>
+              <button type="button" className="link" onClick={() => go(s.key)} disabled={fresh && i > index} aria-current={s.key === step ? 'step' : undefined}>
                 <span className="num">{i + 1}</span>{s.label}
               </button>
             </li>
@@ -190,7 +205,7 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
                   {busy ? 'Setting up…' : usable(clients).length > 0 ? 'Set up again' : `Set up ${agent.name}`}
                 </button>
               )}
-              {(usable(clients).length > 0 || connected) && <button className="ghost" onClick={() => setStep('wake')}>Next</button>}
+              {(usable(clients).length > 0 || connected) && <button className="ghost" onClick={() => go('channels')}>Next</button>}
             </div>
             <details className="manual">
               <summary>Another MCP client</summary>
@@ -198,33 +213,16 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
                 <>
                   <p className="faint" style={{ fontSize: 12 }}>Streamable HTTP at <code>{connected.endpoint}</code>, header <code>Authorization: Bearer &lt;token&gt;</code>. The endpoint only answers on this computer. This token replaces any earlier one.</p>
                   <div className="secret"><code>{connected.token}</code></div>
+                  <p className="faint" style={{ fontSize: 12 }}>To have gild wake that client when {agent.name} is mentioned, set its command in {agent.name}’s settings, under Mentions.</p>
                 </>
               ) : (
                 <>
                   <p className="faint" style={{ fontSize: 12 }}>gild makes {agent.name} a new token for it. Tools gild set up get the new token too.</p>
-                  <div><button className="ghost" onClick={() => act(async () => { const made = await core.connectAgent(agent.id, usable(clients).map(c => c.id)); setConnected(made); setClients(made.clients) })} disabled={busy}>Show a token</button></div>
+                  <div><button className="ghost" onClick={() => act(async () => { const made = await core.connectAgent(agent.id, usable(clients).map(c => c.id)); setConnected(made); setClients(made.clients); onAgents(made.agents) })} disabled={busy}>Show a token</button></div>
                 </>
               )}
             </details>
           </>
-        )}
-
-        {step === 'wake' && (
-          <form onSubmit={e => { e.preventDefault(); saveWake(command) }} className="stepform">
-            <p className="soft">When someone writes <span className="mention">@{agent.name}</span>, gild runs this on this computer, with the message as its input. You don't keep anything open.</p>
-            <label htmlFor="wake-command" className="sr">Command</label>
-            <input id="wake-command" className="field mono" value={command} onChange={e => setCommand(e.target.value)} spellCheck={false} placeholder="claude -p --allowedTools mcp__gild-…" />
-            {clients && usable(clients).length > 1 && (
-              <p className="faint" style={{ fontSize: 12 }}>
-                Use {usable(clients).map((c, i) => <span key={c.id}>{i > 0 && ' or '}<button type="button" className="link" onClick={() => setCommand(c.wake)}>{c.name}</button></span>)}
-              </p>
-            )}
-            <p className="faint" style={{ fontSize: 12 }}>One run at a time, up to ten minutes. Runs and failures show in the channel’s Activity.</p>
-            <div className="row">
-              <button className="primary" disabled={busy || !command.trim()}>Save</button>
-              <button type="button" className="ghost" onClick={() => saveWake('')} disabled={busy}>Don’t wake it</button>
-            </div>
-          </form>
         )}
 
         {step === 'channels' && (
@@ -241,8 +239,29 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
               ))}
             </div>
             <p className="faint" style={{ fontSize: 12 }}>A checked channel lets {agent.name} read, answer and change it. For read-only, use the channel’s Access button.</p>
-            <div className="row"><button className="primary" onClick={share} disabled={busy || !shared}>Save</button></div>
+            <div className="row"><button className="primary" onClick={share} disabled={busy || !shared}>Save</button>{saved && <span className="ok">{saved}</span>}</div>
           </>
+        )}
+
+        {step === 'mentions' && (
+          <form onSubmit={e => { e.preventDefault(); saveMentions(command) }} className="stepform">
+            <p className="soft">When someone writes <span className="mention">@{agent.name}</span>, gild wakes {agent.name} with the conversation so far.</p>
+            <label className="ctxrow" htmlFor="context">
+              Send the last
+              <input id="context" className="field num" type="number" min={0} max={200} value={context} onChange={e => { setContext(e.target.value); setSaved('') }} />
+              messages of the channel with the mention
+            </label>
+            <details className="manual" open={!command || undefined}>
+              <summary>Advanced: what gild runs</summary>
+              <p className="faint" style={{ fontSize: 12 }}>gild runs this on this computer with the mention and the messages as its input. One run at a time, up to ten minutes; runs and failures show in the channel’s Activity. Empty: {agent.name} isn’t woken.</p>
+              <label htmlFor="wake-command" className="sr">Command</label>
+              <input id="wake-command" className="field mono" value={command} onChange={e => { setCommand(e.target.value); setSaved('') }} spellCheck={false} placeholder={usable(clients)[0]?.wake ?? 'claude -p --allowedTools mcp__gild-' + agent.name} />
+              {usable(clients).filter(c => c.wake !== command).map(c => (
+                <div key={c.id}><button type="button" className="link" onClick={() => setCommand(c.wake)}>Use {c.name}’s</button></div>
+              ))}
+            </details>
+            <div className="row"><button className="primary" disabled={busy}>Save</button>{saved && <span className="ok">{saved}</span>}</div>
+          </form>
         )}
 
         {step === 'done' && (
@@ -251,8 +270,8 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
               <p className="big">Now write <span className="mention">@{agent.name}</span> in #{here.name} and you’re set.</p>
             ) : (
               <p className="soft">
-                {!command ? `${agent.name} won't wake when mentioned until it has a command (step 2).` : ''}
-                {!here ? ` ${agent.name} can't see any channel yet (step 3).` : ''}
+                {!command ? `${agent.name} isn’t set up in an AI tool on this computer, so a mention can’t wake it yet. Set what to run in its settings, under Mentions.` : ''}
+                {!here ? ` ${agent.name} can’t see any channel yet (step 2).` : ''}
               </p>
             )}
             <div className="row"><button className="primary" onClick={onClose}>Done</button></div>

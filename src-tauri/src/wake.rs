@@ -15,7 +15,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
-use crate::store::{Agent, Mention, Store};
+use crate::store::{Agent, Mention, Message, Store};
 
 pub const LIMIT: Duration = Duration::from_secs(600);
 
@@ -24,16 +24,36 @@ fn utc(ms: i64) -> String {
     format!("{} {:02}:{:02} UTC", crate::export::date(ms), s / 3600, s / 60 % 60)
 }
 
-/// What the agent is told: who mentioned it, where, and how to answer.
-pub fn prompt(agent: &str, mentions: &[Mention], endpoint: &str) -> String {
-    let mut out = format!(
-        "You are {agent}, an agent in gild: a workspace where people and agents work together in channels. You were mentioned:\n"
-    );
+/// What the agent is told: who mentioned it, where, the conversation
+/// leading up to it, and how to answer.
+pub fn prompt(agent: &str, mentions: &[Mention], context: &[(String, Vec<Message>)], endpoint: &str) -> String {
+    let mut out = format!("You are {agent}, an agent in gild: a workspace where people and agents work together in channels. You were mentioned.\n");
+    let mut channels: Vec<&Mention> = Vec::new();
     for m in mentions {
-        out.push_str(&format!("\n#{} in {} (channel_id {})\n{} at {}: {}\n", m.channel, m.workspace, m.channel_id, m.from, utc(m.at), m.text));
+        if !channels.iter().any(|c| c.channel_id == m.channel_id) {
+            channels.push(m);
+        }
+    }
+    for c in channels {
+        out.push_str(&format!("\n#{} in {} (channel_id {})\n", c.channel, c.workspace, c.channel_id));
+        let here: Vec<&Mention> = mentions.iter().filter(|m| m.channel_id == c.channel_id).collect();
+        match context.iter().find(|(id, _)| id == &c.channel_id).map(|(_, msgs)| msgs) {
+            Some(msgs) if !msgs.is_empty() => {
+                out.push_str(&format!("The last {} messages, oldest first; → marks where you were mentioned:\n", msgs.len()));
+                for m in msgs {
+                    let mark = if here.iter().any(|h| h.message_id == m.id) { "→ " } else { "  " };
+                    out.push_str(&format!("{mark}{} at {}: {}\n", m.author, utc(m.created_at), m.body));
+                }
+            }
+            _ => {
+                for m in here {
+                    out.push_str(&format!("→ {} at {}: {}\n", m.from, utc(m.at), m.text));
+                }
+            }
+        }
     }
     out.push_str(&format!(
-        "\nUse gild's tools (MCP at {endpoint}): read_channel for context, search_docs to answer from the channel's docs, and post_message to answer in the channel you were mentioned in. Do what was asked if you can; if you can't, say why in the channel. Everything you do is in the channel's activity log.\n"
+        "\nUse gild's tools (MCP at {endpoint}): read_channel for more of the conversation, search_docs to answer from the channel's docs, and post_message to answer in the channel you were mentioned in. Do what was asked if you can; if you can't, say why in the channel. Everything you do is in the channel's activity log.\n"
     ));
     out
 }
@@ -90,7 +110,8 @@ pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<
 
 /// Wake one agent for its mentions, and record how it went.
 async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, command: String, mentions: Vec<Mention>, endpoint: String) {
-    let outcome = run_command(&command, &prompt(&agent.name, &mentions, &endpoint), LIMIT).await;
+    let context = core.lock().ok().and_then(|s| s.mention_context(&agent.id, &mentions).ok()).unwrap_or_default();
+    let outcome = run_command(&command, &prompt(&agent.name, &mentions, &context, &endpoint), LIMIT).await;
     let mut channels: Vec<String> = mentions.iter().map(|m| m.channel_id.clone()).collect();
     channels.dedup();
     if let Ok(store) = core.lock() {
@@ -175,6 +196,7 @@ mod tests {
         let core = Arc::new(Mutex::new(store));
         tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
 
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "Northside sent three more students.").unwrap();
         core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@intake where do the forms go? @broken you too").unwrap();
         let mut said = String::new();
         for _ in 0..100 {
@@ -188,6 +210,9 @@ mod tests {
         }
         assert!(said.contains("You are intake") && said.contains("Demo at ") && said.contains("@intake where do the forms go?"), "{said}");
         assert!(said.contains(&format!("channel_id {}", c.id)));
+        // The conversation comes with it, the mention marked.
+        assert!(said.contains("  Demo at ") && said.contains(": Northside sent three more students.\n"), "{said}");
+        assert!(said.contains("→ Demo at ") && said.contains(": @intake where do the forms go? @broken you too\n"), "{said}");
         let store = core.lock().unwrap();
         let mut log: Vec<(String, bool, String)> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action == "woken").map(|a| (a.agent, a.ok, a.detail)).collect();
         log.sort();

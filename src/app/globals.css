@@ -248,3 +248,6 @@ tbody tr:hover { background: var(--chip); }
 .danger { background: var(--bad); color: #fff; border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
 .modalback.top { align-items: flex-start; padding-top: 12vh; }
 .setup .confirm { flex-basis: 100%; font-size: 13px; }
+.setup .ctxrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; color: var(--ink); margin: 0; }
+.setup .field.num { width: 72px; text-align: right; }
+.setup .manual .field { width: 100%; box-sizing: border-box; }
