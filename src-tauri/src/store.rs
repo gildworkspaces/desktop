@@ -15,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 
-use crate::records::{self, Change, Record, View};
+use crate::records::{self, Access, Acl, Change, Record, View};
+use sha2::{Digest, Sha256};
 
 /// Bumped when a table's columns or meaning change.
 const FORMAT: i64 = 1;
@@ -27,6 +28,10 @@ CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, workspace_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, author TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS views (channel_id TEXT PRIMARY KEY, config TEXT NOT NULL, indexed_commit TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS records (channel_id TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, fields TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (channel_id, id));
+CREATE TABLE IF NOT EXISTS indexed (channel_id TEXT PRIMARY KEY, commit_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS grants (channel_id TEXT NOT NULL, agent_id TEXT NOT NULL, access TEXT NOT NULL, PRIMARY KEY (channel_id, agent_id));
+CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
 /// The file name of the database inside the data folder.
@@ -327,7 +332,7 @@ impl Store {
             let channel = text(&row[0]);
             let head = records::head_commit(&self.data, &channel)?;
             let indexed = self
-                .query("SELECT indexed_commit FROM views WHERE channel_id = ?1", &[Value::from_text(channel.clone())])?
+                .query("SELECT commit_id FROM indexed WHERE channel_id = ?1", &[Value::from_text(channel.clone())])?
                 .first()
                 .map(|r| text(&r[0]));
             if head != indexed {
@@ -343,6 +348,18 @@ impl Store {
         let id = Value::from_text(channel_id.to_string());
         self.run("DELETE FROM records WHERE channel_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM views WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM grants WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM indexed WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        if let Some(commit) = &snap.commit {
+            self.run("INSERT INTO indexed (channel_id, commit_id) VALUES (?1, ?2)", &[id.clone(), Value::from_text(commit.clone())])?;
+        }
+        for (agent, access) in &snap.acl.agents {
+            let access = serde_json::to_value(access).map_err(|e| err("indexing access", e))?;
+            self.run(
+                "INSERT INTO grants (channel_id, agent_id, access) VALUES (?1, ?2, ?3)",
+                &[id.clone(), Value::from_text(agent.clone()), Value::from_text(access.as_str().unwrap_or("read").to_string())],
+            )?;
+        }
         if let (Some(view), Some(commit)) = (&snap.view, &snap.commit) {
             let config = serde_json::to_string(view).map_err(|e| err("indexing the view", e))?;
             self.run(
@@ -510,6 +527,194 @@ impl Store {
     }
 }
 
+
+/// An agent: a member that works in the channels it's given, through the
+/// app's MCP endpoint, with its own token.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Agent {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct AgentAccess {
+    pub agent: Agent,
+    pub access: Option<Access>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct AgentChannel {
+    pub workspace: String,
+    pub channel: Channel,
+    pub access: Access,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct AuditEntry {
+    pub agent: String,
+    pub action: String,
+    pub detail: String,
+    pub ok: bool,
+    pub at: i64,
+}
+
+fn sha256_hex(s: &str) -> String {
+    Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_access(s: &str) -> Option<Access> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}
+
+impl Store {
+    pub fn agents(&self) -> Result<Vec<Agent>, String> {
+        let rows = self.query("SELECT id, name, created_at FROM agents ORDER BY created_at", &[])?;
+        Ok(rows.iter().map(|r| Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }).collect())
+    }
+
+    /// A new agent and its token. The token is shown once; only its hash is
+    /// kept.
+    pub fn create_agent(&self, name: &str) -> Result<(Agent, String), String> {
+        let name = channel_name(name).ok_or("Give the agent a name with at least one letter or digit.")?;
+        if self.agents()?.iter().any(|a| a.name == name) {
+            return Err(format!("There is already an agent called {name}."));
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|e| err("making a token", e))?;
+        let token = format!("gild_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let agent = Agent { id: new_id(), name, created_at: now_ms() };
+        self.run(
+            "INSERT INTO agents (id, name, token_sha256, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                Value::from_text(agent.id.clone()),
+                Value::from_text(agent.name.clone()),
+                Value::from_text(sha256_hex(&token)),
+                Value::from_i64(agent.created_at),
+            ],
+        )?;
+        Ok((agent, token))
+    }
+
+    pub fn agent_for_token(&self, token: &str) -> Result<Option<Agent>, String> {
+        let rows = self.query(
+            "SELECT id, name, created_at FROM agents WHERE token_sha256 = ?1",
+            &[Value::from_text(sha256_hex(token.trim()))],
+        )?;
+        Ok(rows.first().map(|r| Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }))
+    }
+
+    pub fn access(&self, agent_id: &str, channel_id: &str) -> Result<Option<Access>, String> {
+        let rows = self.query(
+            "SELECT access FROM grants WHERE channel_id = ?1 AND agent_id = ?2",
+            &[Value::from_text(channel_id.to_string()), Value::from_text(agent_id.to_string())],
+        )?;
+        Ok(rows.first().and_then(|r| parse_access(&text(&r[0]))))
+    }
+
+    /// Refuse unless the agent has at least `need` in the channel. The answer
+    /// never says whether a channel it can't see exists.
+    pub fn require(&self, agent: &Agent, channel_id: &str, need: Access) -> Result<(), String> {
+        match self.access(&agent.id, channel_id)? {
+            Some(have) if have >= need => Ok(()),
+            Some(_) => Err(format!("{} can read this channel but not change it.", agent.name)),
+            None => Err("No channel with that id is shared with this agent.".into()),
+        }
+    }
+
+    /// Every agent with what it may do in this channel, for the window.
+    pub fn channel_access(&self, channel_id: &str) -> Result<Vec<AgentAccess>, String> {
+        self.agents()?
+            .into_iter()
+            .map(|agent| Ok(AgentAccess { access: self.access(&agent.id, channel_id)?, agent }))
+            .collect()
+    }
+
+    /// Give, change or take away an agent's access to a channel: a commit to
+    /// the channel's `.gild/acl.json`, so every grant is in its history.
+    pub fn set_access(&self, channel_id: &str, author: &str, agent_id: &str, access: Option<Access>) -> Result<(), String> {
+        self.require_channel(channel_id)?;
+        let agent = self.agents()?.into_iter().find(|a| a.id == agent_id).ok_or("That agent no longer exists.")?;
+        let mut acl = Acl::default();
+        for row in self.query("SELECT agent_id, access FROM grants WHERE channel_id = ?1", &[Value::from_text(channel_id.to_string())])? {
+            if let Some(a) = parse_access(&text(&row[1])) {
+                acl.agents.insert(text(&row[0]), a);
+            }
+        }
+        if acl.agents.get(agent_id).copied() == access {
+            return Ok(());
+        }
+        let message = match access {
+            Some(Access::Write) => format!("Let {} read and change this channel", agent.name),
+            Some(Access::Read) => format!("Let {} read this channel", agent.name),
+            None => format!("Remove {}'s access", agent.name),
+        };
+        match access {
+            Some(a) => acl.agents.insert(agent_id.to_string(), a),
+            None => acl.agents.remove(agent_id),
+        };
+        let bytes = serde_json::to_vec_pretty(&acl).map_err(|e| err("saving access", e))?;
+        self.write(channel_id, author, &message, &[(records::ACL_PATH.to_string(), bytes)])
+    }
+
+    /// The channels shared with an agent, with what it may do in each.
+    pub fn agent_channels(&self, agent: &Agent) -> Result<Vec<AgentChannel>, String> {
+        let rows = self.query(
+            "SELECT w.name, c.id, c.workspace_id, c.name, c.topic, c.created_at, g.access
+             FROM grants g JOIN channels c ON c.id = g.channel_id JOIN workspaces w ON w.id = c.workspace_id
+             WHERE g.agent_id = ?1 ORDER BY w.created_at, c.created_at",
+            &[Value::from_text(agent.id.clone())],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(AgentChannel {
+                    workspace: text(&r[0]),
+                    channel: Channel { id: text(&r[1]), workspace_id: text(&r[2]), name: text(&r[3]), topic: text(&r[4]), created_at: int(&r[5]) },
+                    access: parse_access(&text(&r[6]))?,
+                })
+            })
+            .collect())
+    }
+
+    pub fn channel(&self, channel_id: &str) -> Result<Option<Channel>, String> {
+        let rows = self.query(
+            "SELECT id, workspace_id, name, topic, created_at FROM channels WHERE id = ?1",
+            &[Value::from_text(channel_id.to_string())],
+        )?;
+        Ok(rows.first().map(|r| Channel { id: text(&r[0]), workspace_id: text(&r[1]), name: text(&r[2]), topic: text(&r[3]), created_at: int(&r[4]) }))
+    }
+
+    /// Record what an agent did or tried to do.
+    pub fn audit(&self, agent: &Agent, action: &str, channel_id: &str, detail: &str, ok: bool) -> Result<(), String> {
+        self.run(
+            "INSERT INTO audit (id, agent_id, agent, action, channel_id, detail, ok, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                Value::from_text(new_id()),
+                Value::from_text(agent.id.clone()),
+                Value::from_text(agent.name.clone()),
+                Value::from_text(action.to_string()),
+                Value::from_text(channel_id.to_string()),
+                Value::from_text(detail.chars().take(300).collect::<String>()),
+                Value::from_i64(ok as i64),
+                Value::from_i64(now_ms()),
+            ],
+        )
+    }
+
+    /// What agents did in a channel, newest first.
+    pub fn activity(&self, channel_id: &str) -> Result<Vec<AuditEntry>, String> {
+        let rows = self.query(
+            "SELECT agent, action, detail, ok, at FROM audit WHERE channel_id = ?1 ORDER BY at DESC, id DESC LIMIT 200",
+            &[Value::from_text(channel_id.to_string())],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| AuditEntry { agent: text(&r[0]), action: text(&r[1]), detail: text(&r[2]), ok: int(&r[3]) != 0, at: int(&r[4]) })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +751,7 @@ mod tests {
             let store = Store::open(&file).unwrap();
             store.run("DELETE FROM views", &[]).unwrap();
             store.run("DELETE FROM records", &[]).unwrap();
+            store.run("DELETE FROM indexed", &[]).unwrap();
             assert!(store.channel_data(&channel.id).unwrap().records.is_empty());
         }
         // Reopening catches up from git.
@@ -658,5 +864,46 @@ mod tests {
         assert_eq!(channel_name("café_menu").as_deref(), Some("café-menu"));
         assert_eq!(channel_name("---"), None);
         assert_eq!(channel_name(&"a".repeat(80)).map(|s| s.len()), Some(40));
+    }
+
+    #[test]
+    fn agents_see_only_what_they_are_given() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let secret = store.create_channel(&ws.id, "payroll", "").unwrap();
+        let (agent, token) = store.create_agent("Intake").unwrap();
+        assert_eq!(agent.name, "intake");
+        assert!(token.starts_with("gild_") && token.len() == 5 + 64);
+        assert_eq!(store.agent_for_token(&token).unwrap().unwrap().id, agent.id);
+        assert!(store.agent_for_token("gild_wrong").unwrap().is_none());
+        assert!(store.create_agent("intake").is_err(), "names are unique");
+
+        // Nothing is shared until someone shares it.
+        assert!(store.agent_channels(&agent).unwrap().is_empty());
+        assert!(store.require(&agent, &general.id, Access::Read).is_err());
+
+        store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Read)).unwrap();
+        assert!(store.require(&agent, &general.id, Access::Read).is_ok());
+        assert!(store.require(&agent, &general.id, Access::Write).unwrap_err().contains("not change"));
+        assert!(store.require(&agent, &secret.id, Access::Read).is_err());
+        let seen: Vec<String> = store.agent_channels(&agent).unwrap().into_iter().map(|c| c.channel.name).collect();
+        assert_eq!(seen, ["general"]);
+
+        // Grants are commits, and they survive losing the index.
+        store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+        let log: Vec<String> = records::history(&dir, &general.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+        assert_eq!(log, ["Let intake read and change this channel", "Let intake read this channel"]);
+        store.run("DELETE FROM grants", &[]).unwrap();
+        store.run("DELETE FROM indexed", &[]).unwrap();
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.access(&agent.id, &general.id).unwrap(), Some(Access::Write));
+
+        store.set_access(&general.id, DEMO_NAME, &agent.id, None).unwrap();
+        assert!(store.require(&agent, &general.id, Access::Read).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
