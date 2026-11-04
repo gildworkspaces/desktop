@@ -4,6 +4,7 @@ import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
 import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, mentionParts, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
 export default function App() {
@@ -91,7 +92,25 @@ function Home({ account, onOpen }: { account: Account; onOpen: (w: Workspace) =>
           {error && <p className="error">{error}</p>}
         </form>
       </div>
+      <ImportWorkspace onImported={onOpen} />
     </main>
+  )
+}
+
+function ImportWorkspace({ onImported }: { onImported: (w: Workspace) => void }) {
+  const [state, setState] = useState<{ busy: boolean; error?: string }>({ busy: false })
+  async function pick() {
+    const folder = await openDialog({ directory: true, title: 'Pick a folder Export workspace made' })
+    if (typeof folder !== 'string') return
+    setState({ busy: true })
+    try { onImported(await core.importWorkspace(folder)) } catch (e) { setState({ busy: false, error: errorText(e) }) }
+  }
+  return (
+    <div className="importbox">
+      <button className="ghost" onClick={pick} disabled={state.busy}>{state.busy ? 'Importing…' : 'Import a workspace'}</button>
+      <span className="faint" style={{ fontSize: 13 }}>From a folder Export workspace made: its channels, chat, tables, docs and full history come back.</span>
+      {state.error && <p className="error" style={{ flexBasis: '100%', margin: 0 }}>{state.error}</p>}
+    </div>
   )
 }
 

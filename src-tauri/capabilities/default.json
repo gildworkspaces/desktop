@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the window may do: call the app's own commands and open links. It reaches no network.",
+  "description": "What the window may do: call the app's own commands, open links, and ask you to pick a folder (to import an export). It reaches no network.",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": ["core:default", "opener:default", "dialog:allow-open"]
 }

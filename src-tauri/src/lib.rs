@@ -202,9 +202,16 @@ fn export_workspace(app: tauri::AppHandle, core: State<Core>, workspace_id: Stri
     Ok(out.display().to_string())
 }
 
+/// Make an export folder (one Export workspace wrote) a workspace again.
+#[tauri::command]
+fn import_workspace(core: State<Core>, folder: String) -> Result<Workspace, String> {
+    with(&core, |s| export::import_workspace(s, std::path::Path::new(&folder)))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -243,6 +250,7 @@ pub fn run() {
             activity,
             mcp_status,
             export_workspace,
+            import_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running gild desktop");

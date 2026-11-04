@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.7.0)
+## What works (0.8.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -43,6 +43,12 @@ everything after that is the design doc.
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
   and `export-viewer.html`, which browses all of it offline.
+- **Import.** *Import a workspace* on the home screen takes a folder Export
+  workspace made and makes it a workspace again: channels, chat (from
+  `chat.jsonl`), tables, docs, access and open proposals (from
+  `history.git`). Imported chat keeps its authors and times and wakes no
+  one. A test exports, imports and exports again, and checks the two
+  exports match.
 - A built-in **demo account**. Accounts and sign-in come later; until then
   everything is written as "Demo".
 
