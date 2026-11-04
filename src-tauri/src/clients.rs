@@ -116,12 +116,20 @@ impl Clients {
 
     /// Take the agent's server out of a client (fine if it isn't there).
     pub async fn disconnect(&self, kind: Kind, agent: &str) {
-        let name = quote(&server_name(agent));
-        let args = match kind {
-            Kind::ClaudeCode => format!("mcp remove --scope user {name}"),
-            Kind::Codex => format!("mcp remove {name}"),
-        };
-        let _ = self.run(kind, &args).await;
+        match kind {
+            Kind::ClaudeCode => {
+                let _ = self.run(kind, &format!("mcp remove --scope user {}", quote(&server_name(agent)))).await;
+            }
+            Kind::Codex => {
+                let config = codex_config(&self.home);
+                if let Ok(text) = std::fs::read_to_string(&config) {
+                    let kept = without_server(&text, &server_name(agent));
+                    if kept != text {
+                        let _ = std::fs::write(&config, kept);
+                    }
+                }
+            }
+        }
     }
 
     /// Give a client the agent's server, replacing any it had (an old one
@@ -141,21 +149,36 @@ impl Clients {
             }
             Kind::Codex => {
                 // Codex's CLI takes a header only from an environment
-                // variable, so the header goes into its config next to the
-                // server the CLI added.
-                self.run(kind, &format!("mcp add {} --url {}", quote(&name), quote(endpoint))).await.map_err(fail)?;
+                // variable, and rewrites the whole config when it adds a
+                // server. gild adds its own two tables to the end instead, so
+                // the rest of the file stays as the person wrote it, and
+                // then asks Codex to read them back.
                 let config = codex_config(&self.home);
-                let mut text = std::fs::read_to_string(&config).map_err(|e| fail(format!("reading {}: {e}", config.display())))?;
-                if !text.ends_with('\n') && !text.is_empty() {
+                let mut text = match std::fs::read_to_string(&config) {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(fail(format!("reading {}: {e}", config.display()))),
+                };
+                if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
                 }
-                text.push_str(&format!("\n[mcp_servers.{}.http_headers]\nAuthorization = \"Bearer {token}\"\n", toml_key(&name)));
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                let key = toml_key(&name);
+                text.push_str(&format!(
+                    "[mcp_servers.{key}]\nurl = {}\n\n[mcp_servers.{key}.http_headers]\nAuthorization = {}\n",
+                    toml_string(endpoint),
+                    toml_string(&format!("Bearer {token}"))
+                ));
+                if let Some(dir) = config.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| fail(format!("making {}: {e}", dir.display())))?;
+                }
                 std::fs::write(&config, text).map_err(|e| fail(format!("writing {}: {e}", config.display())))?;
-                // Codex reads it back with the header, or it isn't set up.
                 let got = self.run(kind, &format!("mcp get {} --json", quote(&name))).await.map_err(fail)?;
                 let json: serde_json::Value = serde_json::from_str(&got).map_err(|e| fail(format!("reading its answer: {e}")))?;
-                if json["transport"]["http_headers"]["Authorization"].as_str() != Some(&format!("Bearer {token}")) {
-                    return Err(fail("it didn't keep the token header".into()));
+                if json["transport"]["url"].as_str() != Some(endpoint) || json["transport"]["http_headers"]["Authorization"].as_str() != Some(&format!("Bearer {token}")) {
+                    return Err(fail("it doesn't read back the address and token gild wrote".into()));
                 }
             }
         }
@@ -164,6 +187,38 @@ impl Clients {
         }
         Ok(())
     }
+}
+
+/// The config without `name`'s tables (`[mcp_servers.<name>]` and its
+/// sub-tables); everything else exactly as it was.
+fn without_server(text: &str, name: &str) -> String {
+    let key = toml_key(name);
+    let (own, sub) = (format!("[mcp_servers.{key}]"), format!("[mcp_servers.{key}."));
+    let mut out = String::new();
+    let mut skipping = false;
+    let mut removed = false;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with('[') {
+            skipping = t == own || t.starts_with(&sub);
+            removed |= skipping;
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    if removed {
+        // The blank line gild put before its tables goes with them.
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+    }
+    out
+}
+
+/// A TOML basic string.
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn codex_config(home: &Path) -> PathBuf {
@@ -175,7 +230,7 @@ fn toml_key(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         s.to_string()
     } else {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        toml_string(s)
     }
 }
 
@@ -183,43 +238,58 @@ fn toml_key(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A stand-in for a client's CLI: `mcp add/get/remove` over one file
-    /// per server, the way the real ones behave from outside. The Codex one
-    /// writes `[mcp_servers.<name>]` to config.toml like codex does, and
-    /// `get --json` reports the header found under it.
-    fn fake(dir: &Path, name: &str, codex: bool) -> String {
-        let path = dir.join(name);
-        let store = dir.join(format!("{name}-servers"));
+    fn script(path: &Path, body: &str) -> String {
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path.display().to_string()
+    }
+
+    /// A stand-in for `claude mcp add/get/remove`: one file per server.
+    fn fake_claude(dir: &Path) -> String {
+        let store = dir.join("claude-servers");
         std::fs::create_dir_all(&store).unwrap();
-        let config = codex_config(dir);
-        let script = format!(
-            r#"#!/bin/sh
-S='{store}'
+        script(
+            &dir.join("claude"),
+            &format!(
+                r#"S='{}'
 [ "$1" = mcp ] || exit 2
 cmd=$2; shift 2
 while [ "${{1#--}}" != "$1" ]; do shift 2; done
 n=$1; shift
 case $cmd in
-  add) printf '%s\n' "$*" > "$S/$n"; {codex_add} ;;
-  get) [ -f "$S/$n" ] || {{ echo "No MCP server named $n" >&2; exit 1; }}; {codex_get} ;;
+  add) printf '%s\n' "$*" > "$S/$n" ;;
+  get) [ -f "$S/$n" ] || {{ echo "No MCP server named $n" >&2; exit 1; }} ;;
   remove) [ -f "$S/$n" ] || exit 1; rm "$S/$n" ;;
 esac
 "#,
-            store = store.display(),
-            codex_add = if codex { format!("mkdir -p '{0}'; printf '[mcp_servers.%s]\\nurl = \"%s\"\\n' \"$n\" \"$2\" >> '{1}'", config.parent().unwrap().display(), config.display()) } else { String::new() },
-            codex_get = if codex {
-                format!("h=$(sed -n 's/^Authorization = \"\\(.*\\)\"$/\\1/p' '{}' | tail -1); printf '{{\"transport\":{{\"http_headers\":{{\"Authorization\":\"%s\"}}}}}}' \"$h\"", config.display())
-            } else {
-                String::new()
-            },
-        );
-        std::fs::write(&path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        path.display().to_string()
+                store.display()
+            ),
+        )
+    }
+
+    /// A stand-in for `codex mcp get <name> --json`: reads the server's url
+    /// and Authorization header out of config.toml, and answers at the
+    /// length the real one does (longer than a line of output).
+    fn fake_codex(dir: &Path) -> String {
+        let config = codex_config(dir);
+        script(
+            &dir.join("codex"),
+            &format!(
+                r#"C='{}'
+[ "$1 $2" = "mcp get" ] || exit 2
+n=$3
+grep -qxF "[mcp_servers.$n]" "$C" 2>/dev/null || {{ echo "No MCP server named '$n' found." >&2; exit 1; }}
+u=$(awk -v s="[mcp_servers.$n]" '$0==s{{f=1;next}} /^\[/{{f=0}} f&&/^url = /{{sub(/^url = "/,"");sub(/"$/,"");print}}' "$C")
+h=$(awk -v s="[mcp_servers.$n.http_headers]" '$0==s{{f=1;next}} /^\[/{{f=0}} f&&/^Authorization = /{{sub(/^Authorization = "/,"");sub(/"$/,"");print}}' "$C")
+printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "transport": {{\n    "type": "streamable_http",\n    "url": "%s",\n    "bearer_token_env_var": null,\n    "http_headers": {{\n      "Authorization": "%s"\n    }},\n    "env_http_headers": null,\n    "http_headers_helper": null\n  }},\n  "enabled_tools": null,\n  "disabled_tools": null,\n  "startup_timeout_sec": null,\n  "tool_timeout_sec": null\n}}\n' "$n" "$u" "$h"
+"#,
+                config.display()
+            ),
+        )
     }
 
     fn temp() -> PathBuf {
@@ -228,10 +298,15 @@ esac
         dir
     }
 
+    /// Someone's Codex config, as they wrote it: comments, spacing, order.
+    const MINE: &str = "# my settings\nmodel = \"gpt-5\"\n\n[mcp_servers.Roblox_Studio]\nargs = []\ncommand = \"/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP\"\nstartup_timeout_sec = 120\n\n[projects.\"/Volumes/Projects\"]\ntrust_level = \"trusted\"\n";
+
     #[tokio::test]
     async fn gild_finds_the_clients_and_sets_the_agent_up_in_them() {
         let dir = temp();
-        let clients = Clients { claude: fake(&dir, "claude", false), codex: fake(&dir, "codex", true), home: dir.clone() };
+        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), home: dir.clone() };
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::write(codex_config(&dir), MINE).unwrap();
         let endpoint = "http://127.0.0.1:4747/mcp";
 
         let before = clients.status("ava").await;
@@ -242,24 +317,38 @@ esac
         clients.connect(Kind::Codex, "ava", endpoint, "gild_one").await.unwrap();
         let added = std::fs::read_to_string(dir.join("claude-servers/gild-ava")).unwrap();
         assert_eq!(added.trim(), "http://127.0.0.1:4747/mcp --header Authorization: Bearer gild_one");
-        let config = std::fs::read_to_string(codex_config(&dir)).unwrap();
-        assert!(config.contains("[mcp_servers.gild-ava]\nurl = \"http://127.0.0.1:4747/mcp\"\n\n[mcp_servers.gild-ava.http_headers]\nAuthorization = \"Bearer gild_one\"\n"), "{config}");
+        let ours = "[mcp_servers.gild-ava]\nurl = \"http://127.0.0.1:4747/mcp\"\n\n[mcp_servers.gild-ava.http_headers]\nAuthorization = \"Bearer gild_one\"\n";
+        assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{ours}"), "the person's config untouched, gild's tables after it");
         assert!(clients.status("ava").await.iter().all(|c| c.connected));
         assert!(clients.status("intake").await.iter().all(|c| !c.connected), "only the agent it was set up for");
 
         // Connecting again replaces the server: the new token, once.
         clients.connect(Kind::ClaudeCode, "ava", endpoint, "gild_two").await.unwrap();
+        clients.connect(Kind::Codex, "ava", endpoint, "gild_two").await.unwrap();
         assert!(std::fs::read_to_string(dir.join("claude-servers/gild-ava")).unwrap().contains("Bearer gild_two"));
+        assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{}", ours.replace("gild_one", "gild_two")));
 
         clients.disconnect(Kind::ClaudeCode, "ava").await;
         assert_eq!(clients.status("ava").await.iter().map(|c| c.connected).collect::<Vec<_>>(), [false, true]);
+        clients.disconnect(Kind::Codex, "ava").await;
+        assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), MINE, "byte for byte as it was");
+        assert!(clients.status("ava").await.iter().all(|c| !c.connected));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_without_a_config_yet_gets_one() {
+        let dir = temp();
+        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), home: dir.clone() };
+        clients.connect(Kind::Codex, "ava", "http://127.0.0.1:4747/mcp", "gild_x").await.unwrap();
+        assert!(std::fs::read_to_string(codex_config(&dir)).unwrap().starts_with("[mcp_servers.gild-ava]\n"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn a_client_that_isn_t_installed_says_so() {
         let dir = temp();
-        let clients = Clients { claude: dir.join("nothing-here").display().to_string(), codex: fake(&dir, "codex", true), home: dir.clone() };
+        let clients = Clients { claude: dir.join("nothing-here").display().to_string(), codex: fake_codex(&dir), home: dir.clone() };
         let status = clients.status("ava").await;
         assert_eq!(status.iter().map(|c| (c.id, c.installed)).collect::<Vec<_>>(), [("claude-code", false), ("codex", true)]);
         let err = clients.connect(Kind::ClaudeCode, "ava", "http://127.0.0.1:4747/mcp", "gild_x").await.unwrap_err();
@@ -272,5 +361,8 @@ esac
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(toml_key("gild-ava"), "gild-ava");
         assert_eq!(toml_key("gild-é"), "\"gild-é\"");
+        // Only the agent's own tables go, not another server sharing a prefix.
+        let text = "[mcp_servers.gild-ava]\nurl = \"a\"\n\n[mcp_servers.gild-ava.http_headers]\nx = 1\n[mcp_servers.gild-ava2]\nurl = \"b\"\n";
+        assert_eq!(without_server(text, "gild-ava"), "[mcp_servers.gild-ava2]\nurl = \"b\"\n");
     }
 }

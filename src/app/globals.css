@@ -245,4 +245,6 @@ tbody tr:hover { background: var(--chip); }
 .setup .ok { color: var(--ok, #2f8f62); font-size: 14px; }
 .setup .big { font-size: 18px; line-height: 1.5; color: var(--ink); }
 .setup .removebar { border-top: 1px solid var(--rule); padding-top: 10px; margin-top: 4px; }
-.danger { background: #c2410c; color: #fff; border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+.danger { background: var(--bad); color: #fff; border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+.modalback.top { align-items: flex-start; padding-top: 12vh; }
+.setup .confirm { flex-basis: 100%; font-size: 13px; }

@@ -52,8 +52,8 @@ fn home() -> String {
     std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_else(|_| "/".into())
 }
 
-/// Run `command` with `input` on stdin. Ok: what it printed last; Err: why
-/// it failed.
+/// Run `command` with `input` on stdin. Ok: what it printed; Err: why it
+/// failed (the end of what it said on stderr).
 pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<String, String> {
     let (sh, flag) = shell();
     let mut child = tokio::process::Command::new(sh)
@@ -79,7 +79,7 @@ pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<
     match tokio::time::timeout(limit, child.wait_with_output()).await {
         Err(_) => Err(format!("it was still running after {} minutes, so it was stopped", limit.as_secs() / 60)),
         Ok(Err(e)) => Err(format!("it failed: {e}")),
-        Ok(Ok(out)) if out.status.success() => Ok(tail(&out.stdout)),
+        Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
         Ok(Ok(out)) => {
             let why = tail(&out.stderr);
             let code = out.status.code().map(|c| format!("exit {c}")).unwrap_or_else(|| "stopped".into());

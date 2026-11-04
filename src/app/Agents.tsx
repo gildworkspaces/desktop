@@ -144,7 +144,7 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   const index = STEPS.findIndex(s => s.key === step)
 
   return (
-    <div className="modalback" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+    <div className="modalback top" role="dialog" aria-modal="true" aria-labelledby="setup-title">
       <div className="modal setup">
         <h2 id="setup-title">{fresh ? `Set up ${agent.name}` : agent.name}</h2>
         <ol className="steps" aria-label="Steps">
@@ -264,9 +264,9 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
           <div className="row removebar">
             {removing ? (
               <>
-                <span className="soft" style={{ fontSize: 13 }}>Remove {agent.name}? It loses every channel and is taken out of {installed.map(c => c.name).join(' and ') || 'gild'}.</span>
-                <button className="danger" onClick={remove} disabled={busy}>Remove</button>
-                <button className="ghost" onClick={() => setRemoving(false)}>Keep</button>
+                <p className="soft confirm">Remove {agent.name}? It loses every channel{installed.some(c => c.connected) ? ` and is taken out of ${installed.filter(c => c.connected).map(c => c.name).join(' and ')}` : ''}. What it did stays in each channel’s activity.</p>
+                <button className="danger" onClick={remove} disabled={busy}>Remove {agent.name}</button>
+                <button className="ghost" onClick={() => setRemoving(false)}>Keep it</button>
               </>
             ) : (
               <>
