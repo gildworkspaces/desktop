@@ -125,9 +125,9 @@ try {
   await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
   const agentsNow = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
-    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context)), e => done({ error: String(e) }))
+    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context + ':' + x.wake)), e => done({ error: String(e) }))
   `)
-  assert.deepEqual(agentsNow, ['intake:50'])
+  assert.deepEqual(agentsNow, [`intake:50:${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`], 'the whole command was saved')
   const mcp = async (body, session) => {
     const res = await fetch('http://127.0.0.1:4747/mcp', {
       method: 'POST',

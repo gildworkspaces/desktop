@@ -85,6 +85,8 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   const [command, setCommand] = useState(agent.wake ?? '')
   const [context, setContext] = useState(String(agent.context ?? 20))
   const [saved, setSaved] = useState('')
+  // Open once if there's no command yet; never closed by typing into it.
+  const [advancedOpen] = useState(!agent.wake)
   const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
@@ -251,7 +253,7 @@ function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
               <input id="context" className="field num" type="number" min={0} max={200} value={context} onChange={e => { setContext(e.target.value); setSaved('') }} />
               messages of the channel with the mention
             </label>
-            <details className="manual" open={!command || undefined}>
+            <details className="manual" open={advancedOpen}>
               <summary>Advanced: what gild runs</summary>
               <p className="faint" style={{ fontSize: 12 }}>gild runs this on this computer with the mention and the messages as its input. One run at a time, up to ten minutes; runs and failures show in the channel’s Activity. Empty: {agent.name} isn’t woken.</p>
               <label htmlFor="wake-command" className="sr">Command</label>
