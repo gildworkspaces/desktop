@@ -129,9 +129,14 @@ fn safe(name: &str) -> String {
 /// Write the workspace into a new folder inside `parent` and return it.
 pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp: &str) -> Result<PathBuf, String> {
     let ws = store.workspaces()?.into_iter().find(|w| w.id == workspace_id).ok_or("That workspace no longer exists.")?;
-    let root = parent.join(format!("{} {stamp}", safe(&ws.name)));
-    if root.exists() {
-        return Err(format!("{} already exists.", root.display()));
+    // Never overwrite an earlier export: a second one in the same second gets
+    // " (2)", and so on.
+    let base = format!("{} {stamp}", safe(&ws.name));
+    let mut root = parent.join(&base);
+    let mut n = 2;
+    while root.exists() {
+        root = parent.join(format!("{base} ({n})"));
+        n += 1;
     }
     let mut channels = Vec::new();
     for c in store.channels(&ws.id)? {
@@ -209,8 +214,10 @@ mod tests {
         assert!(viewer.contains("default-src 'none'") && !viewer.contains("innerHTML"));
         let js = fs::read_to_string(out.join("data/workspace.js")).unwrap();
         assert!(js.starts_with("window.GILD_EXPORT = ") && js.contains("Jordan Lee"));
-        // A second export in the same minute doesn't overwrite the first.
-        assert!(export_workspace(&store, &ws.id, &base.join("exports"), "2026-11-04 1200").is_err());
+        // A second export with the same time doesn't overwrite the first.
+        let again = export_workspace(&store, &ws.id, &base.join("exports"), "2026-11-04 1200").unwrap();
+        assert_eq!(again.file_name().unwrap(), "Front Desk 2026-11-04 1200 (2)");
+        assert!(out.join("export-viewer.html").exists());
         drop(store);
         fs::remove_dir_all(base).unwrap();
     }
