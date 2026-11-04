@@ -214,3 +214,10 @@ tbody tr:hover { background: var(--chip); }
 .md hr { border: 0; border-top: 1px solid var(--rule); margin: 16px 0; }
 .md a { color: var(--accent); }
 .chip.waiting { cursor: pointer; color: var(--accent); border-color: var(--accent); }
+
+/* mentions */
+.mention { color: var(--mark); font-weight: 600; }
+.agentrow { background: transparent; border: 0; border-radius: 7px; text-align: left; width: 100%; padding: 3px 10px; }
+.agentrow:hover { color: var(--ink); background: var(--chip); }
+.agentrow .badge { margin-left: auto; }
+.modal .mono { font-family: var(--mono); font-size: 13px; }

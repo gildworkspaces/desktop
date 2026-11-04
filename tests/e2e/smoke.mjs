@@ -4,7 +4,9 @@
 //   tauri-driver &   node tests/e2e/smoke.mjs <path to the built binary>
 import { Builder, By, Key, until } from 'selenium-webdriver'
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const application = process.argv[2]
 const driver = await new Builder()
@@ -145,6 +147,41 @@ try {
   assert.equal(docLog.error, undefined, docLog.error)
   assert.deepEqual(docLog, ["Demo: Approve intake's change to Intake SOP: The folder is red now", 'Demo: Edit Intake SOP', 'Demo: Add doc Intake SOP'])
   console.log('doc history:', JSON.stringify(docLog))
+
+  // @mentions wake the agent: its "When mentioned, run" command is set in the
+  // window; a mention typed in the window runs it with the mention on stdin,
+  // and it answers in the channel through the MCP endpoint.
+  const work = mkdtempSync(join(tmpdir(), 'gild-e2e-'))
+  writeFileSync(join(work, 'token'), token)
+  writeFileSync(join(work, 'agent.mjs'), `
+    import { readFileSync } from 'node:fs'
+    const prompt = readFileSync(0, 'utf8')
+    const channel = /channel_id (\\S+)\\)/.exec(prompt)[1]
+    const token = readFileSync(process.argv[2], 'utf8').trim()
+    const post = async (body, session) => {
+      const res = await fetch('http://127.0.0.1:4747/mcp', { method: 'POST', body: JSON.stringify(body), headers: {
+        'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ' + token, ...(session ? { 'Mcp-Session-Id': session } : {}) } })
+      await res.text()
+      return res.headers.get('mcp-session-id')
+    }
+    const session = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'woken', version: '1' } } })
+    await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session)
+    const asked = prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.'
+    await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked } } }, session)
+  `)
+  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.css('#wake-command')), 10000).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
+  await driver.findElement(By.xpath("//form[contains(@class,'modal')]//button[normalize-space(.)='Save']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
+  await driver.findElement(By.css('#composer')).sendKeys('@intake where do the forms go?', Key.ENTER)
+  await driver.wait(until.elementLocated(By.xpath("//span[@class='mention' and .='@intake']")), 10000)
+  const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000)
+  console.log('agent answered:', await reply.getText())
+  const woken = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    window.__TAURI_INTERNALS__.invoke('activity', { channelId: ${JSON.stringify(intakeId)} }).then(a => done(a.filter(x => x.action === 'woken').map(x => x.agent + ': ' + x.detail + ' ' + x.ok)), e => done({ error: String(e) }))
+  `)
+  assert.deepEqual(woken, ['intake: woken by Demo true'])
 
   // Export from the window: a folder of open files, and the history clones.
   await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()

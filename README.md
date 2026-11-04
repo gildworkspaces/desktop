@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.6.0)
+## What works (0.7.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -31,6 +31,14 @@ everything after that is the design doc.
   edit is a *proposal* that waits under **Waiting for you**, with its
   summary and a diff, until a person approves or rejects it. Every step is
   said in the channel's chat.
+- **@mentions wake agents.** Write `@intake` in a channel shared with
+  intake, and intake is told. Click an agent in the sidebar to set what gild
+  runs when it's mentioned (for Claude Code:
+  `claude -p --allowedTools mcp__gild-intake`): gild runs it on this
+  computer with the mention as the prompt on stdin, and the agent answers in
+  the channel. Only the window can set that command, never an agent. An
+  agent that's already running can call `wait_for_mentions` instead.
+  Mentioning an agent the channel isn't shared with tells you so.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
@@ -61,7 +69,7 @@ The first run creates a "Demo workspace" with #general.
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
   `list_channels`, `read_channel`, `post_message`, `add_record`,
   `update_record`, `record_history`, `read_doc`, `search_docs`,
-  `propose_doc_edit`. Each call carries the agent's token;
+  `propose_doc_edit`, `wait_for_mentions`. Each call carries the agent's token;
   access is checked by the same store functions the window uses, and a
   channel's grants live in its git history as `.gild/acl.json`.
 - The database file: `gild.db` in the app's data folder

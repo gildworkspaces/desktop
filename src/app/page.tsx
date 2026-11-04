@@ -4,7 +4,7 @@ import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
 import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
-import { core, inApp, onChanged, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
+import { core, inApp, onChanged, mentionParts, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
 export default function App() {
   const [ready, setReady] = useState<'checking' | 'app' | 'browser'>('checking')
@@ -245,7 +245,7 @@ function ChannelView({ channel }: { channel: Channel }) {
                       {m.kind !== 'person' && <span className="badge">{m.kind}</span>}
                       <span className="time">{clock(m.created_at)}</span>
                     </div>
-                    <span className="text">{m.body}</span>
+                    <span className="text">{mentionParts(m.body).map((p, j) => p.mention ? <span key={j} className="mention">{p.text}</span> : p.text)}</span>
                   </div>
                 </div>
               </div>

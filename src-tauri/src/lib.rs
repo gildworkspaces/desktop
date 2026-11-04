@@ -2,6 +2,7 @@ mod export;
 mod mcp;
 mod records;
 mod store;
+mod wake;
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Store, Workspace, DEMO_NAME};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Store, Workspace, DEMO_NAME};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -139,8 +140,18 @@ struct NewAgent {
 }
 
 #[tauri::command]
-fn agents(core: State<Core>) -> Result<Vec<Agent>, String> {
-    with(&core, |s| s.agents())
+fn agents(core: State<Core>) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| s.agent_infos())
+}
+
+/// What gild runs when the agent is mentioned (empty: nothing). Only here,
+/// in the window: no agent can set what runs on this computer.
+#[tauri::command]
+fn set_wake(core: State<Core>, agent_id: String, command: String) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.set_wake(&agent_id, &command)?;
+        s.agent_infos()
+    })
 }
 
 #[tauri::command]
@@ -201,6 +212,7 @@ pub fn run() {
             store.seed_if_empty()?;
             let core = Arc::new(Mutex::new(store));
             mcp::serve(mcp::Gild { core: core.clone(), app: Some(app.handle().clone()) });
+            tauri::async_runtime::spawn(wake::run(core.clone(), Some(app.handle().clone()), format!("http://127.0.0.1:{}/mcp", mcp::PORT)));
             app.manage(Core(core));
             Ok(())
         })
@@ -224,6 +236,7 @@ pub fn run() {
             approve_proposal,
             reject_proposal,
             agents,
+            set_wake,
             create_agent,
             channel_access,
             set_access,

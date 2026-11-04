@@ -110,6 +110,13 @@ fn tools() -> Vec<Tool> {
             }, "required": ["channel_id", "text", "summary"] })),
         ),
         Tool::new(
+            "wait_for_mentions",
+            "Wait until someone mentions you (@your-name) in a channel shared with you, and get those mentions: who said what, where. Returns at once if mentions are already waiting, or an empty list after `timeout_seconds`. Each mention is handed out once.",
+            schema(json!({ "type": "object", "properties": {
+                "timeout_seconds": { "type": "integer", "description": "How long to wait (default 60, at most 600)." }
+            } })),
+        ),
+        Tool::new(
             "record_history",
             "Every change to one record, newest first: what changed, who changed it, and when.",
             schema(json!({ "type": "object", "properties": {
@@ -228,6 +235,53 @@ impl Gild {
     }
 }
 
+fn no_token() -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(
+        "This request has no valid agent token. Add an agent in gild and use its token: Authorization: Bearer <token>.",
+    )])
+    .into()
+}
+
+impl Gild {
+    /// Block until the agent is mentioned (or the time is up) without
+    /// holding the store: everyone else keeps working meanwhile.
+    async fn wait_for_mentions(&self, args: &Map<String, Value>, context: &RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        let unavailable = || ErrorData::internal_error("the workspace database is unavailable", None);
+        let (agent, signals) = {
+            let store = self.core.lock().map_err(|_| unavailable())?;
+            match bearer(context).map(|t| store.agent_for_token(&t)).transpose() {
+                Ok(Some(Some(agent))) => (agent, store.signals()),
+                Ok(_) => return Ok(no_token()),
+                Err(e) => return Err(ErrorData::internal_error(e, None)),
+            }
+        };
+        let seconds = args.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(60).clamp(1, 600);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        loop {
+            // Listen before looking, so a mention between the two isn't missed.
+            let rung = signals.waiters.notified();
+            tokio::pin!(rung);
+            rung.as_mut().enable();
+            let mentions = {
+                let store = self.core.lock().map_err(|_| unavailable())?;
+                let mentions = store.take_mentions(&agent).map_err(|e| ErrorData::internal_error(e, None))?;
+                for m in &mentions {
+                    store.audit(&agent, "wait_for_mentions", &m.channel_id, &format!("{}: {}", m.from, m.text), true).map_err(|e| ErrorData::internal_error(e, None))?;
+                }
+                mentions
+            };
+            if !mentions.is_empty() || tokio::time::Instant::now() >= deadline {
+                let answer = json!({ "mentions": mentions.iter().map(|m| json!({
+                    "channel_id": m.channel_id, "channel": m.channel, "workspace": m.workspace,
+                    "from": m.from, "text": m.text, "message_id": m.message_id, "at_ms": m.at,
+                })).collect::<Vec<_>>() });
+                return Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&answer).unwrap_or_default())]).into());
+            }
+            let _ = tokio::time::timeout_at(deadline, rung).await;
+        }
+    }
+}
+
 impl ServerHandler for Gild {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -243,16 +297,14 @@ impl ServerHandler for Gild {
 
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.clone().unwrap_or_default();
+        if request.name == "wait_for_mentions" {
+            return self.wait_for_mentions(&args, &context).await;
+        }
         let outcome = {
             let store = self.core.lock().map_err(|_| ErrorData::internal_error("the workspace database is unavailable", None))?;
             let agent = match bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
                 Ok(Some(Some(agent))) => agent,
-                Ok(_) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(
-                        "This request has no valid agent token. Add an agent in gild and use its token: Authorization: Bearer <token>.",
-                    )])
-                    .into())
-                }
+                Ok(_) => return Ok(no_token()),
                 Err(e) => return Err(ErrorData::internal_error(e, None)),
             };
             let result = self.run(&store, &agent, &request.name, &args);
@@ -437,6 +489,23 @@ mod tests {
         let (_, text) = c.call("read_doc", json!({ "channel_id": intake.id, "path": sop.path })).await;
         assert!(text.contains("blue folder"), "{text}");
 
+        // Mentions: nothing waiting → empty after the timeout; a mention while
+        // it waits → returned as soon as it's posted.
+        let started = std::time::Instant::now();
+        let (err, text) = c.call("wait_for_mentions", json!({ "timeout_seconds": 1 })).await;
+        assert!(!err && text.contains("\"mentions\": []") && started.elapsed() >= std::time::Duration::from_secs(1), "{text}");
+        let poster = core.clone();
+        let channel = intake.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            poster.lock().unwrap().post(&channel, DEMO_NAME, "person", "@intake can you check Jordan's forms?").unwrap();
+        });
+        let started = std::time::Instant::now();
+        let (err, text) = c.call("wait_for_mentions", json!({ "timeout_seconds": 30 })).await;
+        assert!(!err && text.contains("can you check Jordan's forms?") && started.elapsed() < std::time::Duration::from_secs(5), "{text}");
+        let (_, text) = c.call("wait_for_mentions", json!({ "timeout_seconds": 1 })).await;
+        assert!(text.contains("\"mentions\": []"), "handed out once: {text}");
+
         let store = core.lock().unwrap();
         let record = &store.channel_data(&intake.id).unwrap().records[0];
         assert_eq!((record.status.as_str(), record.fields["Program"].as_str()), ("Enrolled", "Web Dev"), "an update keeps what it didn't name");
@@ -447,7 +516,7 @@ mod tests {
         let audit: Vec<(String, bool)> = store.activity(&intake.id).unwrap().into_iter().map(|a| (a.action, a.ok)).collect();
         assert_eq!(
             audit,
-            [("read_doc", true), ("propose_doc_edit", true), ("post_message", true), ("update_record", true), ("add_record", true)].map(|(a, ok)| (a.to_string(), ok))
+            [("wait_for_mentions", true), ("read_doc", true), ("propose_doc_edit", true), ("post_message", true), ("update_record", true), ("add_record", true)].map(|(a, ok)| (a.to_string(), ok))
         );
         let refused: Vec<bool> = store.activity(&general.id).unwrap().into_iter().map(|a| a.ok).collect();
         assert_eq!(refused, [false, false], "refusals are in the log too");
