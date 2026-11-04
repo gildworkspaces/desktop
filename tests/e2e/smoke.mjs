@@ -71,22 +71,63 @@ try {
   assert.deepEqual(history, ['Demo: Jordan Lee: New → Docs needed, Sent by: Northside', 'Demo: Add Jordan Lee'])
   console.log('history:', JSON.stringify(history))
 
-  // An agent, added in the window, works through the MCP endpoint, and only
-  // in the channel it was given.
-  await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
-  const token = await (await driver.wait(until.elementLocated(By.css('.secret code')), 10000)).getText()
-  assert.match(token, /^gild_[0-9a-f]{64}$/)
-  await driver.findElement(By.css('.modal .primary')).click()
-  await driver.executeAsyncScript(`
-    const done = arguments[arguments.length - 1]
-    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
-    ;(async () => {
-      const ws = await call('workspaces')
-      const intake = (await call('channels', { workspaceId: ws[0].id })).find(c => c.name === 'student-intake')
-      const [agent] = await call('agents')
-      await call('set_access', { channelId: intake.id, agentId: agent.id, access: 'write' })
-    })().then(done, e => done(String(e)))
+  // An agent, added in the window: gild walks through setting it up. CI has
+  // no AI tool gild can set up (clients.rs's tests cover that), so it takes
+  // the token for another MCP client, then the wake command, then a channel.
+  const work = mkdtempSync(join(tmpdir(), 'gild-e2e-'))
+  writeFileSync(join(work, 'agent.mjs'), `
+    import { readFileSync } from 'node:fs'
+    const prompt = readFileSync(0, 'utf8')
+    const channel = /channel_id (\\S+)\\)/.exec(prompt)[1]
+    const token = readFileSync(process.argv[2], 'utf8').trim()
+    const post = async (body, session) => {
+      const res = await fetch('http://127.0.0.1:4747/mcp', { method: 'POST', body: JSON.stringify(body), headers: {
+        'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ' + token, ...(session ? { 'Mcp-Session-Id': session } : {}) } })
+      await res.text()
+      return res.headers.get('mcp-session-id')
+    }
+    const session = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'woken', version: '1' } } })
+    await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session)
+    const asked = (prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.')
+      + (prompt.includes(': Northside sent three more students.') ? ' I saw Northside sent three more.' : '')
+    await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked } } }, session)
   `)
+  await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//h2[.='Set up intake']")), 10000)
+  await driver.wait(until.elementLocated(By.xpath("//label[contains(@class,'clientrow') and contains(., 'Claude Code')]")), 30000)
+  await driver.findElement(By.xpath("//details[contains(@class,'manual')]/summary")).click()
+  await driver.findElement(By.xpath("//button[normalize-space(.)='Show a token']")).click()
+  const token = await (await driver.wait(until.elementLocated(By.css('.secret code')), 30000)).getText()
+  assert.match(token, /^gild_[0-9a-f]{64}$/)
+  writeFileSync(join(work, 'token'), token)
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Next']")).click()
+  const intakeBox = await driver.wait(until.elementLocated(By.xpath("//label[contains(@class,'clientrow') and contains(., '#student-intake')]/input")), 10000)
+  assert.ok(await intakeBox.isSelected(), 'the channel you are in is ticked')
+  assert.ok(!(await driver.findElement(By.xpath("//label[contains(@class,'clientrow') and contains(., '#general')]/input")).isSelected()))
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Save']")).click()
+  // No AI tool here, so nothing can wake it yet, and the last step says so.
+  const doneText = await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//p[contains(., 'can’t wake it yet')]")), 10000)
+  assert.match(await doneText.getText(), /under Mentions/)
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Done']")).click()
+
+  // Its settings, under Mentions: what runs (this test's stand-in for an AI
+  // tool) and how much of the conversation comes with a mention.
+  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//ol[contains(@class,'steps')]//button[contains(., 'Mentions')]")), 10000).click()
+  const ctx = await driver.wait(until.elementLocated(By.css('#context')), 10000)
+  assert.equal(await ctx.getAttribute('value'), '20')
+  await ctx.clear()
+  await ctx.sendKeys('50')
+  await driver.findElement(By.css('#wake-command')).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
+  await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//span[@class='ok' and .='Saved.']")), 10000)
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Close']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
+  const agentsNow = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context + ':' + x.wake)), e => done({ error: String(e) }))
+  `)
+  assert.deepEqual(agentsNow, [`intake:50:${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`], 'the whole command was saved')
   const mcp = async (body, session) => {
     const res = await fetch('http://127.0.0.1:4747/mcp', {
       method: 'POST',
@@ -148,40 +189,42 @@ try {
   assert.deepEqual(docLog, ["Demo: Approve intake's change to Intake SOP: The folder is red now", 'Demo: Edit Intake SOP', 'Demo: Add doc Intake SOP'])
   console.log('doc history:', JSON.stringify(docLog))
 
-  // @mentions wake the agent: its "When mentioned, run" command is set in the
-  // window; a mention typed in the window runs it with the mention on stdin,
-  // and it answers in the channel through the MCP endpoint.
-  const work = mkdtempSync(join(tmpdir(), 'gild-e2e-'))
-  writeFileSync(join(work, 'token'), token)
-  writeFileSync(join(work, 'agent.mjs'), `
-    import { readFileSync } from 'node:fs'
-    const prompt = readFileSync(0, 'utf8')
-    const channel = /channel_id (\\S+)\\)/.exec(prompt)[1]
-    const token = readFileSync(process.argv[2], 'utf8').trim()
-    const post = async (body, session) => {
-      const res = await fetch('http://127.0.0.1:4747/mcp', { method: 'POST', body: JSON.stringify(body), headers: {
-        'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ' + token, ...(session ? { 'Mcp-Session-Id': session } : {}) } })
-      await res.text()
-      return res.headers.get('mcp-session-id')
-    }
-    const session = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'woken', version: '1' } } })
-    await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session)
-    const asked = prompt.includes('where do the forms go?') ? 'They go in the red folder (Intake SOP, Step 2).' : 'I could not find the question.'
-    await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked } } }, session)
-  `)
-  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
-  await driver.wait(until.elementLocated(By.css('#wake-command')), 10000).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
-  await driver.findElement(By.xpath("//form[contains(@class,'modal')]//button[normalize-space(.)='Save']")).click()
-  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
+  // @mentions wake the agent: the command from setup runs with the mention
+  // on stdin, and it answers in the channel through the MCP endpoint.
   await driver.findElement(By.css('#composer')).sendKeys('@intake where do the forms go?', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//span[@class='mention' and .='@intake']")), 10000)
-  const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000)
+  const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000).catch(async e => {
+    // What happened instead: the channel, and what the agent did.
+    const seen = await driver.executeAsyncScript(`
+      const done = arguments[arguments.length - 1]
+      const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+      ;(async () => ({
+        messages: (await call('messages', { channelId: ${JSON.stringify(intakeId)} })).map(m => m.author + ': ' + m.body),
+        activity: (await call('activity', { channelId: ${JSON.stringify(intakeId)} })).map(a => a.agent + ' ' + a.action + ' ' + a.ok + ' ' + a.detail),
+        agents: await call('agents'),
+      }))().then(done, e => done({ error: String(e) }))
+    `)
+    console.log('no answer; the channel and activity:', JSON.stringify(seen, null, 2))
+    throw e
+  })
+  assert.match(await reply.getText(), /I saw Northside sent three more\./, 'the conversation came with the mention')
   console.log('agent answered:', await reply.getText())
   const woken = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     window.__TAURI_INTERNALS__.invoke('activity', { channelId: ${JSON.stringify(intakeId)} }).then(a => done(a.filter(x => x.action === 'woken').map(x => x.agent + ': ' + x.detail + ' ' + x.ok)), e => done({ error: String(e) }))
   `)
   assert.deepEqual(woken, ['intake: woken by Demo true'])
+
+  // Removing it, from its settings: gone from the sidebar, and its token
+  // refused.
+  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[normalize-space(.)='Remove agent']")), 10000).click()
+  await driver.findElement(By.xpath("//button[contains(@class,'danger') and normalize-space(.)='Remove intake']")).click()
+  await driver.wait(async () => (await driver.findElements(By.css('button.agentrow'))).length === 0, 10000)
+  const after = await mcp({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)
+  assert.equal(after.json.result.isError, true)
+  assert.match(after.json.result.content[0].text, /no valid agent token/, 'the removed agent is refused')
+  console.log('removed: intake')
 
   // Export from the window: a folder of open files, and the history clones.
   await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()

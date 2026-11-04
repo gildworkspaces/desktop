@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.8.0)
+## What works (0.9.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -18,12 +18,27 @@ everything after that is the design doc.
 - **A channel can hold a table**, shown as a table or a board. Add records,
   edit them, move them between statuses, and open a record to see its full
   history: who changed what, and when.
-- **Agents.** Add an agent in the sidebar and gild shows its token once,
-  with the command that connects Claude Code (any MCP client works). Agents
-  see only the channels you share with them, from a channel's **Access**
-  button: *can read*, or *can read and change*. What agents do appears in
-  the channel as it happens, and every call they make, allowed or refused, is
-  in the channel's **Activity**.
+- **Agents, set up by gild.** Add an agent in the sidebar and gild walks
+  through three steps, with nothing to copy or paste:
+  1. **Connect:** gild finds the AI tools on this computer (Claude Code,
+     Codex), shows which already have the agent, and adds it to the ones you
+     tick with one button: a new token, set up through each tool's own CLI
+     (Codex: two tables appended to `~/.codex/config.toml`, the rest of the
+     file left exactly as it was). That also sets what wakes the agent when
+     it's mentioned. *Another MCP client* shows the endpoint and a token for
+     anything else.
+  2. **Channels:** tick the channels it can work in (the one you're in is
+     ticked). Agents see nothing else; finer access is in a channel's
+     **Access** button: *can read*, or *can read and change*.
+  3. **Done:** "Now write @intake in #student-intake and you're set."
+
+  Clicking an agent later opens its settings: the same steps, plus
+  **Mentions** (how many of the channel's recent messages come with a
+  mention, 20 unless you change it, and under *Advanced* the command gild
+  runs), and **Remove agent**: it loses every channel (each a commit in that
+  channel's history) and is taken out of the tools gild set it up in. What
+  agents do appears in the channel as it happens, and every call they make,
+  allowed or refused, is in the channel's **Activity**.
 - **Docs.** A channel's **Docs** tab holds markdown docs: SOPs, notes,
   plans. Write and edit them in the window; each save is a commit, and
   **History** shows them all. Agents search docs (`search_docs` answers with
@@ -32,13 +47,14 @@ everything after that is the design doc.
   summary and a diff, until a person approves or rejects it. Every step is
   said in the channel's chat.
 - **@mentions wake agents.** Write `@intake` in a channel shared with
-  intake, and intake is told. Click an agent in the sidebar to set what gild
-  runs when it's mentioned (for Claude Code:
-  `claude -p --allowedTools mcp__gild-intake`): gild runs it on this
-  computer with the mention as the prompt on stdin, and the agent answers in
-  the channel. Only the window can set that command, never an agent. An
-  agent that's already running can call `wait_for_mentions` instead.
-  Mentioning an agent the channel isn't shared with tells you so.
+  intake and gild runs its wake command (from setup; for Claude Code
+  `claude -p --allowedTools mcp__gild-intake`) on this computer with the
+  mention and the channel's recent messages as the prompt on stdin, and the
+  agent answers in the channel.
+  Nothing stays open in the background. Only the window can set that
+  command, never an agent. An agent that's already running can call
+  `wait_for_mentions` instead. Mentioning an agent the channel isn't shared
+  with tells you so.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
@@ -71,6 +87,8 @@ The first run creates a "Demo workspace" with #general.
   branch, `proposals/<id>`; approving it is a merge commit by the person who
   approved, and rejecting it moves the branch to `refs/gild/rejected/<id>`,
   so what was proposed is never lost.
+- `src-tauri/src/clients.rs`: finding Claude Code and Codex on this
+  computer and adding or removing an agent's server in them.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
   `list_channels`, `read_channel`, `post_message`, `add_record`,

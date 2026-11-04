@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, toke
 CREATE TABLE IF NOT EXISTS docs (channel_id TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (channel_id, path));
 CREATE TABLE IF NOT EXISTS mentions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, delivered_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_wake (agent_id TEXT PRIMARY KEY, command TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_context (agent_id TEXT PRIMARY KEY, messages INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -112,7 +113,7 @@ fn now_ms() -> i64 {
 }
 
 /// Unique and time-ordered: milliseconds, then a per-process counter.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{:012x}{:06x}{:04x}", now_ms(), std::process::id() & 0xff_ffff, n & 0xffff)
@@ -834,6 +835,12 @@ pub struct AuditEntry {
     pub at: i64,
 }
 
+fn new_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| err("making a token", e))?;
+    Ok(format!("gild_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+}
+
 fn sha256_hex(s: &str) -> String {
     Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -855,9 +862,7 @@ impl Store {
         if self.agents()?.iter().any(|a| a.name == name) {
             return Err(format!("There is already an agent called {name}."));
         }
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|e| err("making a token", e))?;
-        let token = format!("gild_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let token = new_token()?;
         let agent = Agent { id: new_id(), name, created_at: now_ms() };
         self.run(
             "INSERT INTO agents (id, name, token_sha256, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -869,6 +874,39 @@ impl Store {
             ],
         )?;
         Ok((agent, token))
+    }
+
+    /// A new token for the agent; the old one stops working at once. gild
+    /// keeps only the new one's hash, so the caller hands it on (to the MCP
+    /// clients it sets up, or to the person) and forgets it.
+    pub fn new_token(&self, agent_id: &str) -> Result<String, String> {
+        self.agent(agent_id)?;
+        let token = new_token()?;
+        self.run(
+            "UPDATE agents SET token_sha256 = ?1 WHERE id = ?2",
+            &[Value::from_text(sha256_hex(&token)), Value::from_text(agent_id.to_string())],
+        )?;
+        Ok(token)
+    }
+
+    pub fn agent(&self, agent_id: &str) -> Result<Agent, String> {
+        self.agents()?.into_iter().find(|a| a.id == agent_id).ok_or_else(|| "That agent no longer exists.".to_string())
+    }
+
+    /// Remove an agent: its access to every channel (each removal a commit in
+    /// that channel's history), its wake command, its waiting mentions, and
+    /// its token. What it did stays in the channels' activity.
+    pub fn remove_agent(&self, agent_id: &str, author: &str) -> Result<Agent, String> {
+        let agent = self.agent(agent_id)?;
+        let id = Value::from_text(agent_id.to_string());
+        for row in self.query("SELECT channel_id FROM grants WHERE agent_id = ?1", std::slice::from_ref(&id))? {
+            self.set_access(&text(&row[0]), author, agent_id, None)?;
+        }
+        self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agents WHERE id = ?1", &[id])?;
+        Ok(agent)
     }
 
     pub fn agent_for_token(&self, token: &str) -> Result<Option<Agent>, String> {
@@ -1085,7 +1123,14 @@ pub struct AgentInfo {
     #[serde(flatten)]
     pub agent: Agent,
     pub wake: Option<String>,
+    /// How many of the channel's recent messages come with a mention.
+    pub context: i64,
 }
+
+/// Recent messages sent with a mention, unless the agent's settings say
+/// otherwise.
+pub const DEFAULT_CONTEXT: i64 = 20;
+pub const MAX_CONTEXT: i64 = 200;
 
 /// The names after `@` in a message (`@intake`, `@front-desk`), lower case,
 /// each once. An `@` inside a word (an email address) doesn't count.
@@ -1204,7 +1249,8 @@ impl Store {
 
     pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id ORDER BY a.created_at",
+            "SELECT a.id, a.name, a.created_at, k.command, c.messages FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
+             LEFT JOIN agent_context c ON c.agent_id = a.id ORDER BY a.created_at",
             &[],
         )?;
         Ok(rows
@@ -1215,8 +1261,49 @@ impl Store {
                     Value::Null => None,
                     v => Some(text(v)),
                 },
+                context: match &r[4] {
+                    Value::Null => DEFAULT_CONTEXT,
+                    v => int(v),
+                },
             })
             .collect())
+    }
+
+    /// How many recent messages come with a mention (0: only the mention).
+    pub fn set_context(&self, agent_id: &str, messages: i64) -> Result<(), String> {
+        self.agent(agent_id)?;
+        if !(0..=MAX_CONTEXT).contains(&messages) {
+            return Err(format!("Between 0 and {MAX_CONTEXT} messages."));
+        }
+        self.run(
+            "INSERT INTO agent_context (agent_id, messages) VALUES (?1, ?2) ON CONFLICT (agent_id) DO UPDATE SET messages = excluded.messages",
+            &[Value::from_text(agent_id.to_string()), Value::from_i64(messages)],
+        )
+    }
+
+    /// For each channel the mentions are in: its last `context` messages up
+    /// to the latest mention there, oldest first.
+    pub fn mention_context(&self, agent_id: &str, mentions: &[Mention]) -> Result<Vec<(String, Vec<Message>)>, String> {
+        let n = self.agent_infos()?.into_iter().find(|a| a.agent.id == agent_id).map(|a| a.context).unwrap_or(DEFAULT_CONTEXT);
+        let mut out: Vec<(String, Vec<Message>)> = Vec::new();
+        for m in mentions {
+            if n == 0 || out.iter().any(|(c, _)| c == &m.channel_id) {
+                continue;
+            }
+            let last = mentions.iter().filter(|x| x.channel_id == m.channel_id).map(|x| x.at).max().unwrap_or(m.at);
+            let rows = self.query(
+                "SELECT id, channel_id, author, kind, body, created_at FROM messages WHERE channel_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, id DESC LIMIT ?3",
+                &[Value::from_text(m.channel_id.clone()), Value::from_i64(last), Value::from_i64(n)],
+            )?;
+            let mut msgs: Vec<Message> = rows
+                .iter()
+                .map(|r| Message { id: text(&r[0]), channel_id: text(&r[1]), author: text(&r[2]), kind: text(&r[3]), body: text(&r[4]), created_at: int(&r[5]) })
+                .collect();
+            msgs.reverse();
+            out.push((m.channel_id.clone(), msgs));
+        }
+        Ok(out)
     }
 
     /// Set (or, empty, remove) the command gild runs when the agent is
@@ -1577,6 +1664,82 @@ mod tests {
 
         store.set_access(&general.id, DEMO_NAME, &agent.id, None).unwrap();
         assert!(store.require(&agent, &general.id, Access::Read).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_token_replaces_the_old_and_a_removed_agent_is_gone_everywhere() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let payroll = store.create_channel(&ws.id, "payroll", "").unwrap();
+        let (agent, old) = store.create_agent("ava").unwrap();
+        let (other, _) = store.create_agent("intake").unwrap();
+
+        let new = store.new_token(&agent.id).unwrap();
+        assert_ne!(new, old);
+        assert!(store.agent_for_token(&old).unwrap().is_none(), "the old token stops working");
+        assert_eq!(store.agent_for_token(&new).unwrap().unwrap().id, agent.id);
+
+        for c in [&general, &payroll] {
+            store.set_access(&c.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+            store.set_access(&c.id, DEMO_NAME, &other.id, Some(Access::Read)).unwrap();
+        }
+        store.set_wake(&agent.id, "claude -p").unwrap();
+        store.post(&general.id, DEMO_NAME, "person", "@ava hello").unwrap();
+        assert_eq!(store.pending_mentions(&agent.id).unwrap().len(), 1);
+
+        store.remove_agent(&agent.id, DEMO_NAME).unwrap();
+        assert!(store.agent_for_token(&new).unwrap().is_none());
+        assert_eq!(store.agents().unwrap().into_iter().map(|a| a.name).collect::<Vec<_>>(), ["intake"]);
+        assert!(store.agents_to_wake().unwrap().is_empty());
+        assert!(store.pending_mentions(&agent.id).unwrap().is_empty());
+        for c in [&general, &payroll] {
+            assert_eq!(store.access(&agent.id, &c.id).unwrap(), None);
+            assert_eq!(store.access(&other.id, &c.id).unwrap(), Some(Access::Read), "other agents keep theirs");
+            let log: Vec<String> = records::history(&dir, &c.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+            assert_eq!(log[0], "Remove ava's access");
+        }
+        // Its access doesn't come back from history when the index is rebuilt.
+        store.run("DELETE FROM indexed", &[]).unwrap();
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.access(&agent.id, &general.id).unwrap(), None);
+        // The name is free again.
+        store.create_agent("ava").unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_mention_comes_with_the_agent_s_number_of_recent_messages() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (agent, _) = store.create_agent("ava").unwrap();
+        store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+        assert_eq!(store.agent_infos().unwrap()[0].context, DEFAULT_CONTEXT);
+        for body in ["one", "two", "three", "@ava what did I just say?"] {
+            store.post(&general.id, DEMO_NAME, "person", body).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mentions = store.pending_mentions(&agent.id).unwrap();
+        let bodies = |store: &Store| -> Vec<String> {
+            store.mention_context(&agent.id, &mentions).unwrap().into_iter().flat_map(|(_, m)| m).map(|m| m.body).collect()
+        };
+        assert_eq!(bodies(&store), ["one", "two", "three", "@ava what did I just say?"]);
+        store.set_context(&agent.id, 2).unwrap();
+        assert_eq!(bodies(&store), ["three", "@ava what did I just say?"]);
+        // Later messages aren't part of what it was asked.
+        store.post(&general.id, DEMO_NAME, "person", "later").unwrap();
+        assert_eq!(bodies(&store), ["three", "@ava what did I just say?"]);
+        store.set_context(&agent.id, 0).unwrap();
+        assert!(bodies(&store).is_empty());
+        assert!(store.set_context(&agent.id, MAX_CONTEXT + 1).is_err());
+        assert_eq!(store.agent_infos().unwrap()[0].context, 0);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
