@@ -6,51 +6,17 @@ on:
 permissions:
   contents: read
 # Addis APS 11 says fresh mirab VMs. This org has no mirab runner yet, so the
-# jobs use the temporary host runners (Sami, 30 Oct), each inside a fresh
-# Ubuntu container so nothing is installed on the host.
+# jobs use the temporary host runners (Sami, 30 Oct). Each job runs inside a
+# fresh container that gets the checkout through stdin and writes nothing
+# back, so nothing is installed or left on the host.
 jobs:
-  web:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [web, native, app]
+    name: ${{ matrix.job }}
     runs-on: host-linux-x64
-    container: ubuntu:24.04
     steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: npm run check
-      - run: npm run build
-  native:
-    runs-on: host-linux-x64
-    container: ubuntu:24.04
-    steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: npm run build
-      - run: cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
-      - run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
-  app:
-    # The real app on Linux, through tauri-driver: the window, the Rust
-    # commands and the database together (tests/e2e/smoke.mjs).
-    runs-on: host-linux-x64
-    container: ubuntu:24.04
-    steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev webkit2gtk-driver xvfb xauth
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: cargo install tauri-driver --locked
-      - run: npx tauri build --debug --no-bundle
-      - run: |
-          xvfb-run -a sh -c 'tauri-driver & sleep 3; node tests/e2e/smoke.mjs "$PWD/src-tauri/target/debug/gild-desktop"'
+      - run: tar -c --exclude=.git . | docker run --rm -i node:24-bookworm bash -c 'mkdir /w && tar -x -C /w && cd /w && ci/linux.sh ${{ matrix.job }}'
