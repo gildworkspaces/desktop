@@ -67,6 +67,40 @@ try {
   assert.equal(history.error, undefined, history.error)
   assert.deepEqual(history, ['Demo: Jordan Lee: New → Docs needed, Sent by: Northside', 'Demo: Add Jordan Lee'])
   console.log('history:', JSON.stringify(history))
+
+  // An agent, added in the window, works through the MCP endpoint, and only
+  // in the channel it was given.
+  await driver.findElement(By.css('#new-agent')).sendKeys('intake\n')
+  const token = await (await driver.wait(until.elementLocated(By.css('.secret code')), 10000)).getText()
+  assert.match(token, /^gild_[0-9a-f]{64}$/)
+  await driver.findElement(By.css('.modal .primary')).click()
+  await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    ;(async () => {
+      const ws = await call('workspaces')
+      const intake = (await call('channels', { workspaceId: ws[0].id })).find(c => c.name === 'student-intake')
+      const [agent] = await call('agents')
+      await call('set_access', { channelId: intake.id, agentId: agent.id, access: 'write' })
+    })().then(done, e => done(String(e)))
+  `)
+  const mcp = async (body, session) => {
+    const res = await fetch('http://127.0.0.1:4747/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${token}`, ...(session ? { 'Mcp-Session-Id': session } : {}) },
+      body: JSON.stringify(body),
+    })
+    const text = await res.text()
+    const line = text.split('\n').map(l => l.replace(/^data:\s*/, '')).find(l => l.startsWith('{'))
+    return { session: res.headers.get('mcp-session-id'), json: line ? JSON.parse(line) : null }
+  }
+  const init = await mcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } } })
+  assert.equal(init.json.result.serverInfo.name, 'gild')
+  await mcp({ jsonrpc: '2.0', method: 'notifications/initialized' }, init.session)
+  const listed = await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)
+  const channels = JSON.parse(listed.json.result.content[0].text).channels.map(c => `${c.name}:${c.access}`)
+  assert.deepEqual(channels, ['student-intake:write'], 'general was never shared')
+  console.log('agent sees:', JSON.stringify(channels))
 } finally {
   await driver.quit()
 }

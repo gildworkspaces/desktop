@@ -1,17 +1,18 @@
+mod mcp;
 mod records;
 mod store;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use records::{Change, Record};
-use store::{Channel, ChannelData, Message, Store, Workspace, DEMO_NAME};
+use records::{Access, Change, Record};
+use store::{Agent, AgentAccess, AuditEntry, Channel, ChannelData, Message, Store, Workspace, DEMO_NAME};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
-struct Core(Mutex<Store>);
+struct Core(Arc<Mutex<Store>>);
 
 fn with<T>(core: &State<Core>, f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
     let store = core.0.lock().map_err(|_| "the workspace database is unavailable; restart gild".to_string())?;
@@ -92,6 +93,49 @@ fn record_history(core: State<Core>, channel_id: String, record_id: String) -> R
     with(&core, |s| s.record_history(&channel_id, &record_id))
 }
 
+#[derive(Serialize)]
+struct NewAgent {
+    agent: Agent,
+    /// Shown once. Only its hash is kept.
+    token: String,
+    endpoint: String,
+}
+
+#[tauri::command]
+fn agents(core: State<Core>) -> Result<Vec<Agent>, String> {
+    with(&core, |s| s.agents())
+}
+
+#[tauri::command]
+fn create_agent(core: State<Core>, name: String) -> Result<NewAgent, String> {
+    let (agent, token) = with(&core, |s| s.create_agent(&name))?;
+    Ok(NewAgent { agent, token, endpoint: format!("http://127.0.0.1:{}/mcp", mcp::PORT) })
+}
+
+#[tauri::command]
+fn channel_access(core: State<Core>, channel_id: String) -> Result<Vec<AgentAccess>, String> {
+    with(&core, |s| s.channel_access(&channel_id))
+}
+
+#[tauri::command]
+fn set_access(core: State<Core>, channel_id: String, agent_id: String, access: Option<Access>) -> Result<Vec<AgentAccess>, String> {
+    with(&core, |s| {
+        s.set_access(&channel_id, DEMO_NAME, &agent_id, access)?;
+        s.channel_access(&channel_id)
+    })
+}
+
+#[tauri::command]
+fn activity(core: State<Core>, channel_id: String) -> Result<Vec<AuditEntry>, String> {
+    with(&core, |s| s.activity(&channel_id))
+}
+
+/// Where agents connect, or why they can't.
+#[tauri::command]
+fn mcp_status() -> Result<String, String> {
+    mcp::STATUS.get().cloned().unwrap_or_else(|| Err("Starting the agent endpoint…".into()))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -100,7 +144,9 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             let store = Store::open(&dir)?;
             store.seed_if_empty()?;
-            app.manage(Core(Mutex::new(store)));
+            let core = Arc::new(Mutex::new(store));
+            mcp::serve(mcp::Gild { core: core.clone(), app: Some(app.handle().clone()) });
+            app.manage(Core(core));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -116,6 +162,12 @@ pub fn run() {
             add_record,
             update_record,
             record_history,
+            agents,
+            create_agent,
+            channel_access,
+            set_access,
+            activity,
+            mcp_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running gild desktop");

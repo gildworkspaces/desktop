@@ -1,7 +1,8 @@
 'use client'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
-import { core, inApp, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type Message } from '@/lib/core'
+import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
+import { core, inApp, onChanged, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type Message } from '@/lib/core'
 
 export default function App() {
   const [ready, setReady] = useState<'checking' | 'app' | 'browser'>('checking')
@@ -138,10 +139,7 @@ function WorkspaceView({ account, workspace, onBack }: { account: Account; works
           <span className="label">Members</span>
           <div className="member"><span className="dot" aria-hidden="true" />{account.name} (you)</div>
         </div>
-        <div className="group">
-          <span className="label">Agents</span>
-          <p className="note">No agents yet. Agents join channels in an upcoming release.</p>
-        </div>
+        <AgentsSidebar />
         <div className="foot"><Who account={account} /></div>
       </nav>
       {current ? <ChannelView key={current.id} channel={current} /> : <main className="channel" />}
@@ -159,7 +157,11 @@ function ChannelView({ channel }: { channel: Channel }) {
   const [error, setError] = useState('')
   const list = useRef<HTMLDivElement>(null)
 
-  useEffect(() => { core.messages(channel.id).then(setMessages, e => setError(errorText(e))) }, [channel.id])
+  const [panel, setPanel] = useState<'access' | 'activity' | null>(null)
+  const [version, setVersion] = useState(0)
+  useEffect(() => { core.messages(channel.id).then(setMessages, e => setError(errorText(e))) }, [channel.id, version])
+  // An agent changed this channel: show it.
+  useEffect(() => onChanged(id => { if (id === channel.id) setVersion(v => v + 1) }), [channel.id])
   const toBottom = useCallback(() => { const el = list.current; if (el) el.scrollTop = el.scrollHeight }, [])
   useEffect(toBottom, [messages, toBottom])
 
@@ -187,10 +189,12 @@ function ChannelView({ channel }: { channel: Channel }) {
             <button className={mode === 'board' ? 'tab on' : 'tab'} aria-pressed={mode === 'board'} onClick={() => setMode('board')}>Board</button>
           </div>
         )}
+        <button className="ghost" onClick={() => setPanel(p => (p === 'access' ? null : 'access'))}>Access</button>
+        <button className="ghost" onClick={() => setPanel(p => (p === 'activity' ? null : 'activity'))}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
-        <ViewPane channelId={channel.id} mode={mode} onCount={setCount} />
+        <ViewPane key={version} channelId={channel.id} mode={mode} onCount={setCount} />
       </section>
       <section className="msgs" aria-label="Messages" style={{ flex: `${expanded ? 1 : 2} 1 0` }}>
         <div className="list" ref={list}>
@@ -201,7 +205,7 @@ function ChannelView({ channel }: { channel: Channel }) {
               <div key={m.id} style={{ display: 'contents' }}>
                 {newDay && <div className="daybreak">{day(m.created_at)}</div>}
                 <div className="msg">
-                  <div className={`avatar ${m.kind === 'system' ? 'system' : 'person'}`} aria-hidden="true">{initial(m.author)}</div>
+                  <div className={`avatar ${m.kind}`} aria-hidden="true">{initial(m.author)}</div>
                   <div className="body">
                     <div className="meta">
                       <span className="author">{m.author}</span>
@@ -224,6 +228,8 @@ function ChannelView({ channel }: { channel: Channel }) {
           {error && <p className="error">{error}</p>}
         </div>
       </section>
+      {panel === 'access' && <AccessPanel channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
+      {panel === 'activity' && <ActivityPanel key={version} channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
     </main>
   )
 }

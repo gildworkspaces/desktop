@@ -1,6 +1,7 @@
 // The window's only way to the workspace: the Rust core's commands.
 // Types mirror src-tauri/src/store.rs.
 import { invoke, isTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 export type Account = { name: string; demo: boolean }
 export type Workspace = { id: string; name: string; channels: number; messages: number; created_at: number }
@@ -12,7 +13,21 @@ export type DataRecord = { id: string; title: string; status: string; fields: Re
 export type ChannelData = { view: View | null; records: DataRecord[] }
 export type Change = { commit: string; author: string; at: number; message: string }
 
+export type Access = 'read' | 'write'
+export type Agent = { id: string; name: string; created_at: number }
+export type NewAgent = { agent: Agent; token: string; endpoint: string }
+export type AgentAccess = { agent: Agent; access: Access | null }
+export type AuditEntry = { agent: string; action: string; detail: string; ok: boolean; at: number }
+
 export const inApp = () => isTauri()
+
+/** Call `f` with a channel id whenever an agent changes that channel. */
+export function onChanged(f: (channelId: string) => void): () => void {
+  let stop: (() => void) | null = null
+  let gone = false
+  listen<string>('gild://changed', e => f(e.payload)).then(u => { if (gone) u(); else stop = u })
+  return () => { gone = true; stop?.() }
+}
 
 export const core = {
   account: () => invoke<Account>('account'),
@@ -29,6 +44,12 @@ export const core = {
   updateRecord: (channelId: string, recordId: string, title: string, status: string, fields: Record<string, string>) =>
     invoke<DataRecord>('update_record', { channelId, recordId, title, status, fields }),
   recordHistory: (channelId: string, recordId: string) => invoke<Change[]>('record_history', { channelId, recordId }),
+  agents: () => invoke<Agent[]>('agents'),
+  createAgent: (name: string) => invoke<NewAgent>('create_agent', { name }),
+  channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
+  setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),
+  activity: (channelId: string) => invoke<AuditEntry[]>('activity', { channelId }),
+  mcpStatus: () => invoke<string>('mcp_status'),
 }
 
 /** "Sent by, Program" → ["Sent by", "Program"] */

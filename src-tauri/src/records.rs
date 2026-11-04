@@ -3,6 +3,8 @@
 //! SQLite tables in `store.rs` are an index rebuilt from it.
 //!
 //! In the repository:
+//!   .gild/acl.json              who besides the workspace's people may use
+//!                               this channel: agent id → "read" | "write"
 //!   .gild/view.json             the channel's view: columns and statuses
 //!   .gild/records/<id>.json     one file per record, so two writers never
 //!                               touch the same file for different records
@@ -18,6 +20,21 @@ use gix::ObjectId;
 use serde::{Deserialize, Serialize};
 
 pub const VIEW_PATH: &str = ".gild/view.json";
+pub const ACL_PATH: &str = ".gild/acl.json";
+
+/// What an agent may do in a channel. No entry means nothing: an agent sees
+/// only the channels it was given.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    Read,
+    Write,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Acl {
+    pub agents: std::collections::BTreeMap<String, Access>,
+}
 pub const RECORDS_DIR: &str = ".gild/records";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -52,6 +69,7 @@ pub struct Change {
 /// What a channel's repository holds at one commit.
 pub struct Snapshot {
     pub commit: Option<String>,
+    pub acl: Acl,
     pub view: Option<View>,
     pub records: Vec<Record>,
 }
@@ -139,16 +157,20 @@ fn blob_text(repo: &gix::Repository, tree: &gix::Tree<'_>, path: &str) -> Result
 pub fn snapshot(data: &Path, channel_id: &str) -> Result<Snapshot, String> {
     let path = repo_path(data, channel_id);
     if !path.exists() {
-        return Ok(Snapshot { commit: None, view: None, records: vec![] });
+        return Ok(Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![] });
     }
     let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
     let Some(id) = head(&repo) else {
-        return Ok(Snapshot { commit: None, view: None, records: vec![] });
+        return Ok(Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![] });
     };
     let tree = repo
         .find_commit(id)
         .and_then(|c| c.tree())
         .map_err(|e| err("reading the channel's last change", e))?;
+    let acl = match blob_text(&repo, &tree, ACL_PATH)? {
+        Some(bytes) => serde_json::from_slice::<Acl>(&bytes).map_err(|e| err("reading .gild/acl.json", e))?,
+        None => Acl::default(),
+    };
     let view = match blob_text(&repo, &tree, VIEW_PATH)? {
         Some(bytes) => Some(serde_json::from_slice::<View>(&bytes).map_err(|e| err("reading .gild/view.json", e))?),
         None => None,
@@ -168,7 +190,7 @@ pub fn snapshot(data: &Path, channel_id: &str) -> Result<Snapshot, String> {
         }
     }
     records.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-    Ok(Snapshot { commit: Some(id.to_string()), view, records })
+    Ok(Snapshot { commit: Some(id.to_string()), acl, view, records })
 }
 
 /// The commits that changed `path`, newest first, following the first parent

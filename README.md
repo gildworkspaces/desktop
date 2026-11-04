@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.3.0)
+## What works (0.4.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -18,6 +18,12 @@ everything after that is the design doc.
 - **A channel can hold a table**, shown as a table or a board. Add records,
   edit them, move them between statuses, and open a record to see its full
   history: who changed what, and when.
+- **Agents.** Add an agent in the sidebar and gild shows its token once,
+  with the command that connects Claude Code (any MCP client works). Agents
+  see only the channels you share with them, from a channel's **Access**
+  button: *can read*, or *can read and change*. What agents do appears in
+  the channel as it happens, and every call they make, allowed or refused, is
+  in the channel's **Activity**.
 - A built-in **demo account**. Accounts and sign-in come later; until then
   everything is written as "Demo".
 
@@ -36,6 +42,12 @@ The first run creates a "Demo workspace" with #general.
   truth: every change is a commit by the person who made it, and the SQLite
   tables are an index rebuilt from it (on every write, and on startup when a
   channel's history has moved past its index). Pure Rust (gitoxide).
+- `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
+  HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
+  `list_channels`, `read_channel`, `post_message`, `add_record`,
+  `update_record`, `record_history`. Each call carries the agent's token;
+  access is checked by the same store functions the window uses, and a
+  channel's grants live in its git history as `.gild/acl.json`.
 - The database file: `gild.db` in the app's data folder
   (`~/Library/Application Support/gg.gild.desktop/` on macOS). It is a plain
   SQLite file; `sqlite3` reads it.
