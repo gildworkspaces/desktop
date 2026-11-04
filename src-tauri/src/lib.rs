@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use records::{Access, Change, Record};
-use store::{Agent, AgentAccess, AuditEntry, Channel, ChannelData, Message, Store, Workspace, DEMO_NAME};
+use records::{Access, Change, Doc, Record};
+use store::{Agent, AgentAccess, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Store, Workspace, DEMO_NAME};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -92,6 +92,42 @@ fn update_record(
 #[tauri::command]
 fn record_history(core: State<Core>, channel_id: String, record_id: String) -> Result<Vec<Change>, String> {
     with(&core, |s| s.record_history(&channel_id, &record_id))
+}
+
+#[tauri::command]
+fn channel_docs(core: State<Core>, channel_id: String) -> Result<ChannelDocs, String> {
+    with(&core, |s| s.channel_docs(&channel_id))
+}
+
+#[tauri::command]
+fn create_doc(core: State<Core>, channel_id: String, title: String) -> Result<Doc, String> {
+    with(&core, |s| s.create_doc(&channel_id, DEMO_NAME, &title))
+}
+
+#[tauri::command]
+fn save_doc(core: State<Core>, channel_id: String, path: String, body: String) -> Result<Doc, String> {
+    with(&core, |s| s.save_doc(&channel_id, DEMO_NAME, &path, &body))
+}
+
+#[tauri::command]
+fn doc_history(core: State<Core>, channel_id: String, path: String) -> Result<Vec<Change>, String> {
+    with(&core, |s| s.doc_history(&channel_id, &path))
+}
+
+#[tauri::command]
+fn approve_proposal(core: State<Core>, channel_id: String, id: String) -> Result<ChannelDocs, String> {
+    with(&core, |s| {
+        s.approve_proposal(&channel_id, DEMO_NAME, &id)?;
+        s.channel_docs(&channel_id)
+    })
+}
+
+#[tauri::command]
+fn reject_proposal(core: State<Core>, channel_id: String, id: String) -> Result<ChannelDocs, String> {
+    with(&core, |s| {
+        s.reject_proposal(&channel_id, DEMO_NAME, &id)?;
+        s.channel_docs(&channel_id)
+    })
 }
 
 #[derive(Serialize)]
@@ -181,6 +217,12 @@ pub fn run() {
             add_record,
             update_record,
             record_history,
+            channel_docs,
+            create_doc,
+            save_doc,
+            doc_history,
+            approve_proposal,
+            reject_proposal,
             agents,
             create_agent,
             channel_access,

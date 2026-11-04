@@ -29,6 +29,7 @@ th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
 .msg b { font-weight: 600; }
 .msg .t { color: var(--soft); font: 11px ui-monospace, Menlo, monospace; margin-left: 6px; }
 .msg .x { white-space: pre-wrap; overflow-wrap: anywhere; }
+.doc { margin: 0; padding: 14px 16px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.6 ui-monospace, Menlo, monospace; }
 .files { color: var(--soft); font-size: 12px; }
 .files code { font: 12px ui-monospace, Menlo, monospace; }
 @media (max-width: 640px) { .wrap { flex-direction: column; } nav { width: auto; border-right: 0; border-bottom: 1px solid var(--rule); } }
@@ -71,6 +72,10 @@ th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
       })
       box.append(t); main.append(box)
     }
+    ;(c.docs || []).forEach(d => {
+      main.append(el('span', 'Doc · ' + d.title, 'label'))
+      main.append(el('pre', d.text, 'box doc'))
+    })
     main.append(el('span', c.messages.length === 1 ? '1 message' : c.messages.length + ' messages', 'label'))
     c.messages.forEach(m => {
       const d = el('div', null, 'msg'), line = el('div')
@@ -79,7 +84,7 @@ th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
       main.append(d)
     })
     const files = el('p', null, 'files')
-    files.append('Open files for this channel: ', el('code', 'channels/' + c.name + '/'), '. Its full history is a git repository you can clone: ', el('code', 'git clone channels/' + c.name + '/history.git'))
+    files.append('Open files for this channel: ', el('code', 'channels/' + c.name + '/'), ' (docs as markdown in ', el('code', 'docs/'), '). Its full history is a git repository you can clone: ', el('code', 'git clone channels/' + c.name + '/history.git'))
     main.append(files)
   }
   data.channels.forEach((c, i) => { const b = el('button', '# ' + c.name); b.onclick = () => show(i); nav.append(b) })

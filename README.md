@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.5.0)
+## What works (0.6.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -24,9 +24,16 @@ everything after that is the design doc.
   button: *can read*, or *can read and change*. What agents do appears in
   the channel as it happens, and every call they make, allowed or refused, is
   in the channel's **Activity**.
+- **Docs.** A channel's **Docs** tab holds markdown docs: SOPs, notes,
+  plans. Write and edit them in the window; each save is a commit, and
+  **History** shows them all. Agents search docs (`search_docs` answers with
+  the doc and the section) and read them, but can't change them: an agent's
+  edit is a *proposal* that waits under **Waiting for you**, with its
+  summary and a diff, until a person approves or rejects it. Every step is
+  said in the channel's chat.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
-  table as CSV and JSON, its full history as a git repository you can clone,
+  table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
   and `export-viewer.html`, which browses all of it offline.
 - A built-in **demo account**. Accounts and sign-in come later; until then
   everything is written as "Demo".
@@ -45,11 +52,16 @@ The first run creates a "Demo workspace" with #general.
   `.gild/view.json` and one `.gild/records/<id>.json` per record. Git is the
   truth: every change is a commit by the person who made it, and the SQLite
   tables are an index rebuilt from it (on every write, and on startup when a
-  channel's history has moved past its index). Pure Rust (gitoxide).
+  channel's history has moved past its index). Pure Rust (gitoxide). Docs
+  are `docs/<name>.md` in the same repository. An agent's proposed edit is a
+  branch, `proposals/<id>`; approving it is a merge commit by the person who
+  approved, and rejecting it moves the branch to `refs/gild/rejected/<id>`,
+  so what was proposed is never lost.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
   `list_channels`, `read_channel`, `post_message`, `add_record`,
-  `update_record`, `record_history`. Each call carries the agent's token;
+  `update_record`, `record_history`, `read_doc`, `search_docs`,
+  `propose_doc_edit`. Each call carries the agent's token;
   access is checked by the same store functions the window uses, and a
   channel's grants live in its git history as `.gild/acl.json`.
 - The database file: `gild.db` in the app's data folder

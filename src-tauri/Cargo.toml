@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.5.0"
+version = "0.6.0"
 description = "gild: the open workspace where people and agents work together"
 license = "Apache-2.0"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -31,6 +31,8 @@ sha2 = "0.11.0"
 getrandom = "0.3"
 tokio-util = "0.7"
 http = "1"
+# Line diffs of agents' proposed doc edits (Apache-2.0, pure Rust).
+similar = "2.7"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

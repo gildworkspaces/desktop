@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 
-use crate::records::{self, Access, Acl, Change, Record, View};
+use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
 use sha2::{Digest, Sha256};
 
 /// Bumped when a table's columns or meaning change.
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS records (channel_id TEXT NOT NULL, id TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS indexed (channel_id TEXT PRIMARY KEY, commit_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS grants (channel_id TEXT NOT NULL, agent_id TEXT NOT NULL, access TEXT NOT NULL, PRIMARY KEY (channel_id, agent_id));
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS docs (channel_id TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (channel_id, path));
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -360,6 +361,13 @@ impl Store {
         self.run("DELETE FROM views WHERE channel_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM grants WHERE channel_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM indexed WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM docs WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        for d in &snap.docs {
+            self.run(
+                "INSERT INTO docs (channel_id, path, title, body) VALUES (?1, ?2, ?3, ?4)",
+                &[id.clone(), Value::from_text(d.path.clone()), Value::from_text(d.title.clone()), Value::from_text(d.body.clone())],
+            )?;
+        }
         if let Some(commit) = &snap.commit {
             self.run("INSERT INTO indexed (channel_id, commit_id) VALUES (?1, ?2)", &[id.clone(), Value::from_text(commit.clone())])?;
         }
@@ -537,6 +545,250 @@ impl Store {
     }
 }
 
+
+/// An agent's proposed doc edit, as the window and agents see it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub id: String,
+    pub agent: String,
+    pub summary: String,
+    pub at: i64,
+    pub path: String,
+    pub title: String,
+    /// The doc doesn't exist yet: approving creates it.
+    pub new_doc: bool,
+    /// The doc changed after the proposal: it can only be rejected.
+    pub stale: bool,
+    pub diff: Vec<DiffLine>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ChannelDocs {
+    pub docs: Vec<Doc>,
+    pub proposals: Vec<Proposal>,
+}
+
+/// A part of a doc that matches a search: the doc, the heading it's under,
+/// and the lines that matched.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct DocHit {
+    pub channel_id: String,
+    pub channel: String,
+    pub path: String,
+    pub title: String,
+    pub section: String,
+    pub excerpt: String,
+    pub score: usize,
+}
+
+/// Docs are at most this many characters: a long SOP, not a book.
+const MAX_DOC: usize = 200_000;
+
+/// Words a question is made of that say nothing about what it's after.
+const STOP: &[&str] = &[
+    "the", "and", "for", "are", "was", "were", "what", "where", "when", "which", "who", "whom", "why", "how", "does", "did", "doing",
+    "with", "from", "into", "that", "this", "these", "those", "there", "their", "they", "them", "you", "your", "our", "can", "should",
+    "would", "could", "will", "about", "have", "has", "had", "not", "but", "any", "all", "get", "got", "goes", "go", "put", "need",
+];
+
+/// A search's terms: lower case, without stop words, without a plural `s`.
+fn terms(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in query.split(|c: char| !c.is_alphanumeric()).map(str::to_lowercase) {
+        if w.chars().count() < 3 || STOP.contains(&w.as_str()) {
+            continue;
+        }
+        let w = if w.chars().count() > 3 && w.ends_with('s') && !w.ends_with("ss") { w[..w.len() - 1].to_string() } else { w };
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// The parts of one doc that match `terms`, each scored by how many terms
+/// it has (a term in the heading counts twice).
+fn search_doc(doc: &Doc, terms: &[String]) -> Vec<(String, String, usize)> {
+    let mut sections: Vec<(String, Vec<&str>)> = vec![(doc.title.clone(), vec![])];
+    for line in doc.body.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            let heading = t.trim_start_matches('#').trim();
+            if heading != doc.title {
+                sections.push((heading.to_string(), vec![]));
+            }
+        } else if !t.is_empty() {
+            sections.last_mut().expect("there is always a first section").1.push(line.trim());
+        }
+    }
+    let mut out = Vec::new();
+    for (heading, lines) in sections {
+        // A heading with nothing under it answers nothing.
+        if lines.is_empty() {
+            continue;
+        }
+        let (h, text) = (heading.to_lowercase(), lines.join("\n").to_lowercase());
+        let score: usize = terms.iter().map(|t| usize::from(text.contains(t.as_str())) + 2 * usize::from(h.contains(t.as_str()))).sum();
+        if score == 0 {
+            continue;
+        }
+        let matching: Vec<&str> = lines.iter().copied().filter(|l| terms.iter().any(|t| l.to_lowercase().contains(t.as_str()))).collect();
+        let excerpt = if matching.is_empty() { lines.clone() } else { matching }.join("\n");
+        let excerpt: String = excerpt.chars().take(400).collect();
+        out.push((heading, excerpt, score));
+    }
+    out
+}
+
+impl Store {
+    pub fn docs(&self, channel_id: &str) -> Result<Vec<Doc>, String> {
+        let rows = self.query("SELECT path, body FROM docs WHERE channel_id = ?1 ORDER BY title, path", &[Value::from_text(channel_id.to_string())])?;
+        Ok(rows.iter().map(|r| Doc::new(&text(&r[0]), text(&r[1]))).collect())
+    }
+
+    pub fn doc(&self, channel_id: &str, path: &str) -> Result<Doc, String> {
+        self.docs(channel_id)?.into_iter().find(|d| d.path == path).ok_or_else(|| "There is no doc at that path in this channel.".into())
+    }
+
+    /// A channel's docs and the proposals waiting on them.
+    pub fn channel_docs(&self, channel_id: &str) -> Result<ChannelDocs, String> {
+        self.require_channel(channel_id)?;
+        Ok(ChannelDocs { docs: self.docs(channel_id)?, proposals: self.proposals(channel_id)? })
+    }
+
+    fn check_body(body: &str) -> Result<(), String> {
+        if body.chars().count() > MAX_DOC {
+            return Err("Docs are at most 200,000 characters.".into());
+        }
+        Ok(())
+    }
+
+    /// Where a doc called `title` lives: `docs/<name>.md`.
+    fn path_for(title: &str) -> Result<String, String> {
+        let name = channel_name(title).ok_or("Give the doc a title with at least one letter or digit.")?;
+        Ok(format!("{}/{name}.md", records::DOCS_DIR))
+    }
+
+    /// A new doc, starting with its title as a heading.
+    pub fn create_doc(&self, channel_id: &str, author: &str, title: &str) -> Result<Doc, String> {
+        self.require_channel(channel_id)?;
+        let title = title.trim();
+        if title.chars().count() > 120 {
+            return Err("Doc titles are at most 120 characters.".into());
+        }
+        let path = Self::path_for(title)?;
+        if self.docs(channel_id)?.iter().any(|d| d.path == path) {
+            return Err(format!("This channel already has a doc at {path}."));
+        }
+        let body = format!("# {title}\n\n");
+        self.write(channel_id, author, &format!("Add doc {title}"), &[(path.clone(), body.into_bytes())])?;
+        self.doc(channel_id, &path)
+    }
+
+    /// Save a person's edit to a doc. Nothing changed: no commit.
+    pub fn save_doc(&self, channel_id: &str, author: &str, path: &str, body: &str) -> Result<Doc, String> {
+        let old = self.doc(channel_id, path)?;
+        Self::check_body(body)?;
+        if old.body == body {
+            return Ok(old);
+        }
+        self.write(channel_id, author, &format!("Edit {}", Doc::new(path, body.to_string()).title), &[(path.to_string(), body.as_bytes().to_vec())])?;
+        self.doc(channel_id, path)
+    }
+
+    pub fn doc_history(&self, channel_id: &str, path: &str) -> Result<Vec<Change>, String> {
+        records::history(&self.data, channel_id, path)
+    }
+
+    pub fn proposals(&self, channel_id: &str) -> Result<Vec<Proposal>, String> {
+        Ok(records::proposals(&self.data, channel_id)?
+            .into_iter()
+            .map(|p| Proposal {
+                title: Doc::new(&p.path, p.after.clone()).title,
+                diff: records::diff(p.before.as_deref().unwrap_or(""), &p.after),
+                new_doc: p.before.is_none(),
+                id: p.id,
+                agent: p.author,
+                summary: p.message,
+                at: p.at,
+                path: p.path,
+                stale: p.stale,
+            })
+            .collect())
+    }
+
+    /// An agent's edit to a doc (`path`), or a new doc (`title`), as a
+    /// proposal: the doc doesn't change until a person approves it.
+    pub fn propose_doc(&self, channel_id: &str, agent: &str, path: Option<&str>, title: Option<&str>, body: &str, summary: &str) -> Result<Proposal, String> {
+        self.require_channel(channel_id)?;
+        Self::check_body(body)?;
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err("Say in a few words what the change is and why (`summary`).".into());
+        }
+        let (path, title) = match (path, title) {
+            (Some(p), _) => {
+                let d = self.doc(channel_id, p)?;
+                if d.body == body {
+                    return Err("That is what the doc already says.".into());
+                }
+                (d.path, d.title)
+            }
+            (None, Some(t)) => {
+                let p = Self::path_for(t)?;
+                if self.docs(channel_id)?.iter().any(|d| d.path == p) {
+                    return Err(format!("A doc already exists at {p}: propose an edit to it with `path`."));
+                }
+                (p, t.trim().to_string())
+            }
+            (None, None) => return Err("Give `path` to edit a doc, or `title` for a new one.".into()),
+        };
+        let id = new_id();
+        records::propose(&self.data, channel_id, &id, agent, summary, &path, body.as_bytes())?;
+        self.post(channel_id, "gild", "system", &format!("{agent} proposed a change to {title}: {summary}. It waits for approval in Docs."))?;
+        self.proposals(channel_id)?.into_iter().find(|p| p.id == id).ok_or_else(|| "the proposal was not saved".into())
+    }
+
+    fn proposal(&self, channel_id: &str, id: &str) -> Result<Proposal, String> {
+        self.proposals(channel_id)?.into_iter().find(|p| p.id == id).ok_or_else(|| "That proposal was already approved or rejected.".into())
+    }
+
+    pub fn approve_proposal(&self, channel_id: &str, author: &str, id: &str) -> Result<(), String> {
+        let p = self.proposal(channel_id, id)?;
+        let message = format!("Approve {}'s change to {}: {}", p.agent, p.title, p.summary);
+        records::approve(&self.data, channel_id, id, author, &message)?;
+        self.reindex(channel_id)?;
+        self.post(channel_id, "gild", "system", &format!("{author} approved {}'s change to {}.", p.agent, p.title))?;
+        Ok(())
+    }
+
+    pub fn reject_proposal(&self, channel_id: &str, author: &str, id: &str) -> Result<(), String> {
+        let p = self.proposal(channel_id, id)?;
+        records::reject(&self.data, channel_id, id)?;
+        self.post(channel_id, "gild", "system", &format!("{author} rejected {}'s change to {}.", p.agent, p.title))?;
+        Ok(())
+    }
+
+    /// The parts of these channels' docs that best match `query`, best first.
+    pub fn search_docs(&self, channel_ids: &[String], query: &str) -> Result<Vec<DocHit>, String> {
+        let terms = terms(query);
+        if terms.is_empty() {
+            return Err("Search for a few words that would be in the doc.".into());
+        }
+        let mut hits = Vec::new();
+        for id in channel_ids {
+            let Some(channel) = self.channel(id)? else { continue };
+            for doc in self.docs(id)? {
+                for (section, excerpt, score) in search_doc(&doc, &terms) {
+                    hits.push(DocHit { channel_id: id.clone(), channel: channel.name.clone(), path: doc.path.clone(), title: doc.title.clone(), section, excerpt, score });
+                }
+            }
+        }
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| (&a.channel, &a.path).cmp(&(&b.channel, &b.path))));
+        hits.truncate(5);
+        Ok(hits)
+    }
+}
 
 /// An agent: a member that works in the channels it's given, through the
 /// app's MCP endpoint, with its own token.
@@ -863,6 +1115,109 @@ mod tests {
         let general = &store.channels(&ws.id).unwrap()[0];
         assert!(store.post(&general.id, DEMO_NAME, "person", "  ").is_err());
         assert!(store.post("nope", DEMO_NAME, "person", "hi").is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    const SOP: &str = "# Intake SOP\n\nHow the front desk takes in a student.\n\n## Step 1: Check in\n\nGreet the student and find them in #student-intake.\n\n## Step 2: Forms\n\nSigned intake forms go in the blue folder at the front desk.\nScan them before 5pm.\n";
+
+    #[test]
+    fn docs_are_files_in_the_channel_history() {
+        let (dir, file) = temp();
+        let channel = {
+            let store = Store::open(&file).unwrap();
+            let ws = store.create_workspace("Front Desk").unwrap();
+            let c = store.channels(&ws.id).unwrap()[0].clone();
+            let doc = store.create_doc(&c.id, DEMO_NAME, "Intake SOP").unwrap();
+            assert_eq!((doc.path.as_str(), doc.title.as_str()), ("docs/intake-sop.md", "Intake SOP"));
+            assert!(store.create_doc(&c.id, DEMO_NAME, "intake sop").unwrap_err().contains("already has"));
+            store.save_doc(&c.id, DEMO_NAME, &doc.path, SOP).unwrap();
+            store.save_doc(&c.id, DEMO_NAME, &doc.path, SOP).unwrap();
+            assert!(store.save_doc(&c.id, DEMO_NAME, "docs/../../x.md", "x").is_err(), "only docs that exist");
+            let log: Vec<String> = store.doc_history(&c.id, &doc.path).unwrap().into_iter().map(|h| h.message).collect();
+            assert_eq!(log, ["Edit Intake SOP", "Add doc Intake SOP"], "saving with nothing changed makes no commit");
+            store.run("DELETE FROM docs", &[]).unwrap();
+            store.run("DELETE FROM indexed", &[]).unwrap();
+            c
+        };
+        let store = Store::open(&file).unwrap();
+        let docs = store.docs(&channel.id).unwrap();
+        assert_eq!(docs.len(), 1, "rebuilt from git");
+        assert_eq!(docs[0].body, SOP);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_s_edit_waits_for_a_person() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let doc = store.create_doc(&c.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&c.id, DEMO_NAME, &doc.path, SOP).unwrap();
+
+        let edited = SOP.replace("before 5pm", "before 4pm");
+        let p = store.propose_doc(&c.id, "intake", Some(&doc.path), None, &edited, "The office closes at 4:30 now").unwrap();
+        assert_eq!(store.doc(&c.id, &doc.path).unwrap().body, SOP, "nothing changes until a person approves");
+        assert!(!p.stale && !p.new_doc);
+        let changed: Vec<(&str, &str)> = p.diff.iter().filter(|l| l.op != "same").map(|l| (l.op, l.text.as_str())).collect();
+        assert_eq!(changed, [("del", "Scan them before 5pm."), ("add", "Scan them before 4pm.")]);
+
+        store.approve_proposal(&c.id, DEMO_NAME, &p.id).unwrap();
+        assert_eq!(store.doc(&c.id, &doc.path).unwrap().body, edited);
+        assert!(store.proposals(&c.id).unwrap().is_empty());
+        assert!(store.approve_proposal(&c.id, DEMO_NAME, &p.id).unwrap_err().contains("already"));
+        let log: Vec<String> = store.doc_history(&c.id, &doc.path).unwrap().into_iter().map(|h| format!("{}: {}", h.author, h.message)).collect();
+        assert_eq!(log[0], "Demo: Approve intake's change to Intake SOP: The office closes at 4:30 now");
+
+        // A proposal on a doc that changed since can't be approved.
+        let p = store.propose_doc(&c.id, "intake", Some(&doc.path), None, &format!("{edited}\nAsk for ID.\n"), "Ask for ID").unwrap();
+        store.save_doc(&c.id, DEMO_NAME, &doc.path, &format!("{edited}\nBring a pen.\n")).unwrap();
+        assert!(store.proposals(&c.id).unwrap()[0].stale);
+        assert!(store.approve_proposal(&c.id, DEMO_NAME, &p.id).unwrap_err().contains("changed after"));
+        store.reject_proposal(&c.id, DEMO_NAME, &p.id).unwrap();
+        assert!(store.proposals(&c.id).unwrap().is_empty());
+        assert!(store.doc(&c.id, &doc.path).unwrap().body.contains("Bring a pen") && !store.doc(&c.id, &doc.path).unwrap().body.contains("Ask for ID"));
+        // What was rejected stays in the history.
+        let repo = gix::open(records::repo_path(&dir, &c.id)).unwrap();
+        assert!(repo.find_reference(format!("refs/gild/rejected/{}", p.id).as_str()).is_ok());
+
+        // A new doc can be proposed too, and appears only when approved.
+        let p = store.propose_doc(&c.id, "intake", None, Some("Closing"), "# Closing\n\nLock the door.\n", "A closing checklist").unwrap();
+        assert!(p.new_doc && store.docs(&c.id).unwrap().len() == 1);
+        store.approve_proposal(&c.id, DEMO_NAME, &p.id).unwrap();
+        assert_eq!(store.doc(&c.id, "docs/closing.md").unwrap().title, "Closing");
+        assert!(store.propose_doc(&c.id, "intake", None, None, "x", "y").is_err());
+        assert!(store.propose_doc(&c.id, "intake", Some("docs/closing.md"), None, "x", " ").unwrap_err().contains("summary"));
+
+        // Each step is said in the channel, so people see it happen.
+        let said: Vec<String> = store.messages(&c.id).unwrap().into_iter().filter(|m| m.kind == "system").map(|m| m.body).collect();
+        assert_eq!(said[0], "intake proposed a change to Intake SOP: The office closes at 4:30 now. It waits for approval in Docs.");
+        assert_eq!(said[1], "Demo approved intake's change to Intake SOP.");
+        assert_eq!(said[3], "Demo rejected intake's change to Intake SOP.");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_finds_the_section_that_answers() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let other = store.create_channel(&ws.id, "payroll", "").unwrap();
+        let doc = store.create_doc(&c.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&c.id, DEMO_NAME, &doc.path, SOP).unwrap();
+        let pay = store.create_doc(&other.id, DEMO_NAME, "Pay").unwrap();
+        store.save_doc(&other.id, DEMO_NAME, &pay.path, "# Pay\n\nIntake forms for payroll go to the accountant.\n").unwrap();
+
+        let hits = store.search_docs(std::slice::from_ref(&c.id), "Where do the intake forms go?").unwrap();
+        assert_eq!((hits[0].title.as_str(), hits[0].section.as_str()), ("Intake SOP", "Step 2: Forms"));
+        assert_eq!(hits[0].excerpt, "Signed intake forms go in the blue folder at the front desk.");
+        assert!(hits.iter().all(|h| h.channel_id == c.id), "only the channels searched");
+        assert!(store.search_docs(std::slice::from_ref(&c.id), "where is it?").is_err());
+        assert!(store.search_docs(std::slice::from_ref(&c.id), "zebra").unwrap().is_empty());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

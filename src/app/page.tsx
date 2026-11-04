@@ -1,9 +1,10 @@
 'use client'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
+import { DocsPane } from './Docs'
 import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
-import { core, inApp, onChanged, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type Message } from '@/lib/core'
+import { core, inApp, onChanged, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
 export default function App() {
   const [ready, setReady] = useState<'checking' | 'app' | 'browser'>('checking')
@@ -172,14 +173,23 @@ function ChannelView({ channel }: { channel: Channel }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [draft, setDraft] = useState('')
   const [expanded, setExpanded] = useState(false)
-  const [mode, setMode] = useState<'table' | 'board'>('table')
-  const [count, setCount] = useState<number | null>(null)
+  const [mode, setMode] = useState<'table' | 'board' | 'docs'>('table')
+  const [chosen, setChosen] = useState(false)
+  // undefined: not loaded yet; null: the channel has no table.
+  const [count, setCount] = useState<number | null | undefined>(undefined)
+  const [docs, setDocs] = useState<ChannelDocs | null>(null)
   const [error, setError] = useState('')
   const list = useRef<HTMLDivElement>(null)
 
   const [panel, setPanel] = useState<'access' | 'activity' | null>(null)
   const [version, setVersion] = useState(0)
+  const refresh = () => setVersion(v => v + 1)
   useEffect(() => { core.messages(channel.id).then(setMessages, e => setError(errorText(e))) }, [channel.id, version])
+  useEffect(() => { core.channelDocs(channel.id).then(setDocs, e => setError(errorText(e))) }, [channel.id, version])
+  // A channel with docs and no table opens on its docs.
+  useEffect(() => { if (!chosen && count === null && docs && (docs.docs.length > 0 || docs.proposals.length > 0)) setMode('docs') }, [chosen, count, docs])
+  const show = (m: 'table' | 'board' | 'docs') => { setChosen(true); setMode(m) }
+  const waiting = docs?.proposals.length ?? 0
   // An agent changed this channel: show it.
   useEffect(() => onChanged(id => { if (id === channel.id) setVersion(v => v + 1) }), [channel.id])
   const toBottom = useCallback(() => { const el = list.current; if (el) el.scrollTop = el.scrollHeight }, [])
@@ -202,19 +212,22 @@ function ChannelView({ channel }: { channel: Channel }) {
         <h2># {channel.name}</h2>
         {channel.topic && <span className="soft" style={{ fontSize: 13 }}>{channel.topic}</span>}
         <span className="spacer" />
-        {count !== null && <span className="faint mono" style={{ fontSize: 12 }}>{count} {count === 1 ? 'record' : 'records'}</span>}
-        {count !== null && (
-          <div className="tabs" role="group" aria-label="Show as">
-            <button className={mode === 'table' ? 'tab on' : 'tab'} aria-pressed={mode === 'table'} onClick={() => setMode('table')}>Table</button>
-            <button className={mode === 'board' ? 'tab on' : 'tab'} aria-pressed={mode === 'board'} onClick={() => setMode('board')}>Board</button>
-          </div>
-        )}
+        {typeof count === 'number' && mode !== 'docs' && <span className="faint mono" style={{ fontSize: 12 }}>{count} {count === 1 ? 'record' : 'records'}</span>}
+        <div className="tabs" role="group" aria-label="Show">
+          <button className={mode === 'table' ? 'tab on' : 'tab'} aria-pressed={mode === 'table'} onClick={() => show('table')}>Table</button>
+          {typeof count === 'number' && <button className={mode === 'board' ? 'tab on' : 'tab'} aria-pressed={mode === 'board'} onClick={() => show('board')}>Board</button>}
+          <button className={mode === 'docs' ? 'tab on' : 'tab'} aria-pressed={mode === 'docs'} onClick={() => show('docs')}>
+            Docs{waiting > 0 && <span className="count" aria-label={`${waiting} waiting for approval`}>{waiting}</span>}
+          </button>
+        </div>
         <button className="ghost" onClick={() => setPanel(p => (p === 'access' ? null : 'access'))}>Access</button>
         <button className="ghost" onClick={() => setPanel(p => (p === 'activity' ? null : 'activity'))}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
-        <ViewPane key={version} channelId={channel.id} mode={mode} onCount={setCount} />
+        {mode === 'docs'
+          ? docs && <DocsPane channelId={channel.id} data={docs} onChanged={refresh} onEditing={() => setExpanded(true)} />
+          : <ViewPane key={version} channelId={channel.id} mode={mode} onCount={setCount} />}
       </section>
       <section className="msgs" aria-label="Messages" style={{ flex: `${expanded ? 1 : 2} 1 0` }}>
         <div className="list" ref={list}>
