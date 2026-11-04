@@ -7,6 +7,11 @@ export type Workspace = { id: string; name: string; channels: number; messages: 
 export type Channel = { id: string; workspace_id: string; name: string; topic: string; created_at: number }
 export type Message = { id: string; channel_id: string; author: string; kind: 'person' | 'system' | 'agent'; body: string; created_at: number }
 
+export type View = { kind: 'table'; fields: string[]; statuses: string[] }
+export type DataRecord = { id: string; title: string; status: string; fields: Record<string, string>; created_at: number }
+export type ChannelData = { view: View | null; records: DataRecord[] }
+export type Change = { commit: string; author: string; at: number; message: string }
+
 export const inApp = () => isTauri()
 
 export const core = {
@@ -17,7 +22,17 @@ export const core = {
   createChannel: (workspaceId: string, name: string, topic = '') => invoke<Channel>('create_channel', { workspaceId, name, topic }),
   messages: (channelId: string) => invoke<Message[]>('messages', { channelId }),
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
+  channelData: (channelId: string) => invoke<ChannelData>('channel_data', { channelId }),
+  setView: (channelId: string, fields: string[], statuses: string[]) => invoke<ChannelData>('set_view', { channelId, fields, statuses }),
+  addRecord: (channelId: string, title: string, status: string, fields: Record<string, string> = {}) =>
+    invoke<DataRecord>('add_record', { channelId, title, status, fields }),
+  updateRecord: (channelId: string, recordId: string, title: string, status: string, fields: Record<string, string>) =>
+    invoke<DataRecord>('update_record', { channelId, recordId, title, status, fields }),
+  recordHistory: (channelId: string, recordId: string) => invoke<Change[]>('record_history', { channelId, recordId }),
 }
+
+/** "Sent by, Program" → ["Sent by", "Program"] */
+export const splitList = (s: string) => s.split(',').map(x => x.trim()).filter(Boolean)
 
 // A workspace's colour, from its name: the same name is always the same colour.
 const TINTS = ['#f38020', '#3b6fd8', '#2f8f62', '#a2509a', '#c2410c', '#4a4d55', '#8a5f08']

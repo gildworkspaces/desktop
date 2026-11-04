@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.2.0)
+## What works (0.3.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -15,6 +15,9 @@ everything after that is the design doc.
   split.
 - Messages, channels and workspaces are saved in a SQLite database on this
   computer and are there when you reopen the app.
+- **A channel can hold a table**, shown as a table or a board. Add records,
+  edit them, move them between statuses, and open a record to see its full
+  history: who changed what, and when.
 - A built-in **demo account**. Accounts and sign-in come later; until then
   everything is written as "Demo".
 
@@ -27,6 +30,12 @@ The first run creates a "Demo workspace" with #general.
 - `src/lib/core.ts`: the window's only way to data, the Rust core's commands.
 - `src-tauri/src/store.rs`: the database, written with Turso's Rust engine
   (`turso_core`, the engine Zega+SQLite uses). No C.
+- `src-tauri/src/records.rs`: each channel's records live in a git
+  repository, `channels/<channel id>.git` in the data folder, as
+  `.gild/view.json` and one `.gild/records/<id>.json` per record. Git is the
+  truth: every change is a commit by the person who made it, and the SQLite
+  tables are an index rebuilt from it (on every write, and on startup when a
+  channel's history has moved past its index). Pure Rust (gitoxide).
 - The database file: `gild.db` in the app's data folder
   (`~/Library/Application Support/gg.gild.desktop/` on macOS). It is a plain
   SQLite file; `sqlite3` reads it.

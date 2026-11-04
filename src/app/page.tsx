@@ -1,5 +1,6 @@
 'use client'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { ViewPane } from './ChannelView'
 import { core, inApp, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type Message } from '@/lib/core'
 
 export default function App() {
@@ -148,17 +149,13 @@ function WorkspaceView({ account, workspace, onBack }: { account: Account; works
   )
 }
 
-const VIEW_KINDS = [
-  { name: 'Table & board', when: 'next' },
-  { name: 'Doc', when: 'soon' },
-  { name: 'Canvas', when: 'add-on' },
-  { name: 'Sheet', when: 'add-on' },
-]
 
 function ChannelView({ channel }: { channel: Channel }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [draft, setDraft] = useState('')
   const [expanded, setExpanded] = useState(false)
+  const [mode, setMode] = useState<'table' | 'board'>('table')
+  const [count, setCount] = useState<number | null>(null)
   const [error, setError] = useState('')
   const list = useRef<HTMLDivElement>(null)
 
@@ -183,16 +180,17 @@ function ChannelView({ channel }: { channel: Channel }) {
         <h2># {channel.name}</h2>
         {channel.topic && <span className="soft" style={{ fontSize: 13 }}>{channel.topic}</span>}
         <span className="spacer" />
+        {count !== null && <span className="faint mono" style={{ fontSize: 12 }}>{count} {count === 1 ? 'record' : 'records'}</span>}
+        {count !== null && (
+          <div className="tabs" role="group" aria-label="Show as">
+            <button className={mode === 'table' ? 'tab on' : 'tab'} aria-pressed={mode === 'table'} onClick={() => setMode('table')}>Table</button>
+            <button className={mode === 'board' ? 'tab on' : 'tab'} aria-pressed={mode === 'board'} onClick={() => setMode('board')}>Board</button>
+          </div>
+        )}
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
-        <div className="empty">
-          <span className="label">This channel's view</span>
-          <p className="soft" style={{ margin: 0, maxWidth: '46ch' }}>The data this channel is about will live here, beside the conversation.</p>
-          <div className="kinds">
-            {VIEW_KINDS.map(k => <div key={k.name} className="kind"><b>{k.name}</b><span>{k.when}</span></div>)}
-          </div>
-        </div>
+        <ViewPane channelId={channel.id} mode={mode} onCount={setCount} />
       </section>
       <section className="msgs" aria-label="Messages" style={{ flex: `${expanded ? 1 : 2} 1 0` }}>
         <div className="list" ref={list}>

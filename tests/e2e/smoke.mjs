@@ -41,6 +41,32 @@ try {
   assert.deepEqual(saved.channels, ['general', 'student-intake'])
   assert.deepEqual(saved.messages, ['Demo: Northside sent three more students.'])
   console.log('saved:', JSON.stringify(saved))
+
+  // The channel gets a table through the window, and a record's history comes
+  // back from git through the core.
+  await driver.findElement(By.css('#cols')).sendKeys('Sent by, Program')
+  const stats = await driver.findElement(By.css('#stats'))
+  await stats.clear()
+  await stats.sendKeys('New, Docs needed, Enrolled')
+  await driver.findElement(By.css('form.columns button.primary')).click()
+  await driver.wait(until.elementLocated(By.css('#rec-title')), 10000)
+  await driver.findElement(By.css('#rec-title')).sendKeys('Jordan Lee\n')
+  await driver.wait(until.elementLocated(By.xpath("//td//button[contains(., 'Jordan Lee')]")), 10000)
+  const history = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    ;(async () => {
+      const ws = await call('workspaces')
+      const intake = (await call('channels', { workspaceId: ws[0].id })).find(c => c.name === 'student-intake')
+      const data = await call('channel_data', { channelId: intake.id })
+      const jordan = data.records[0]
+      await call('update_record', { channelId: intake.id, recordId: jordan.id, title: jordan.title, status: 'Docs needed', fields: { 'Sent by': 'Northside' } })
+      return (await call('record_history', { channelId: intake.id, recordId: jordan.id })).map(h => h.author + ': ' + h.message)
+    })().then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(history.error, undefined, history.error)
+  assert.deepEqual(history, ['Demo: Jordan Lee: New → Docs needed, Sent by: Northside', 'Demo: Add Jordan Lee'])
+  console.log('history:', JSON.stringify(history))
 } finally {
   await driver.quit()
 }
