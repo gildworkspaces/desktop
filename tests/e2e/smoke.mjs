@@ -198,7 +198,20 @@ try {
   // on stdin, and it answers in the channel through the MCP endpoint.
   await driver.findElement(By.css('#composer')).sendKeys('@intake where do the forms go?', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//span[@class='mention' and .='@intake']")), 10000)
-  const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000)
+  const reply = await driver.wait(until.elementLocated(By.xpath("//div[@class='msg'][.//span[@class='author' and .='intake']]//span[@class='text' and contains(., 'red folder')]")), 30000).catch(async e => {
+    // What happened instead: the channel, and what the agent did.
+    const seen = await driver.executeAsyncScript(`
+      const done = arguments[arguments.length - 1]
+      const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+      ;(async () => ({
+        messages: (await call('messages', { channelId: ${JSON.stringify(intakeId)} })).map(m => m.author + ': ' + m.body),
+        activity: (await call('activity', { channelId: ${JSON.stringify(intakeId)} })).map(a => a.agent + ' ' + a.action + ' ' + a.ok + ' ' + a.detail),
+        agents: await call('agents'),
+      }))().then(done, e => done({ error: String(e) }))
+    `)
+    console.log('no answer; the channel and activity:', JSON.stringify(seen, null, 2))
+    throw e
+  })
   assert.match(await reply.getText(), /I saw Northside sent three more\./, 'the conversation came with the mention')
   console.log('agent answered:', await reply.getText())
   const woken = await driver.executeAsyncScript(`
