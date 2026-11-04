@@ -8,6 +8,11 @@
 //!   .gild/view.json             the channel's view: columns and statuses
 //!   .gild/records/<id>.json     one file per record, so two writers never
 //!                               touch the same file for different records
+//!   docs/<name>.md              the channel's docs, plain markdown
+//!
+//! An agent's edit to a doc is a branch, `proposals/<id>`, until a person
+//! approves it (a merge commit) or rejects it (the branch moves to
+//! `refs/gild/rejected/<id>`, so what was proposed stays in the history).
 //!
 //! Every change is one commit, written by the person who made it. Pure Rust
 //! (gitoxide): no C and no `git` binary needed.
@@ -66,12 +71,74 @@ pub struct Change {
     pub message: String,
 }
 
+/// A markdown doc: `docs/<name>.md`. Its title is its first `# ` heading.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Doc {
+    pub path: String,
+    pub title: String,
+    pub body: String,
+}
+
+impl Doc {
+    pub fn new(path: &str, body: String) -> Doc {
+        let title = body
+            .lines()
+            .find_map(|l| l.strip_prefix("# ").map(str::trim).filter(|t| !t.is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| path.trim_start_matches("docs/").trim_end_matches(".md").to_string());
+        Doc { path: path.to_string(), title, body }
+    }
+}
+
+/// An agent's proposed change to a doc, waiting for a person: a branch
+/// `proposals/<id>` whose one commit sits on the channel's history.
+pub struct RawProposal {
+    pub id: String,
+    pub author: String,
+    pub at: i64,
+    pub message: String,
+    pub path: String,
+    /// The doc when the proposal was made (None: a new doc).
+    pub before: Option<String>,
+    pub after: String,
+    /// The doc changed after the proposal was made, so it can't be approved
+    /// as it is.
+    pub stale: bool,
+}
+
+/// One line of a diff: `same`, `add` or `del`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct DiffLine {
+    pub op: &'static str,
+    pub text: String,
+}
+
+/// Line by line, what changed from `before` to `after`.
+pub fn diff(before: &str, after: &str) -> Vec<DiffLine> {
+    similar::TextDiff::from_lines(before, after)
+        .iter_all_changes()
+        .map(|c| DiffLine {
+            op: match c.tag() {
+                similar::ChangeTag::Equal => "same",
+                similar::ChangeTag::Insert => "add",
+                similar::ChangeTag::Delete => "del",
+            },
+            text: c.value().trim_end_matches('\n').to_string(),
+        })
+        .collect()
+}
+
+pub const DOCS_DIR: &str = "docs";
+const PROPOSALS: &str = "refs/heads/proposals/";
+const REJECTED: &str = "refs/gild/rejected/";
+
 /// What a channel's repository holds at one commit.
 pub struct Snapshot {
     pub commit: Option<String>,
     pub acl: Acl,
     pub view: Option<View>,
     pub records: Vec<Record>,
+    pub docs: Vec<Doc>,
 }
 
 fn err(context: &str, e: impl std::fmt::Display) -> String {
@@ -113,7 +180,22 @@ pub fn head_commit(data: &Path, channel_id: &str) -> Result<Option<String>, Stri
 pub fn commit(data: &Path, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<String, String> {
     let repo = open_or_init(&repo_path(data, channel_id))?;
     let parent = head(&repo);
-    let base = match parent {
+    let id = commit_on(&repo, "HEAD", parent, parent.into_iter().collect(), files, author, message)?;
+    Ok(id.to_string())
+}
+
+/// One commit: `base`'s tree with `files` written over it, with `parents`,
+/// moving `reference` to it.
+fn commit_on(
+    repo: &gix::Repository,
+    reference: &str,
+    base: Option<ObjectId>,
+    parents: Vec<ObjectId>,
+    files: &[(String, Vec<u8>)],
+    author: &str,
+    message: &str,
+) -> Result<ObjectId, String> {
+    let base = match base {
         Some(id) => repo
             .find_commit(id)
             .and_then(|c| c.tree_id())
@@ -139,9 +221,9 @@ pub fn commit(data: &Path, channel_id: &str, author: &str, message: &str, files:
     let mut time = gix::date::parse::TimeBuf::default();
     let who = signature.to_ref(&mut time);
     let id = repo
-        .commit_as(who, who, "HEAD", message, tree, parent)
+        .commit_as(who, who, reference, message, tree, parents)
         .map_err(|e| err("saving the change", e))?;
-    Ok(id.to_string())
+    Ok(id.detach())
 }
 
 fn blob_text(repo: &gix::Repository, tree: &gix::Tree<'_>, path: &str) -> Result<Option<Vec<u8>>, String> {
@@ -155,13 +237,14 @@ fn blob_text(repo: &gix::Repository, tree: &gix::Tree<'_>, path: &str) -> Result
 /// Everything at the repository's current commit: the source the index is
 /// built from.
 pub fn snapshot(data: &Path, channel_id: &str) -> Result<Snapshot, String> {
+    let empty = || Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![], docs: vec![] };
     let path = repo_path(data, channel_id);
     if !path.exists() {
-        return Ok(Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![] });
+        return Ok(empty());
     }
     let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
     let Some(id) = head(&repo) else {
-        return Ok(Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![] });
+        return Ok(empty());
     };
     let tree = repo
         .find_commit(id)
@@ -190,7 +273,149 @@ pub fn snapshot(data: &Path, channel_id: &str) -> Result<Snapshot, String> {
         }
     }
     records.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-    Ok(Snapshot { commit: Some(id.to_string()), acl, view, records })
+    let mut docs = Vec::new();
+    for (path, blob) in doc_blobs(&repo, &tree)? {
+        let bytes = repo.find_object(blob).map_err(|e| err("reading a doc", e))?.data.clone();
+        docs.push(Doc::new(&path, String::from_utf8_lossy(&bytes).into_owned()));
+    }
+    Ok(Snapshot { commit: Some(id.to_string()), acl, view, records, docs })
+}
+
+/// Every `docs/*.md` in a tree: path → blob.
+fn doc_blobs(repo: &gix::Repository, tree: &gix::Tree<'_>) -> Result<std::collections::BTreeMap<String, ObjectId>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(dir) = tree.lookup_entry_by_path(DOCS_DIR).map_err(|e| err("reading the docs", e))? else {
+        return Ok(out);
+    };
+    let dir = repo
+        .find_object(dir.object_id())
+        .and_then(|o| o.try_into_tree())
+        .map_err(|e| err("reading the docs", e))?;
+    for entry in dir.iter() {
+        let entry = entry.map_err(|e| err("reading the docs", e))?;
+        let name = entry.filename().to_string();
+        if entry.mode().is_blob() && name.ends_with(".md") {
+            out.insert(format!("{DOCS_DIR}/{name}"), entry.object_id());
+        }
+    }
+    Ok(out)
+}
+
+fn tree_of(repo: &gix::Repository, commit: ObjectId) -> Result<gix::Tree<'_>, String> {
+    repo.find_commit(commit).and_then(|c| c.tree()).map_err(|e| err("reading history", e))
+}
+
+fn blob_at(repo: &gix::Repository, commit: Option<ObjectId>, path: &str) -> Result<Option<ObjectId>, String> {
+    let Some(commit) = commit else { return Ok(None) };
+    let tree = tree_of(repo, commit)?;
+    Ok(tree.lookup_entry_by_path(path).map_err(|e| err("reading history", e))?.map(|e| e.object_id()))
+}
+
+fn text_of(repo: &gix::Repository, blob: Option<ObjectId>) -> Result<Option<String>, String> {
+    let Some(blob) = blob else { return Ok(None) };
+    let object = repo.find_object(blob).map_err(|e| err("reading a doc", e))?;
+    Ok(Some(String::from_utf8_lossy(&object.data).into_owned()))
+}
+
+/// Put `body` at `path` on a new branch `proposals/<id>`, on top of the
+/// channel's current history. The channel's docs don't change.
+pub fn propose(data: &Path, channel_id: &str, id: &str, author: &str, message: &str, path: &str, body: &[u8]) -> Result<(), String> {
+    let repo = open_or_init(&repo_path(data, channel_id))?;
+    let base = head(&repo).ok_or("This channel has no history to propose a change to.")?;
+    let files = [(path.to_string(), body.to_vec())];
+    commit_on(&repo, &format!("{PROPOSALS}{id}"), Some(base), vec![base], &files, author, message)?;
+    Ok(())
+}
+
+/// The proposal's commit, the commit it was made on, and the doc it changes.
+fn proposal_parts(repo: &gix::Repository, id: &str) -> Result<(ObjectId, ObjectId, String), String> {
+    let mut reference = repo
+        .find_reference(format!("{PROPOSALS}{id}").as_str())
+        .map_err(|_| "That proposal was already approved or rejected.".to_string())?;
+    let commit = reference.peel_to_id().map_err(|e| err("reading the proposal", e))?.detach();
+    let parent = repo
+        .find_commit(commit)
+        .map_err(|e| err("reading the proposal", e))?
+        .parent_ids()
+        .next()
+        .ok_or("The proposal has no base.")?
+        .detach();
+    let (before, after) = (doc_blobs(repo, &tree_of(repo, parent)?)?, doc_blobs(repo, &tree_of(repo, commit)?)?);
+    let path = after
+        .iter()
+        .find(|(p, b)| before.get(*p) != Some(b))
+        .map(|(p, _)| p.clone())
+        .ok_or("The proposal changes no doc.")?;
+    Ok((commit, parent, path))
+}
+
+/// Every open proposal, oldest first.
+pub fn proposals(data: &Path, channel_id: &str) -> Result<Vec<RawProposal>, String> {
+    let path = repo_path(data, channel_id);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+    let current = head(&repo);
+    let mut ids = Vec::new();
+    let platform = repo.references().map_err(|e| err("reading proposals", e))?;
+    for r in platform.local_branches().map_err(|e| err("reading proposals", e))? {
+        let r = r.map_err(|e| err("reading proposals", e))?;
+        if let Some(id) = r.name().as_bstr().to_string().strip_prefix(PROPOSALS) {
+            ids.push(id.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for id in ids {
+        let (commit, parent, path) = proposal_parts(&repo, &id)?;
+        let c = repo.find_commit(commit).map_err(|e| err("reading the proposal", e))?;
+        let author = c.author().map_err(|e| err("reading the proposal", e))?;
+        let (was, now) = (blob_at(&repo, Some(parent), &path)?, blob_at(&repo, current, &path)?);
+        out.push(RawProposal {
+            id,
+            author: author.name.to_string(),
+            at: author.time().map(|t| t.seconds).unwrap_or(0) * 1000,
+            message: c.message_raw_sloppy().to_string().trim().to_string(),
+            before: text_of(&repo, was)?,
+            after: text_of(&repo, blob_at(&repo, Some(commit), &path)?)?.unwrap_or_default(),
+            stale: was != now,
+            path,
+        });
+    }
+    out.sort_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
+    Ok(out)
+}
+
+/// Take a proposal into the channel's history as a merge commit by
+/// `author`: the doc becomes what the agent proposed, and both the agent's
+/// commit and the approval stay in the history.
+pub fn approve(data: &Path, channel_id: &str, id: &str, author: &str, message: &str) -> Result<(), String> {
+    let repo = gix::open(repo_path(data, channel_id)).map_err(|e| err("opening the channel's history", e))?;
+    let (commit, parent, path) = proposal_parts(&repo, id)?;
+    let current = head(&repo).ok_or("This channel has no history.")?;
+    if blob_at(&repo, Some(parent), &path)? != blob_at(&repo, Some(current), &path)? {
+        return Err("The doc changed after this was proposed. Reject it and ask for a fresh proposal.".into());
+    }
+    let body = text_of(&repo, blob_at(&repo, Some(commit), &path)?)?.unwrap_or_default();
+    commit_on(&repo, "HEAD", Some(current), vec![current, commit], &[(path, body.into_bytes())], author, message)?;
+    delete_proposal(&repo, id)
+}
+
+/// Close a proposal without taking it. Its commit stays reachable from
+/// `refs/gild/rejected/<id>`, so the history keeps what was proposed.
+pub fn reject(data: &Path, channel_id: &str, id: &str) -> Result<(), String> {
+    let repo = gix::open(repo_path(data, channel_id)).map_err(|e| err("opening the channel's history", e))?;
+    let (commit, _, _) = proposal_parts(&repo, id)?;
+    repo.reference(format!("{REJECTED}{id}").as_str(), commit, gix::refs::transaction::PreviousValue::MustNotExist, "rejected")
+        .map_err(|e| err("keeping the rejected proposal", e))?;
+    delete_proposal(&repo, id)
+}
+
+fn delete_proposal(repo: &gix::Repository, id: &str) -> Result<(), String> {
+    repo.find_reference(format!("{PROPOSALS}{id}").as_str())
+        .map_err(|e| err("closing the proposal", e))?
+        .delete()
+        .map_err(|e| err("closing the proposal", e))
 }
 
 /// The commits that changed `path`, newest first, following the first parent

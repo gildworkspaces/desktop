@@ -8,6 +8,7 @@
 //!   channels/<name>/chat.jsonl     the same, one JSON message per line
 //!   channels/<name>/table.csv      the channel's table, if it has one
 //!   channels/<name>/table.json
+//!   channels/<name>/docs/*.md      the channel's docs, as they are now
 //!   channels/<name>/history.git    the channel's full history: `git clone` it
 //!
 //! Every format is written from the same rows (one read per channel), so the
@@ -151,11 +152,19 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
             write(&dir.join("table.csv"), csv)?;
             write(&dir.join("table.json"), serde_json::to_vec_pretty(t).map_err(|e| err("writing table.json", e))?)?;
         }
+        let docs = store.docs(&c.id)?;
+        for d in &docs {
+            // A doc's path is docs/<name>.md, made by channel_name(): already a
+            // safe file name, but keep it inside the export regardless.
+            let name = safe(d.path.trim_start_matches("docs/").trim_end_matches(".md"));
+            write(&dir.join("docs").join(format!("{name}.md")), &d.body)?;
+        }
         let repo = records::repo_path(store.data_dir(), &c.id);
         if repo.exists() {
             copy_dir(&repo, &dir.join("history.git"))?;
         }
-        channels.push(json!({ "name": c.name, "topic": c.topic, "messages": messages, "table": table }));
+        let docs: Vec<_> = docs.iter().map(|d| json!({ "path": d.path, "title": d.title, "text": d.body })).collect();
+        channels.push(json!({ "name": c.name, "topic": c.topic, "messages": messages, "table": table, "docs": docs }));
     }
     let manifest = json!({
         "workspace": ws.name,
@@ -169,7 +178,7 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
     write(
         &root.join("README.md"),
         format!(
-            "# {}\n\nExported from gild {} on {}.\n\nOpen `export-viewer.html` in a browser to read everything, offline.\n\nEach channel is a folder in `channels/`: `chat.md` and `chat.jsonl` hold the conversation, `table.csv` and `table.json` hold its table (if it has one), and `history.git` is the channel's full history, which `git clone` opens.\n",
+            "# {}\n\nExported from gild {} on {}.\n\nOpen `export-viewer.html` in a browser to read everything, offline.\n\nEach channel is a folder in `channels/`: `chat.md` and `chat.jsonl` hold the conversation, `table.csv` and `table.json` hold its table (if it has one), `docs/` holds its docs as markdown, and `history.git` is the channel's full history, which `git clone` opens.\n",
             ws.name,
             env!("CARGO_PKG_VERSION"),
             day(crate::store::now())
@@ -196,6 +205,8 @@ mod tests {
         let fields: BTreeMap<String, String> = [("Sent by".to_string(), "Northside, East".to_string()), ("Notes".to_string(), "said \"soon\"".to_string())].into();
         store.add_record(&intake.id, DEMO_NAME, "Jordan Lee", "New", fields).unwrap();
         store.post(&intake.id, DEMO_NAME, "person", "<script>alert(1)</script> three more students").unwrap();
+        let sop = store.create_doc(&intake.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# Intake SOP\n\nForms go in the blue folder.\n").unwrap();
 
         let out = export_workspace(&store, &ws.id, &base.join("exports"), "2026-11-04 1200").unwrap();
         let ch = out.join("channels/student-intake");
@@ -208,12 +219,13 @@ mod tests {
         // The history is a real git repository with the record's commit in it.
         let repo = gix::open(ch.join("history.git")).unwrap();
         let head = repo.head_commit().unwrap();
-        assert_eq!(head.message_raw_sloppy().to_string().trim(), "Add Jordan Lee");
+        assert_eq!(head.message_raw_sloppy().to_string().trim(), "Edit Intake SOP");
+        assert_eq!(fs::read_to_string(ch.join("docs/intake-sop.md")).unwrap(), "# Intake SOP\n\nForms go in the blue folder.\n");
         // The viewer and its data sit beside the files, with no network.
         let viewer = fs::read_to_string(out.join("export-viewer.html")).unwrap();
         assert!(viewer.contains("default-src 'none'") && !viewer.contains("innerHTML"));
         let js = fs::read_to_string(out.join("data/workspace.js")).unwrap();
-        assert!(js.starts_with("window.GILD_EXPORT = ") && js.contains("Jordan Lee"));
+        assert!(js.starts_with("window.GILD_EXPORT = ") && js.contains("Jordan Lee") && js.contains("blue folder"));
         // A second export with the same time doesn't overwrite the first.
         let again = export_workspace(&store, &ws.id, &base.join("exports"), "2026-11-04 1200").unwrap();
         assert_eq!(again.file_name().unwrap(), "Front Desk 2026-11-04 1200 (2)");

@@ -85,6 +85,31 @@ fn tools() -> Vec<Tool> {
             }, "required": ["channel_id", "record_id"] })),
         ),
         Tool::new(
+            "read_doc",
+            "One of a channel's docs, as markdown. read_channel lists each channel's docs by path.",
+            schema(json!({ "type": "object", "properties": {
+                "channel_id": channel, "path": { "type": "string", "description": "The doc's path, such as docs/intake-sop.md." }
+            }, "required": ["channel_id", "path"] })),
+        ),
+        Tool::new(
+            "search_docs",
+            "Search the docs in every channel shared with you. Each hit names the channel, the doc, and the section (heading) it's under, with the lines that matched: cite them when you answer.",
+            schema(json!({ "type": "object", "properties": {
+                "query": { "type": "string", "description": "A question or a few words, such as: where do the intake forms go?" }
+            }, "required": ["query"] })),
+        ),
+        Tool::new(
+            "propose_doc_edit",
+            "Propose a doc's new text (all of it, as markdown), or a new doc. Nothing changes until a person in the channel approves it; they see your summary and a diff. Give `path` to edit a doc, or `title` for a new one. Needs write access.",
+            schema(json!({ "type": "object", "properties": {
+                "channel_id": channel,
+                "path": { "type": "string", "description": "The doc to change." },
+                "title": { "type": "string", "description": "A new doc's title, instead of `path`." },
+                "text": { "type": "string", "description": "The doc's full new text, in markdown." },
+                "summary": { "type": "string", "description": "What you changed and why, in a sentence: the person approving reads this." }
+            }, "required": ["channel_id", "text", "summary"] })),
+        ),
+        Tool::new(
             "record_history",
             "Every change to one record, newest first: what changed, who changed it, and when.",
             schema(json!({ "type": "object", "properties": {
@@ -141,7 +166,26 @@ impl Gild {
                     "messages": recent,
                     "table": data.view.map(|v| json!({ "columns": v.fields, "statuses": v.statuses })),
                     "records": data.records,
+                    "docs": store.docs(id)?.into_iter().map(|d| json!({ "path": d.path, "title": d.title })).collect::<Vec<_>>(),
                 })))
+            }
+            "read_doc" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                let d = store.doc(id, arg(args, "path")?)?;
+                Ok((None, json!({ "path": d.path, "title": d.title, "text": d.body })))
+            }
+            "search_docs" => {
+                let ids: Vec<String> = store.agent_channels(agent)?.into_iter().map(|c| c.channel.id).collect();
+                Ok((None, json!({ "hits": store.search_docs(&ids, arg(args, "query")?)? })))
+            }
+            "propose_doc_edit" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let path = args.get("path").and_then(Value::as_str);
+                let title = args.get("title").and_then(Value::as_str);
+                let p = store.propose_doc(id, &agent.name, path, title, arg(args, "text")?, arg(args, "summary")?)?;
+                Ok((Some(id.to_string()), json!({ "proposal": p.id, "doc": p.path, "status": "waiting for a person to approve it" })))
             }
             "post_message" => {
                 let id = arg(args, "channel_id")?;
@@ -189,7 +233,7 @@ impl ServerHandler for Gild {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gild", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-            "gild is a workspace where people and agents work together in channels. Start with list_channels: you see only the channels shared with you. Everything you do is recorded in the channel's audit log, and record changes are commits in the channel's history under your name.",
+            "gild is a workspace where people and agents work together in channels. Start with list_channels: you see only the channels shared with you. Everything you do is recorded in the channel's audit log, and record changes are commits in the channel's history under your name. To answer a question about how things are done, use search_docs and cite the doc and section. You can't change a doc directly: propose_doc_edit, and a person approves it.",
         )
     }
 
@@ -214,7 +258,11 @@ impl ServerHandler for Gild {
             let result = self.run(&store, &agent, &request.name, &args);
             let channel = args.get("channel_id").and_then(Value::as_str).unwrap_or("");
             let detail = match &result {
-                Ok(_) => args.get("title").or(args.get("text")).and_then(Value::as_str).unwrap_or("").to_string(),
+                Ok(_) => ["summary", "query", "title", "path", "text"]
+                    .iter()
+                    .find_map(|k| args.get(*k).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string(),
                 Err(e) => e.clone(),
             };
             store.audit(&agent, &request.name, channel, &detail, result.is_ok()).map_err(|e| ErrorData::internal_error(e, None))?;
@@ -332,6 +380,10 @@ mod tests {
         let (agent, token) = store.create_agent("intake").unwrap();
         store.set_access(&intake.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
         store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Read)).unwrap();
+        let sop = store.create_doc(&intake.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# Intake SOP\n\n## Step 2: Forms\n\nIntake forms go in the blue folder.\n").unwrap();
+        let secret = store.create_doc(&hidden.id, DEMO_NAME, "Payroll").unwrap();
+        store.save_doc(&hidden.id, DEMO_NAME, &secret.path, "# Payroll\n\nIntake forms for payroll go to the accountant.\n").unwrap();
         let core = Arc::new(Mutex::new(store));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -367,6 +419,24 @@ mod tests {
         let (err, text) = c.call("read_channel", json!({ "channel_id": hidden.id })).await;
         assert!(err && text.contains("No channel with that id"), "{text}");
 
+        // Docs: search answers from the channels shared with it, never others.
+        let (err, text) = c.call("search_docs", json!({ "query": "Where do the intake forms go?" })).await;
+        assert!(!err, "{text}");
+        let hits: Value = serde_json::from_str(&text).unwrap();
+        let found: Vec<(&str, &str)> = hits["hits"].as_array().unwrap().iter().map(|h| (h["title"].as_str().unwrap(), h["section"].as_str().unwrap())).collect();
+        assert_eq!(found, [("Intake SOP", "Step 2: Forms")], "payroll's doc was never shared");
+        let (err, text) = c.call("read_doc", json!({ "channel_id": hidden.id, "path": secret.path })).await;
+        assert!(err && text.contains("No channel with that id"), "{text}");
+        // An edit is a proposal: the doc doesn't change.
+        let (err, text) = c
+            .call("propose_doc_edit", json!({ "channel_id": intake.id, "path": sop.path, "text": "# Intake SOP\n\nForms go in the red folder.\n", "summary": "The folder is red now" }))
+            .await;
+        assert!(!err && text.contains("waiting for a person"), "{text}");
+        let (err, text) = c.call("propose_doc_edit", json!({ "channel_id": general.id, "title": "Hi", "text": "# Hi\n", "summary": "hi" })).await;
+        assert!(err && text.contains("not change"), "read access can't propose: {text}");
+        let (_, text) = c.call("read_doc", json!({ "channel_id": intake.id, "path": sop.path })).await;
+        assert!(text.contains("blue folder"), "{text}");
+
         let store = core.lock().unwrap();
         let record = &store.channel_data(&intake.id).unwrap().records[0];
         assert_eq!((record.status.as_str(), record.fields["Program"].as_str()), ("Enrolled", "Web Dev"), "an update keeps what it didn't name");
@@ -375,9 +445,14 @@ mod tests {
         let posted = store.messages(&intake.id).unwrap();
         assert_eq!((posted[0].author.as_str(), posted[0].kind.as_str()), ("intake", "agent"));
         let audit: Vec<(String, bool)> = store.activity(&intake.id).unwrap().into_iter().map(|a| (a.action, a.ok)).collect();
-        assert_eq!(audit, [("post_message".to_string(), true), ("update_record".to_string(), true), ("add_record".to_string(), true)]);
+        assert_eq!(
+            audit,
+            [("read_doc", true), ("propose_doc_edit", true), ("post_message", true), ("update_record", true), ("add_record", true)].map(|(a, ok)| (a.to_string(), ok))
+        );
         let refused: Vec<bool> = store.activity(&general.id).unwrap().into_iter().map(|a| a.ok).collect();
-        assert_eq!(refused, [false], "refusals are in the log too");
+        assert_eq!(refused, [false, false], "refusals are in the log too");
+        let waiting = store.proposals(&intake.id).unwrap();
+        assert_eq!((waiting.len(), waiting[0].agent.as_str(), waiting[0].summary.as_str()), (1, "intake", "The folder is red now"));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

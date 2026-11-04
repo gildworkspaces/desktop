@@ -103,6 +103,49 @@ try {
   assert.deepEqual(channels, ['student-intake:write'], 'general was never shared')
   console.log('agent sees:', JSON.stringify(channels))
 
+  // Docs: a person writes one in the window; the agent finds the answer in
+  // it, and its edit waits until the person approves it in the window.
+  await driver.findElement(By.xpath("//button[contains(@class,'tab') and starts-with(normalize-space(.),'Docs')]")).click()
+  await driver.wait(until.elementLocated(By.css('#new-doc')), 10000).sendKeys('Intake SOP', Key.ENTER)
+  await driver.wait(until.elementLocated(By.xpath("//article[contains(@class,'doc')]//button[normalize-space(.)='Edit']")), 10000).click()
+  const editor = await driver.wait(until.elementLocated(By.css('#doc-body')), 10000)
+  await editor.clear()
+  await editor.sendKeys('# Intake SOP', Key.ENTER, Key.ENTER, '## Step 2: Forms', Key.ENTER, Key.ENTER, 'Signed intake forms go in the blue folder.', Key.ENTER)
+  await driver.findElement(By.xpath("//article[contains(@class,'doc')]//button[normalize-space(.)='Save']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[@class='md']//h3[contains(., 'Step 2: Forms')]")), 10000)
+
+  const tool = async (id, name, args) => {
+    const r = await mcp({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }, init.session)
+    assert.ok(!r.json.result.isError, r.json.result.content[0].text)
+    return JSON.parse(r.json.result.content[0].text)
+  }
+  const found = await tool(3, 'search_docs', { query: 'Where do the intake forms go?' })
+  assert.deepEqual([found.hits[0].title, found.hits[0].section, found.hits[0].excerpt], ['Intake SOP', 'Step 2: Forms', 'Signed intake forms go in the blue folder.'])
+  console.log('agent found:', JSON.stringify(found.hits[0]))
+  const intakeId = (await tool(4, 'list_channels', {})).channels[0].channel_id
+  const [doc] = (await tool(5, 'read_channel', { channel_id: intakeId })).docs
+  const proposed = await tool(6, 'propose_doc_edit', {
+    channel_id: intakeId, path: doc.path,
+    text: '# Intake SOP\n\n## Step 2: Forms\n\nSigned intake forms go in the red folder.\n', summary: 'The folder is red now',
+  })
+  assert.match(proposed.status, /waiting/)
+
+  // The window shows it waiting (refreshed by the agent's change), and the
+  // doc still says blue until the person approves.
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'waiting') and contains(., 'Review 1 change')]")), 10000).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'dl') and contains(@class,'add') and contains(., 'red folder')]")), 10000)
+  assert.match(await driver.findElement(By.xpath("//div[contains(@class,'dl') and contains(@class,'del')]")).getText(), /blue folder/)
+  await driver.findElement(By.xpath("//button[normalize-space(.)='Approve']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[@class='md']//p[contains(., 'red folder')]")), 10000)
+  const docLog = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    call('doc_history', { channelId: ${JSON.stringify(intakeId)}, path: ${JSON.stringify(doc.path)} }).then(h => done(h.map(c => c.author + ': ' + c.message)), e => done({ error: String(e) }))
+  `)
+  assert.equal(docLog.error, undefined, docLog.error)
+  assert.deepEqual(docLog, ["Demo: Approve intake's change to Intake SOP: The folder is red now", 'Demo: Edit Intake SOP', 'Demo: Add doc Intake SOP'])
+  console.log('doc history:', JSON.stringify(docLog))
+
   // Export from the window: a folder of open files, and the history clones.
   await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()
   const outcome = await driver.wait(until.elementLocated(By.xpath("//p[contains(., 'Saved to')] | //div[contains(@class,'exportbox')]//p[contains(@class,'error')]")), 20000)
@@ -117,6 +160,7 @@ try {
   assert.equal(readFileSync(`${dir}/table.csv`, 'utf8').split('\n')[1], 'Jordan Lee,Northside,,Docs needed')
   assert.match(readFileSync(`${dir}/chat.md`, 'utf8'), /Northside sent three more students\./)
   assert.ok(existsSync(`${dir}/history.git/HEAD`), 'the history is a git repository')
+  assert.match(readFileSync(`${dir}/docs/intake-sop.md`, 'utf8'), /red folder/)
   assert.ok(existsSync(`${out}/export-viewer.html`))
   console.log('exported:', out)
 } finally {

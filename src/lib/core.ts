@@ -13,6 +13,11 @@ export type DataRecord = { id: string; title: string; status: string; fields: Re
 export type ChannelData = { view: View | null; records: DataRecord[] }
 export type Change = { commit: string; author: string; at: number; message: string }
 
+export type Doc = { path: string; title: string; body: string }
+export type DiffLine = { op: 'same' | 'add' | 'del'; text: string }
+export type Proposal = { id: string; agent: string; summary: string; at: number; path: string; title: string; new_doc: boolean; stale: boolean; diff: DiffLine[] }
+export type ChannelDocs = { docs: Doc[]; proposals: Proposal[] }
+
 export type Access = 'read' | 'write'
 export type Agent = { id: string; name: string; created_at: number }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
@@ -44,6 +49,12 @@ export const core = {
   updateRecord: (channelId: string, recordId: string, title: string, status: string, fields: Record<string, string>) =>
     invoke<DataRecord>('update_record', { channelId, recordId, title, status, fields }),
   recordHistory: (channelId: string, recordId: string) => invoke<Change[]>('record_history', { channelId, recordId }),
+  channelDocs: (channelId: string) => invoke<ChannelDocs>('channel_docs', { channelId }),
+  createDoc: (channelId: string, title: string) => invoke<Doc>('create_doc', { channelId, title }),
+  saveDoc: (channelId: string, path: string, body: string) => invoke<Doc>('save_doc', { channelId, path, body }),
+  docHistory: (channelId: string, path: string) => invoke<Change[]>('doc_history', { channelId, path }),
+  approveProposal: (channelId: string, id: string) => invoke<ChannelDocs>('approve_proposal', { channelId, id }),
+  rejectProposal: (channelId: string, id: string) => invoke<ChannelDocs>('reject_proposal', { channelId, id }),
   agents: () => invoke<Agent[]>('agents'),
   createAgent: (name: string) => invoke<NewAgent>('create_agent', { name }),
   channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
