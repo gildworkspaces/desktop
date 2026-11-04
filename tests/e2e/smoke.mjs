@@ -70,7 +70,7 @@ try {
 
   // An agent, added in the window, works through the MCP endpoint, and only
   // in the channel it was given.
-  await driver.findElement(By.css('#new-agent')).sendKeys('intake\n')
+  await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
   const token = await (await driver.wait(until.elementLocated(By.css('.secret code')), 10000)).getText()
   assert.match(token, /^gild_[0-9a-f]{64}$/)
   await driver.findElement(By.css('.modal .primary')).click()
