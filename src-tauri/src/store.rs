@@ -89,6 +89,11 @@ fn err(context: &str, e: impl std::fmt::Display) -> String {
     format!("{context}: {e}")
 }
 
+/// Milliseconds since the Unix epoch.
+pub fn now() -> i64 {
+    now_ms()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -185,6 +190,11 @@ impl Store {
             "Welcome to gild. This demo workspace lives on this computer, and everything you write here is saved locally.",
         )?;
         Ok(())
+    }
+
+    /// The data folder this store keeps its database and histories in.
+    pub fn data_dir(&self) -> &Path {
+        &self.data
     }
 
     pub fn workspaces(&self) -> Result<Vec<Workspace>, String> {

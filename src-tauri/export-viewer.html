@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- No network, ever: this page works offline, years from now, with gild gone. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' file:; style-src 'unsafe-inline'; img-src data:">
+<title>gild export</title>
+<style>
+:root { --bg: #fafaf8; --surface: #fff; --ink: #17181b; --soft: #4a4d55; --rule: #dedbd4; --accent: #8a5f08; --chip: #efede8; color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0b0c0e; --surface: #14161a; --ink: #eceae4; --soft: #b9b6ae; --rule: #23252a; --accent: #e2b54a; --chip: #1b1d22; color-scheme: dark; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+.wrap { display: flex; min-height: 100vh; }
+nav { width: 240px; flex: none; border-right: 1px solid var(--rule); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; }
+nav h1 { font-size: 17px; margin: 0 8px 4px; }
+nav p { margin: 0 8px 12px; color: var(--soft); font-size: 12px; }
+nav button { all: unset; cursor: pointer; padding: 6px 10px; border-radius: 7px; color: var(--soft); }
+nav button[aria-current] { background: var(--ink); color: var(--bg); }
+nav button:focus-visible { outline: 2px solid var(--accent); }
+main { flex: 1; min-width: 0; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: 18px; }
+h2 { margin: 0; font-size: 20px; }
+.label { font: 11px ui-monospace, Menlo, monospace; letter-spacing: .07em; text-transform: uppercase; color: var(--soft); }
+.box { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font: 11px ui-monospace, Menlo, monospace; color: var(--soft); }
+.msg { display: flex; flex-direction: column; padding: 6px 0; border-bottom: 1px solid var(--rule); }
+.msg b { font-weight: 600; }
+.msg .t { color: var(--soft); font: 11px ui-monospace, Menlo, monospace; margin-left: 6px; }
+.msg .x { white-space: pre-wrap; overflow-wrap: anywhere; }
+.files { color: var(--soft); font-size: 12px; }
+.files code { font: 12px ui-monospace, Menlo, monospace; }
+@media (max-width: 640px) { .wrap { flex-direction: column; } nav { width: auto; border-right: 0; border-bottom: 1px solid var(--rule); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav id="nav" aria-label="Channels"></nav>
+  <main id="main"><p>Loading the export…</p></main>
+</div>
+<script src="data/workspace.js"></script>
+<script>
+// Everything is rendered as text (textContent), never as HTML: this export
+// holds what people and agents wrote, and none of it may run as code here.
+(function () {
+  const data = window.GILD_EXPORT
+  const nav = document.getElementById('nav')
+  const main = document.getElementById('main')
+  const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e }
+  if (!data) { main.textContent = 'data/workspace.js is missing. Keep this page in the export folder, next to the data folder.'; return }
+  nav.append(el('h1', data.workspace), el('p', 'Exported ' + new Date(data.exported_at).toLocaleString() + ' from gild ' + data.gild_version))
+  const show = (i) => {
+    const c = data.channels[i]
+    ;[...nav.querySelectorAll('button')].forEach((b, j) => b.toggleAttribute('aria-current', j === i))
+    main.replaceChildren()
+    main.append(el('h2', '# ' + c.name))
+    if (c.topic) main.append(el('p', c.topic))
+    if (c.table) {
+      const n = c.table.records.length
+      main.append(el('span', 'Table · ' + n + (n === 1 ? ' record' : ' records'), 'label'))
+      const box = el('div', null, 'box'), t = el('table'), head = el('tr')
+      ;['Title', ...c.table.columns, 'Status'].forEach(h => head.append(el('th', h)))
+      t.append(head)
+      c.table.records.forEach(r => {
+        const tr = el('tr')
+        tr.append(el('td', r.title))
+        c.table.columns.forEach(col => tr.append(el('td', r.fields[col] || '')))
+        tr.append(el('td', r.status))
+        t.append(tr)
+      })
+      box.append(t); main.append(box)
+    }
+    main.append(el('span', c.messages.length === 1 ? '1 message' : c.messages.length + ' messages', 'label'))
+    c.messages.forEach(m => {
+      const d = el('div', null, 'msg'), line = el('div')
+      line.append(el('b', m.author + (m.kind === 'agent' ? ' (agent)' : '')), el('span', new Date(m.created_at).toLocaleString(), 't'))
+      d.append(line, el('div', m.body, 'x'))
+      main.append(d)
+    })
+    const files = el('p', null, 'files')
+    files.append('Open files for this channel: ', el('code', 'channels/' + c.name + '/'), '. Its full history is a git repository you can clone: ', el('code', 'git clone channels/' + c.name + '/history.git'))
+    main.append(files)
+  }
+  data.channels.forEach((c, i) => { const b = el('button', '# ' + c.name); b.onclick = () => show(i); nav.append(b) })
+  if (data.channels.length) show(0); else main.textContent = 'This workspace has no channels.'
+})()
+</script>
+</body>
+</html>

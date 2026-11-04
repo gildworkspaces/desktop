@@ -50,6 +50,7 @@ export const core = {
   setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),
   activity: (channelId: string) => invoke<AuditEntry[]>('activity', { channelId }),
   mcpStatus: () => invoke<string>('mcp_status'),
+  exportWorkspace: (workspaceId: string) => invoke<string>('export_workspace', { workspaceId }),
 }
 
 /** "Sent by, Program" → ["Sent by", "Program"] */

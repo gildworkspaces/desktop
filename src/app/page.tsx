@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { core, inApp, onChanged, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type Message } from '@/lib/core'
 
 export default function App() {
@@ -140,6 +141,7 @@ function WorkspaceView({ account, workspace, onBack }: { account: Account; works
           <div className="member"><span className="dot" aria-hidden="true" />{account.name} (you)</div>
         </div>
         <AgentsSidebar />
+        <ExportWorkspace workspace={workspace} />
         <div className="foot"><Who account={account} /></div>
       </nav>
       {current ? <ChannelView key={current.id} channel={current} /> : <main className="channel" />}
@@ -147,6 +149,24 @@ function WorkspaceView({ account, workspace, onBack }: { account: Account; works
   )
 }
 
+
+function ExportWorkspace({ workspace }: { workspace: Workspace }) {
+  const [state, setState] = useState<{ busy: boolean; path?: string; error?: string }>({ busy: false })
+  async function run() {
+    setState({ busy: true })
+    try { setState({ busy: false, path: await core.exportWorkspace(workspace.id) }) } catch (e) { setState({ busy: false, error: errorText(e) }) }
+  }
+  return (
+    <div className="group exportbox">
+      <button className="ghost" onClick={run} disabled={state.busy}>{state.busy ? 'Exporting…' : 'Export workspace'}</button>
+      <p className="note">A folder of open files: chat as markdown, tables as CSV, full history as git, and a page that browses it all offline.</p>
+      {state.path && (
+        <p className="note">Saved to <span className="mono">{state.path.split('/').slice(-2).join('/')}</span>. <button className="link" onClick={() => revealItemInDir(state.path!)}>Show in Finder</button></p>
+      )}
+      {state.error && <p className="error" style={{ padding: '0 10px' }}>{state.error}</p>}
+    </div>
+  )
+}
 
 function ChannelView({ channel }: { channel: Channel }) {
   const [messages, setMessages] = useState<Message[]>([])
