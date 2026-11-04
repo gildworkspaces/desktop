@@ -17,7 +17,8 @@ try {
   // First run: the demo workspace is there, signed in as the demo account.
   const card = await driver.wait(until.elementLocated(By.css('button.card')), 30000)
   assert.match(await card.getText(), /Demo workspace/)
-  assert.match(await driver.findElement(By.css('.who')).getText(), /demo account/)
+  // You, in the top bar: the profile's name until you change it.
+  assert.match(await driver.findElement(By.css('.usercard .me')).getText(), /Demo/)
 
   // Open it: #general holds the welcome message from the seed.
   await card.click()
@@ -25,7 +26,8 @@ try {
   assert.match(await driver.findElement(By.css('.list')).getText(), /Welcome to gild/)
 
   // A new channel and a message, through the window like a person would.
-  await driver.findElement(By.css('#new-channel')).sendKeys('Student Intake', Key.ENTER)
+  await driver.findElement(By.css("button[aria-label='Create a channel']")).click()
+  await driver.wait(until.elementLocated(By.css('#channel-name')), 10000).sendKeys('Student Intake', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//h2[contains(., 'student-intake')]")), 10000)
   await driver.findElement(By.css('#composer')).sendKeys('Northside sent three more students.', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//span[@class='text' and contains(., 'Northside sent three more students.')]")), 10000)
@@ -97,7 +99,8 @@ try {
       : 'I could not find the question.'
     await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'post_message', arguments: { channel_id: channel, text: asked, ...(thread ? { thread_id: thread } : {}) } } }, session)
   `)
-  await driver.findElement(By.css('#new-agent')).sendKeys('intake', Key.ENTER)
+  await driver.findElement(By.css("button[aria-label='Add an agent']")).click()
+  await driver.wait(until.elementLocated(By.css('#agent-name')), 10000).sendKeys('intake', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//h2[.='Set up intake']")), 10000)
   await driver.wait(until.elementLocated(By.xpath("//label[contains(@class,'clientrow') and contains(., 'Claude Code')]")), 30000)
   await driver.findElement(By.xpath("//details[contains(@class,'manual')]/summary")).click()
@@ -127,7 +130,6 @@ try {
   await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//span[@class='ok' and .='Saved.']")), 10000)
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Close']")).click()
-  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow')]//span[contains(., 'wakes on @')]")), 10000)
   const agentsNow = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context + ':' + x.wake)), e => done({ error: String(e) }))
@@ -251,9 +253,13 @@ try {
   console.log('removed: intake')
 
   // Export from the window: a folder of open files, and the history clones.
-  await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()
-  const outcome = await driver.wait(until.elementLocated(By.xpath("//p[contains(., 'Saved to')] | //div[contains(@class,'exportbox')]//p[contains(@class,'error')]")), 20000)
+  // Export lives in Settings now: the gear, then Export and import.
+  await driver.findElement(By.css("button[aria-label='App settings']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'sitem') and .='Export and import']")), 10000).click()
+  await driver.findElement(By.xpath("//div[contains(@class,'sline')]//button[.='Export']")).click()
+  const outcome = await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'sline')]//span[contains(@class,'ok') or contains(@class,'error')]")), 20000)
   assert.match(await outcome.getText(), /Saved to/)
+  await driver.findElement(By.css("button[aria-label='Close settings']")).click()
   const out = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)

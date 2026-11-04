@@ -1,59 +1,170 @@
 'use client'
 // Agents: adding one (gild sets it up in the AI tools on this computer),
-// what it may do in a channel, and what agents did there.
+// the members list, Settings' agents page, what an agent may do in a
+// channel, and what agents did there.
 import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected } from '@/lib/core'
+import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type Profile } from '@/lib/core'
+import { Avatar } from './Profile'
 
-export function AgentsSidebar({ channels, current }: { channels: Channel[]; current: Channel | null }) {
+/** Tell every agents list in the window that the agents changed. */
+const changed = () => window.dispatchEvent(new Event('gild:agents'))
+
+function useAgents(): [Agent[], (a: Agent[]) => void, string] {
   const [agents, setAgents] = useState<Agent[]>([])
-  const [name, setName] = useState('')
-  const [open, setOpen] = useState<{ agent: Agent; fresh: boolean } | null>(null)
-  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null)
   const [error, setError] = useState('')
-
   useEffect(() => {
-    core.agents().then(setAgents, e => setError(errorText(e)))
-    core.mcpStatus().then(t => setStatus({ ok: true, text: t }), e => setStatus({ ok: false, text: errorText(e) }))
+    const load = () => core.agents().then(setAgents, e => setError(errorText(e)))
+    load()
+    window.addEventListener('gild:agents', load)
+    return () => window.removeEventListener('gild:agents', load)
   }, [])
+  return [agents, (a: Agent[]) => { setAgents(a); changed() }, error]
+}
 
-  async function add(e: React.FormEvent) {
-    e.preventDefault()
-    setError('')
-    try {
-      const made = await core.createAgent(name)
-      setAgents(a => [...a, made.agent])
-      setOpen({ agent: made.agent, fresh: true })
-      setName('')
-    } catch (err) { setError(errorText(err)) }
-  }
-
+export function PlusButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <div className="group">
-      <span className="label">Agents</span>
-      {agents.length === 0 && <p className="note">No agents yet. Add one and gild sets it up.</p>}
-      {agents.map(a => (
-        <button key={a.id} className="member agentrow" onClick={() => setOpen({ agent: a, fresh: false })} aria-label={`${a.name}: settings`}>
-          <span className="dot agent" aria-hidden="true" />{a.name}
-          {a.wake && <span className="badge" title="Wakes when mentioned">wakes on @</span>}
-        </button>
-      ))}
-      <form className="addchan" onSubmit={add}>
-        <label htmlFor="new-agent" className="sr">New agent</label>
-        <input id="new-agent" className="field" placeholder="+ add agent" value={name} onChange={e => setName(e.target.value)} />
-      </form>
-      {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
-      {status && !status.ok && <p className="error" style={{ padding: '0 10px' }}>{status.text}</p>}
-      {open && (
-        <AgentSetup
-          key={open.agent.id}
-          agent={open.agent}
-          fresh={open.fresh}
-          channels={channels}
-          current={current}
-          onAgents={setAgents}
-          onClose={() => setOpen(null)}
+    <button className="plus" onClick={onClick} aria-label={label} title={label}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+    </button>
+  )
+}
+
+/** Adding an agent: its name, then the setup steps. */
+export function useAddAgent(channels: Channel[], current: Channel | null, onAgents: (a: Agent[]) => void) {
+  const [naming, setNaming] = useState(false)
+  const [setting, setSetting] = useState<{ agent: Agent; fresh: boolean } | null>(null)
+  const ui = (
+    <>
+      {naming && (
+        <NameModal
+          title="Add an agent"
+          label="Name"
+          hint="What people write after @ to ask it something, e.g. intake."
+          action="Continue"
+          id="agent-name"
+          onSubmit={async name => {
+            const made = await core.createAgent(name)
+            onAgents(await core.agents())
+            setNaming(false)
+            setSetting({ agent: made.agent, fresh: true })
+          }}
+          onClose={() => setNaming(false)}
         />
       )}
+      {setting && (
+        <AgentSetup key={setting.agent.id} agent={setting.agent} fresh={setting.fresh} channels={channels} current={current} onAgents={onAgents} onClose={() => setSetting(null)} />
+      )}
+    </>
+  )
+  return { add: () => setNaming(true), open: (agent: Agent) => setSetting({ agent, fresh: false }), ui }
+}
+
+/** A small modal asking for one name (and, optionally, more fields given as children). */
+export function NameModal({ title, label, hint, action, id, onSubmit, onClose, extra }: {
+  title: string; label: string; hint?: string; action: string; id: string
+  onSubmit: (name: string, extra: string) => Promise<void>; onClose: () => void; extra?: { id: string; label: string; placeholder: string }
+}) {
+  const [name, setName] = useState('')
+  const [more, setMore] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', esc)
+    return () => document.removeEventListener('keydown', esc)
+  }, [onClose])
+  return (
+    <div className="modalback top" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}>
+      <form className="modal small" onSubmit={async e => {
+        e.preventDefault()
+        setBusy(true)
+        setError('')
+        try { await onSubmit(name, more) } catch (err) { setError(errorText(err)) } finally { setBusy(false) }
+      }}>
+        <h2 id={`${id}-title`}>{title}</h2>
+        <label htmlFor={id} className="flabel">{label}</label>
+        <input id={id} className="field" autoFocus value={name} onChange={e => setName(e.target.value)} />
+        {hint && <p className="faint" style={{ fontSize: 12 }}>{hint}</p>}
+        {extra && (
+          <>
+            <label htmlFor={extra.id} className="flabel">{extra.label}</label>
+            <input id={extra.id} className="field" placeholder={extra.placeholder} value={more} onChange={e => setMore(e.target.value)} />
+          </>
+        )}
+        {error && <p className="error">{error}</p>}
+        <div className="row end">
+          <button type="button" className="ghost" onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={busy || !name.trim()}>{action}</button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+/** The sidebar's members: you, then the agents. */
+export function MembersGroup({ profile, channels, current }: { profile: Profile; channels: Channel[]; current: Channel | null }) {
+  const [agents, setAgents, error] = useAgents()
+  const [status, setStatus] = useState<string>('')
+  useEffect(() => { core.mcpStatus().then(() => setStatus(''), e => setStatus(errorText(e))) }, [])
+  const adding = useAddAgent(channels, current, setAgents)
+  return (
+    <div className="group">
+      <div className="grouphead"><span className="label">Members</span><PlusButton label="Add an agent" onClick={adding.add} /></div>
+      <div className="member"><Avatar profile={profile} size={20} />{profile.name} <span className="faint">(you)</span></div>
+      {agents.map(a => (
+        <button key={a.id} className="member agentrow" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>
+          <span className="aavatar" aria-hidden="true">{a.name[0]?.toUpperCase()}</span>{a.name}
+          <span className="tag">agent</span>
+        </button>
+      ))}
+      {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
+      {status && <p className="error" style={{ padding: '0 10px' }}>{status}</p>}
+      {adding.ui}
+    </div>
+  )
+}
+
+/** Settings › Agents. */
+export function AgentsSettings({ channels, current }: { channels: Channel[]; current: Channel | null }) {
+  const [agents, setAgents, error] = useAgents()
+  const [endpoint, setEndpoint] = useState<{ ok: boolean; text: string } | null>(null)
+  const [where, setWhere] = useState<Record<string, number>>({})
+  useEffect(() => { core.mcpStatus().then(t => setEndpoint({ ok: true, text: t }), e => setEndpoint({ ok: false, text: errorText(e) })) }, [])
+  useEffect(() => {
+    Promise.all(channels.map(c => core.channelAccess(c.id))).then(all => {
+      const n: Record<string, number> = {}
+      for (const rows of all) for (const r of rows) if (r.access) n[r.agent.id] = (n[r.agent.id] ?? 0) + 1
+      setWhere(n)
+    }, () => {})
+  }, [channels, agents])
+  const adding = useAddAgent(channels, current, setAgents)
+  return (
+    <div className="spage">
+      <p className="soft lead">Agents work in the channels you share with them. gild starts one when it’s mentioned, or when someone writes in a thread it’s in, and every call it makes is in the channel’s Activity.</p>
+      {agents.length > 0 && (
+        <div className="srows">
+          {agents.map(a => (
+            <div key={a.id} className="srow agentline">
+              <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b></span>
+              <span className="soft">{channels.length > 0 ? `${where[a.id] ?? 0} ${(where[a.id] ?? 0) === 1 ? 'channel' : 'channels'} here` : ''}</span>
+              <span className="soft">{a.wake ? 'wakes on @' : 'not woken'}</span>
+              <button className="ghost" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>Settings</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {agents.length === 0 && <p className="faint">No agents yet.</p>}
+      <div><button className="primary" onClick={adding.add}>Add an agent</button></div>
+      {error && <p className="error">{error}</p>}
+      {endpoint && (
+        <div className="sfield ruled">
+          <span className="flabel">Agent endpoint</span>
+          {endpoint.ok
+            ? <><span className="mono endpoint"><span className="sdot online" aria-hidden="true" />{endpoint.text}</span><span className="faint" style={{ fontSize: 12 }}>Running. It only answers on this computer.</span></>
+            : <p className="error">{endpoint.text}</p>}
+        </div>
+      )}
+      {adding.ui}
     </div>
   )
 }
@@ -75,7 +186,7 @@ const SETTINGS: { key: Step; label: string }[] = [
 /** Setting an agent up: gild adds it to the AI tools on this computer (and
  *  wakes it through the first of them), shares channels with it, and says
  *  how to use it. Opened again from the sidebar, it's the agent's settings. */
-function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
+export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
   agent: Agent; fresh: boolean; channels: Channel[]; current: Channel | null; onAgents: (agents: Agent[]) => void; onClose: () => void
 }) {
   const [step, setStep] = useState<Step>('connect')

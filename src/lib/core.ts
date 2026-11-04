@@ -4,6 +4,12 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 export type Account = { name: string; demo: boolean }
+export type Status = 'online' | 'idle' | 'dnd' | 'invisible'
+export type Theme = 'system' | 'light' | 'dark'
+/** You: `picture` is a small data: URL; `banner` one of BANNERS. */
+export type Profile = { name: string; bio: string; picture: string | null; banner: string; status: Status; theme: Theme }
+export const BANNERS = ['#f38020', '#3b6fd8', '#2f8f62', '#a2509a', '#c2410c', '#4a4d55']
+export const MAX_BIO = 190
 export type Workspace = { id: string; name: string; channels: number; messages: number; created_at: number }
 export type Channel = { id: string; workspace_id: string; name: string; topic: string; created_at: number }
 /** `thread`: a reply, in the thread of that message. `replies` and
@@ -46,6 +52,11 @@ export function onChanged(f: (channelId: string) => void): () => void {
 
 export const core = {
   account: () => invoke<Account>('account'),
+  profile: () => invoke<Profile>('profile'),
+  saveProfile: (name: string, bio: string, picture: string | null, banner: string) => invoke<Profile>('save_profile', { name, bio, picture, banner }),
+  setStatus: (status: Status) => invoke<Profile>('set_status', { status }),
+  setTheme: (theme: Theme) => invoke<Profile>('set_theme', { theme }),
+  version: () => invoke<string>('version'),
   workspaces: () => invoke<Workspace[]>('workspaces'),
   createWorkspace: (name: string) => invoke<Workspace>('create_workspace', { name }),
   channels: (workspaceId: string) => invoke<Channel[]>('channels', { workspaceId }),
