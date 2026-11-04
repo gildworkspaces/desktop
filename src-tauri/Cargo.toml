@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "gild: the open workspace where people and agents work together"
 license = "Apache-2.0"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -18,7 +18,9 @@ tauri-build = { version = "2.6.3", features = [] }
 tauri = { version = "2.11.6", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # Turso's Rust rewrite of SQLite (MIT): the workspace database. The same
 # engine and the same exact pin as Zega+SQLite (zegadb/zega), so the two can
 # share a file format later.
 turso_core = "=0.8.3"
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }

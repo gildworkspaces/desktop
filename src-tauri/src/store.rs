@@ -6,13 +6,16 @@
 //! never touches the file.
 
 use std::num::NonZero;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
+
+use crate::records::{self, Change, Record, View};
 
 /// Bumped when a table's columns or meaning change.
 const FORMAT: i64 = 1;
@@ -22,7 +25,12 @@ CREATE TABLE IF NOT EXISTS gild_meta (key TEXT PRIMARY KEY, value INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, name TEXT NOT NULL, topic TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, author TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS views (channel_id TEXT PRIMARY KEY, config TEXT NOT NULL, indexed_commit TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS records (channel_id TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, fields TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (channel_id, id));
 ";
+
+/// The file name of the database inside the data folder.
+pub const DB_FILE: &str = "gild.db";
 
 /// The account everything is written as until real accounts exist.
 pub const DEMO_NAME: &str = "Demo";
@@ -56,7 +64,17 @@ pub struct Message {
     pub created_at: i64,
 }
 
+/// A channel's view and records, as the index has them.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ChannelData {
+    pub view: Option<View>,
+    pub records: Vec<Record>,
+}
+
 pub struct Store {
+    /// The data folder: the database, and `channels/<id>.git` for each
+    /// channel's records (the truth the index is built from).
+    data: PathBuf,
     conn: Arc<Connection>,
     // Held so the database outlives every statement on `conn`.
     _db: Arc<Database>,
@@ -105,8 +123,11 @@ pub fn channel_name(input: &str) -> Option<String> {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Store, String> {
-        let path = path.to_str().ok_or("the data folder's path is not valid UTF-8")?;
+    /// Open the store in `data`, and bring the index up to date with every
+    /// channel's history.
+    pub fn open(data: &Path) -> Result<Store, String> {
+        let db_path = data.join(DB_FILE);
+        let path = db_path.to_str().ok_or("the data folder's path is not valid UTF-8")?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| err("starting SQLite I/O", e))?);
         let db = Database::open_file(io, path, Arc::new(SqliteDialect)).map_err(|e| err("opening the workspace database", e))?;
         let conn = db.connect().map_err(|e| err("connecting to the workspace database", e))?;
@@ -114,12 +135,13 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { conn, _db: db };
+        let store = Store { data: data.to_path_buf(), conn, _db: db };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
             Some(row) => return Err(format!("this database is format {}, and this gild reads format {FORMAT}", int(&row[0]))),
         }
+        store.catch_up()?;
         Ok(store)
     }
 
@@ -274,6 +296,220 @@ impl Store {
     }
 }
 
+
+/// Limits that keep a view readable.
+const MAX_FIELDS: usize = 12;
+const MAX_STATUSES: usize = 8;
+
+fn clean_list(items: &[String], what: &str, max: usize) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if item.chars().count() > 40 {
+            return Err(format!("{what} names are at most 40 characters."));
+        }
+        if out.iter().any(|o| o.eq_ignore_ascii_case(item)) {
+            return Err(format!("\"{item}\" is listed twice."));
+        }
+        out.push(item.to_string());
+    }
+    if out.len() > max {
+        return Err(format!("A table has at most {max} {what}s."));
+    }
+    Ok(out)
+}
+
+impl Store {
+    /// Rebuild the index of every channel whose history moved past it. The
+    /// index is a function of the commit, so this is the same code that
+    /// indexes each change.
+    fn catch_up(&self) -> Result<(), String> {
+        for row in self.query("SELECT id FROM channels", &[])? {
+            let channel = text(&row[0]);
+            let head = records::head_commit(&self.data, &channel)?;
+            let indexed = self
+                .query("SELECT indexed_commit FROM views WHERE channel_id = ?1", &[Value::from_text(channel.clone())])?
+                .first()
+                .map(|r| text(&r[0]));
+            if head != indexed {
+                self.reindex(&channel)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace a channel's index with what its history says now.
+    fn reindex(&self, channel_id: &str) -> Result<(), String> {
+        let snap = records::snapshot(&self.data, channel_id)?;
+        let id = Value::from_text(channel_id.to_string());
+        self.run("DELETE FROM records WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM views WHERE channel_id = ?1", std::slice::from_ref(&id))?;
+        if let (Some(view), Some(commit)) = (&snap.view, &snap.commit) {
+            let config = serde_json::to_string(view).map_err(|e| err("indexing the view", e))?;
+            self.run(
+                "INSERT INTO views (channel_id, config, indexed_commit) VALUES (?1, ?2, ?3)",
+                &[id.clone(), Value::from_text(config), Value::from_text(commit.clone())],
+            )?;
+        }
+        for r in &snap.records {
+            let fields = serde_json::to_string(&r.fields).map_err(|e| err("indexing a record", e))?;
+            self.run(
+                "INSERT INTO records (channel_id, id, title, status, fields, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    id.clone(),
+                    Value::from_text(r.id.clone()),
+                    Value::from_text(r.title.clone()),
+                    Value::from_text(r.status.clone()),
+                    Value::from_text(fields),
+                    Value::from_i64(r.created_at),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Commit, then index: the change is real once the commit exists, and the
+    /// index follows it.
+    fn write(&self, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+        records::commit(&self.data, channel_id, author, message, files)?;
+        self.reindex(channel_id)
+    }
+
+    fn require_channel(&self, channel_id: &str) -> Result<(), String> {
+        if self.query("SELECT 1 FROM channels WHERE id = ?1", &[Value::from_text(channel_id.to_string())])?.is_empty() {
+            return Err("That channel no longer exists.".into());
+        }
+        Ok(())
+    }
+
+    pub fn channel_data(&self, channel_id: &str) -> Result<ChannelData, String> {
+        let id = Value::from_text(channel_id.to_string());
+        let view = match self.query("SELECT config FROM views WHERE channel_id = ?1", std::slice::from_ref(&id))?.first() {
+            Some(row) => Some(serde_json::from_str::<View>(&text(&row[0])).map_err(|e| err("reading the view", e))?),
+            None => None,
+        };
+        let rows = self.query(
+            "SELECT id, title, status, fields, created_at FROM records WHERE channel_id = ?1 ORDER BY created_at, id",
+            &[id],
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(Record {
+                id: text(&r[0]),
+                title: text(&r[1]),
+                status: text(&r[2]),
+                fields: serde_json::from_str(&text(&r[3])).map_err(|e| err("reading a record", e))?,
+                created_at: int(&r[4]),
+            });
+        }
+        Ok(ChannelData { view, records: out })
+    }
+
+    /// Give a channel a table (or change its columns and statuses).
+    pub fn set_view(&self, channel_id: &str, author: &str, fields: &[String], statuses: &[String]) -> Result<ChannelData, String> {
+        self.require_channel(channel_id)?;
+        let fields = clean_list(fields, "column", MAX_FIELDS)?;
+        let statuses = clean_list(statuses, "status", MAX_STATUSES)?;
+        if statuses.is_empty() {
+            return Err("A table needs at least one status, such as To do.".into());
+        }
+        let had = self.channel_data(channel_id)?.view.is_some();
+        let view = View { kind: "table".into(), fields, statuses };
+        let bytes = serde_json::to_vec_pretty(&view).map_err(|e| err("saving the view", e))?;
+        let message = if had { "Change the table's columns" } else { "Add a table" };
+        self.write(channel_id, author, message, &[(records::VIEW_PATH.to_string(), bytes)])?;
+        self.channel_data(channel_id)
+    }
+
+    fn check_record(view: &View, title: &str, status: &str, fields: &BTreeMap<String, String>) -> Result<(), String> {
+        if title.trim().is_empty() {
+            return Err("A record needs a title.".into());
+        }
+        if title.chars().count() > 200 {
+            return Err("Titles are at most 200 characters.".into());
+        }
+        if !view.statuses.iter().any(|s| s == status) {
+            return Err(format!("\"{status}\" is not one of this table's statuses."));
+        }
+        for (name, value) in fields {
+            if !view.fields.iter().any(|f| f == name) {
+                return Err(format!("This table has no column \"{name}\"."));
+            }
+            if value.chars().count() > 2000 {
+                return Err(format!("\"{name}\" is longer than 2,000 characters."));
+            }
+        }
+        Ok(())
+    }
+
+    fn view_of(&self, channel_id: &str) -> Result<View, String> {
+        self.channel_data(channel_id)?.view.ok_or_else(|| "This channel has no table yet.".to_string())
+    }
+
+    pub fn add_record(
+        &self,
+        channel_id: &str,
+        author: &str,
+        title: &str,
+        status: &str,
+        fields: BTreeMap<String, String>,
+    ) -> Result<Record, String> {
+        self.require_channel(channel_id)?;
+        let view = self.view_of(channel_id)?;
+        let fields: BTreeMap<String, String> = fields.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
+        Self::check_record(&view, title, status, &fields)?;
+        let record = Record { id: new_id(), title: title.trim().to_string(), status: status.to_string(), fields, created_at: now_ms() };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| err("saving the record", e))?;
+        self.write(channel_id, author, &format!("Add {}", record.title), &[(records::record_path(&record.id), bytes)])?;
+        Ok(record)
+    }
+
+    /// Change a record. The commit message says what changed, in words.
+    pub fn update_record(
+        &self,
+        channel_id: &str,
+        author: &str,
+        record_id: &str,
+        title: &str,
+        status: &str,
+        fields: BTreeMap<String, String>,
+    ) -> Result<Record, String> {
+        let data = self.channel_data(channel_id)?;
+        let view = data.view.ok_or("This channel has no table yet.")?;
+        let old = data.records.into_iter().find(|r| r.id == record_id).ok_or("That record no longer exists.")?;
+        let fields: BTreeMap<String, String> = fields.into_iter().map(|(k, v)| (k, v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect();
+        Self::check_record(&view, title, status, &fields)?;
+        let new = Record { id: old.id.clone(), title: title.trim().to_string(), status: status.to_string(), fields, created_at: old.created_at };
+        let mut said = Vec::new();
+        if new.title != old.title {
+            said.push(format!("renamed from {}", old.title));
+        }
+        if new.status != old.status {
+            said.push(format!("{} → {}", old.status, new.status));
+        }
+        for name in &view.fields {
+            let (a, b) = (old.fields.get(name), new.fields.get(name));
+            if a != b {
+                said.push(match b {
+                    Some(v) => format!("{name}: {v}"),
+                    None => format!("{name} cleared"),
+                });
+            }
+        }
+        if said.is_empty() {
+            return Ok(old);
+        }
+        let bytes = serde_json::to_vec_pretty(&new).map_err(|e| err("saving the record", e))?;
+        let message = format!("{}: {}", new.title, said.join(", "));
+        self.write(channel_id, author, &message, &[(records::record_path(&new.id), bytes)])?;
+        Ok(new)
+    }
+
+    /// Every change to one record, newest first, from git.
+    pub fn record_history(&self, channel_id: &str, record_id: &str) -> Result<Vec<Change>, String> {
+        records::history(&self.data, channel_id, &records::record_path(record_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,8 +517,82 @@ mod tests {
     fn temp() -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("gild-store-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("gild.db");
-        (dir, file)
+        (dir.clone(), dir)
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn records_are_rebuilt_from_git_when_the_index_is_gone() {
+        let (dir, file) = temp();
+        let channel = {
+            let store = Store::open(&file).unwrap();
+            let ws = store.create_workspace("Front Desk").unwrap();
+            let c = store.create_channel(&ws.id, "student-intake", "").unwrap();
+            store.set_view(&c.id, DEMO_NAME, &strings(&["Sent by", "Program"]), &strings(&["New", "Docs needed", "Enrolled"])).unwrap();
+            let jordan = store.add_record(&c.id, DEMO_NAME, "Jordan Lee", "New", fields(&[("Sent by", "Northside"), ("Program", "Web Dev")])).unwrap();
+            store.add_record(&c.id, DEMO_NAME, "Priya Natarajan", "Enrolled", fields(&[("Sent by", "Northside")])).unwrap();
+            store.update_record(&c.id, DEMO_NAME, &jordan.id, "Jordan Lee", "Docs needed", fields(&[("Sent by", "Northside"), ("Program", "Web Dev")])).unwrap();
+            c
+        };
+        // Lose the index: every indexed view and record.
+        {
+            let store = Store::open(&file).unwrap();
+            store.run("DELETE FROM views", &[]).unwrap();
+            store.run("DELETE FROM records", &[]).unwrap();
+            assert!(store.channel_data(&channel.id).unwrap().records.is_empty());
+        }
+        // Reopening catches up from git.
+        let store = Store::open(&file).unwrap();
+        let data = store.channel_data(&channel.id).unwrap();
+        assert_eq!(data.view.unwrap().statuses, ["New", "Docs needed", "Enrolled"]);
+        let got: Vec<(String, String)> = data.records.iter().map(|r| (r.title.clone(), r.status.clone())).collect();
+        assert_eq!(got, [("Jordan Lee".to_string(), "Docs needed".to_string()), ("Priya Natarajan".to_string(), "Enrolled".to_string())]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_s_history_says_what_changed() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = &store.channels(&ws.id).unwrap()[0];
+        store.set_view(&c.id, DEMO_NAME, &strings(&["Program"]), &strings(&["New", "Enrolled"])).unwrap();
+        let r = store.add_record(&c.id, DEMO_NAME, "Ana Souza", "New", fields(&[])).unwrap();
+        let other = store.add_record(&c.id, DEMO_NAME, "Tom Okafor", "New", fields(&[])).unwrap();
+        store.update_record(&c.id, DEMO_NAME, &r.id, "Ana Souza", "Enrolled", fields(&[("Program", "UX")])).unwrap();
+        store.update_record(&c.id, DEMO_NAME, &other.id, "Tom Okafor", "Enrolled", fields(&[])).unwrap();
+        // Saving with nothing changed makes no commit.
+        store.update_record(&c.id, DEMO_NAME, &r.id, "Ana Souza", "Enrolled", fields(&[("Program", "UX")])).unwrap();
+        let history: Vec<String> = store.record_history(&c.id, &r.id).unwrap().into_iter().map(|h| h.message).collect();
+        assert_eq!(history, ["Ana Souza: New → Enrolled, Program: UX", "Add Ana Souza"], "only this record's commits, newest first");
+        assert_eq!(store.record_history(&c.id, &r.id).unwrap()[0].author, DEMO_NAME);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn records_refuse_what_they_should() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = &store.channels(&ws.id).unwrap()[0];
+        assert!(store.add_record(&c.id, DEMO_NAME, "x", "New", fields(&[])).unwrap_err().contains("no table"));
+        assert!(store.set_view(&c.id, DEMO_NAME, &strings(&["A", "a"]), &strings(&["New"])).unwrap_err().contains("twice"));
+        assert!(store.set_view(&c.id, DEMO_NAME, &strings(&["A"]), &strings(&[" "])).is_err());
+        store.set_view(&c.id, DEMO_NAME, &strings(&["A"]), &strings(&["New"])).unwrap();
+        assert!(store.add_record(&c.id, DEMO_NAME, " ", "New", fields(&[])).is_err());
+        assert!(store.add_record(&c.id, DEMO_NAME, "x", "Done", fields(&[])).unwrap_err().contains("statuses"));
+        assert!(store.add_record(&c.id, DEMO_NAME, "x", "New", fields(&[("B", "1")])).unwrap_err().contains("no column"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

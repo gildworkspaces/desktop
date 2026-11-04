@@ -1,9 +1,13 @@
+mod records;
 mod store;
 
 use std::sync::Mutex;
 
 use serde::Serialize;
-use store::{Channel, Message, Store, Workspace, DEMO_NAME};
+use std::collections::BTreeMap;
+
+use records::{Change, Record};
+use store::{Channel, ChannelData, Message, Store, Workspace, DEMO_NAME};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -56,13 +60,45 @@ fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<M
     with(&core, |s| s.post(&channel_id, DEMO_NAME, "person", &body))
 }
 
+#[tauri::command]
+fn channel_data(core: State<Core>, channel_id: String) -> Result<ChannelData, String> {
+    with(&core, |s| s.channel_data(&channel_id))
+}
+
+#[tauri::command]
+fn set_view(core: State<Core>, channel_id: String, fields: Vec<String>, statuses: Vec<String>) -> Result<ChannelData, String> {
+    with(&core, |s| s.set_view(&channel_id, DEMO_NAME, &fields, &statuses))
+}
+
+#[tauri::command]
+fn add_record(core: State<Core>, channel_id: String, title: String, status: String, fields: BTreeMap<String, String>) -> Result<Record, String> {
+    with(&core, |s| s.add_record(&channel_id, DEMO_NAME, &title, &status, fields))
+}
+
+#[tauri::command]
+fn update_record(
+    core: State<Core>,
+    channel_id: String,
+    record_id: String,
+    title: String,
+    status: String,
+    fields: BTreeMap<String, String>,
+) -> Result<Record, String> {
+    with(&core, |s| s.update_record(&channel_id, DEMO_NAME, &record_id, &title, &status, fields))
+}
+
+#[tauri::command]
+fn record_history(core: State<Core>, channel_id: String, record_id: String) -> Result<Vec<Change>, String> {
+    with(&core, |s| s.record_history(&channel_id, &record_id))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let store = Store::open(&dir.join("gild.db"))?;
+            let store = Store::open(&dir)?;
             store.seed_if_empty()?;
             app.manage(Core(Mutex::new(store)));
             Ok(())
@@ -75,6 +111,11 @@ pub fn run() {
             create_channel,
             messages,
             send_message,
+            channel_data,
+            set_view,
+            add_record,
+            update_record,
+            record_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running gild desktop");
