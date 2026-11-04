@@ -4,6 +4,7 @@
 //   tauri-driver &   node tests/e2e/smoke.mjs <path to the built binary>
 import { Builder, By, Key, until } from 'selenium-webdriver'
 import assert from 'node:assert/strict'
+import { readFileSync, existsSync } from 'node:fs'
 
 const application = process.argv[2]
 const driver = await new Builder()
@@ -101,6 +102,23 @@ try {
   const channels = JSON.parse(listed.json.result.content[0].text).channels.map(c => `${c.name}:${c.access}`)
   assert.deepEqual(channels, ['student-intake:write'], 'general was never shared')
   console.log('agent sees:', JSON.stringify(channels))
+
+  // Export from the window: a folder of open files, and the history clones.
+  await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()
+  const outcome = await driver.wait(until.elementLocated(By.xpath("//p[contains(., 'Saved to')] | //div[contains(@class,'exportbox')]//p[contains(@class,'error')]")), 20000)
+  assert.match(await outcome.getText(), /Saved to/)
+  const out = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    call('workspaces').then(ws => call('export_workspace', { workspaceId: ws[0].id })).then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(out.error, undefined, out.error)
+  const dir = `${out}/channels/student-intake`
+  assert.equal(readFileSync(`${dir}/table.csv`, 'utf8').split('\n')[1], 'Jordan Lee,Northside,,Docs needed')
+  assert.match(readFileSync(`${dir}/chat.md`, 'utf8'), /Northside sent three more students\./)
+  assert.ok(existsSync(`${dir}/history.git/HEAD`), 'the history is a git repository')
+  assert.ok(existsSync(`${out}/export-viewer.html`))
+  console.log('exported:', out)
 } finally {
   await driver.quit()
 }

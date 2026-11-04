@@ -1,3 +1,4 @@
+mod export;
 mod mcp;
 mod records;
 mod store;
@@ -136,6 +137,24 @@ fn mcp_status() -> Result<String, String> {
     mcp::STATUS.get().cloned().unwrap_or_else(|| Err("Starting the agent endpoint…".into()))
 }
 
+/// Export a workspace to Documents/gild exports and return the folder.
+#[tauri::command]
+fn export_workspace(app: tauri::AppHandle, core: State<Core>, workspace_id: String) -> Result<String, String> {
+    // Documents, as the system names it; ~/Documents where it names none
+    // (Linux without XDG user directories).
+    let docs = match app.path().document_dir() {
+        Ok(d) => d,
+        Err(_) => app.path().home_dir().map_err(|e| format!("finding your home folder: {e}"))?.join("Documents"),
+    };
+    let stamp = {
+        let ms = store::now();
+        let secs = ms / 1000;
+        format!("{} {:02}{:02}{:02}", export::date(ms), secs / 3600 % 24, secs / 60 % 60, secs % 60)
+    };
+    let out = with(&core, |s| export::export_workspace(s, &workspace_id, &docs.join("gild exports"), &stamp))?;
+    Ok(out.display().to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -168,6 +187,7 @@ pub fn run() {
             set_access,
             activity,
             mcp_status,
+            export_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running gild desktop");

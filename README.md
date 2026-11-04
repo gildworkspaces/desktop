@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.4.0)
+## What works (0.5.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -24,6 +24,10 @@ everything after that is the design doc.
   button: *can read*, or *can read and change*. What agents do appears in
   the channel as it happens, and every call they make, allowed or refused, is
   in the channel's **Activity**.
+- **Export.** *Export workspace* in the sidebar writes a folder to
+  Documents/gild exports: each channel's chat as markdown and JSON lines, its
+  table as CSV and JSON, its full history as a git repository you can clone,
+  and `export-viewer.html`, which browses all of it offline.
 - A built-in **demo account**. Accounts and sign-in come later; until then
   everything is written as "Demo".
 
