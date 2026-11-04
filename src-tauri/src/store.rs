@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 
 use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
@@ -61,7 +61,7 @@ pub struct Channel {
     pub created_at: i64,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub id: String,
     pub channel_id: String,
@@ -987,6 +987,81 @@ impl Store {
             .iter()
             .map(|r| AuditEntry { agent: text(&r[0]), action: text(&r[1]), detail: text(&r[2]), ok: int(&r[3]) != 0, at: int(&r[4]) })
             .collect())
+    }
+}
+
+/// A channel coming back from an export: its chat, and its history (the
+/// truth its table, docs and access are rebuilt from).
+pub struct ImportChannel {
+    pub name: String,
+    pub topic: String,
+    pub messages: Vec<Message>,
+    pub history: Option<PathBuf>,
+}
+
+impl Store {
+    /// A new workspace from an export. Everything is checked before anything
+    /// is written. Messages keep their authors and times, and wake no one:
+    /// they were said before.
+    pub fn import_workspace(&self, name: &str, channels: Vec<ImportChannel>) -> Result<Workspace, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 60 {
+            return Err("The export's workspace name is missing or longer than 60 characters.".into());
+        }
+        let mut seen = Vec::new();
+        for c in &channels {
+            if channel_name(&c.name).as_deref() != Some(c.name.as_str()) {
+                return Err(format!("\"{}\" isn't a channel name gild makes.", c.name));
+            }
+            if seen.contains(&c.name) {
+                return Err(format!("#{} is in the export twice.", c.name));
+            }
+            seen.push(c.name.clone());
+            if let Some(m) = c.messages.iter().find(|m| !["person", "system", "agent"].contains(&m.kind.as_str()) || m.body.trim().is_empty()) {
+                return Err(format!("A message in #{} has no text or an unknown kind ({}).", c.name, m.kind));
+            }
+            if let Some(h) = &c.history {
+                gix::open(h).map_err(|e| format!("#{}'s history.git isn't a git repository: {e}", c.name))?;
+            }
+        }
+        let (ws_id, at) = (new_id(), now_ms());
+        self.run(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
+            &[Value::from_text(ws_id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
+        )?;
+        for (i, c) in channels.into_iter().enumerate() {
+            let id = new_id();
+            if let Some(h) = &c.history {
+                crate::export::copy_dir(h, &records::repo_path(&self.data, &id))?;
+            }
+            // Channels are listed by when they were made: keep the export's order.
+            let created = at + i as i64;
+            self.run(
+                "INSERT INTO channels (id, workspace_id, name, topic, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    Value::from_text(id.clone()),
+                    Value::from_text(ws_id.clone()),
+                    Value::from_text(c.name.clone()),
+                    Value::from_text(c.topic.trim().to_string()),
+                    Value::from_i64(created),
+                ],
+            )?;
+            for m in &c.messages {
+                self.run(
+                    "INSERT INTO messages (id, channel_id, author, kind, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    &[
+                        Value::from_text(new_id()),
+                        Value::from_text(id.clone()),
+                        Value::from_text(m.author.clone()),
+                        Value::from_text(m.kind.clone()),
+                        Value::from_text(m.body.clone()),
+                        Value::from_i64(m.created_at),
+                    ],
+                )?;
+            }
+            self.reindex(&id)?;
+        }
+        self.workspaces()?.into_iter().find(|w| w.id == ws_id).ok_or_else(|| "the imported workspace was not saved".into())
     }
 }
 

@@ -35,12 +35,18 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     fs::write(path, bytes).map_err(|e| err(&format!("writing {}", path.display()), e))
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+/// Copy a folder. Symbolic links are skipped, never followed: an export
+/// someone hands you can't pull other files from your computer in.
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     fs::create_dir_all(to).map_err(|e| err("copying history", e))?;
     for entry in fs::read_dir(from).map_err(|e| err("copying history", e))? {
         let entry = entry.map_err(|e| err("copying history", e))?;
         let target = to.join(entry.file_name());
-        if entry.file_type().map_err(|e| err("copying history", e))?.is_dir() {
+        let kind = entry.file_type().map_err(|e| err("copying history", e))?;
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target).map_err(|e| err("copying history", e))?;
@@ -172,7 +178,7 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
         "gild_version": env!("CARGO_PKG_VERSION"),
         "channels": channels,
     });
-    let js = format!("window.GILD_EXPORT = {};\n", serde_json::to_string(&manifest).map_err(|e| err("writing the viewer's data", e))?);
+    let js = format!("{MANIFEST_START}{};\n", serde_json::to_string(&manifest).map_err(|e| err("writing the viewer's data", e))?);
     write(&root.join("data").join("workspace.js"), js)?;
     write(&root.join("export-viewer.html"), VIEWER)?;
     write(
@@ -185,6 +191,42 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
         ),
     )?;
     Ok(root)
+}
+
+const MANIFEST_START: &str = "window.GILD_EXPORT = ";
+
+/// Make an export folder a workspace again. The open files are the source:
+/// each channel's chat from `chat.jsonl` and its history from `history.git`
+/// (its table, docs, access and open proposals are rebuilt from that); the
+/// workspace and channel names and topics come from `data/workspace.js`.
+pub fn import_workspace(store: &Store, folder: &Path) -> Result<crate::store::Workspace, String> {
+    let not_export = || "This folder isn't a gild export: it has no data/workspace.js from gild. Pick the folder Export workspace made.".to_string();
+    let js = fs::read_to_string(folder.join("data").join("workspace.js")).map_err(|_| not_export())?;
+    let json = js.trim().strip_prefix(MANIFEST_START).and_then(|s| s.strip_suffix(';')).ok_or_else(not_export)?;
+    let manifest: serde_json::Value = serde_json::from_str(json).map_err(|e| err("reading data/workspace.js", e))?;
+    let name = manifest["workspace"].as_str().ok_or_else(not_export)?;
+    let mut channels = Vec::new();
+    for c in manifest["channels"].as_array().ok_or_else(not_export)? {
+        let cname = c["name"].as_str().ok_or_else(not_export)?.to_string();
+        let dir = folder.join("channels").join(safe(&cname));
+        let messages: Vec<Message> = match fs::read_to_string(dir.join("chat.jsonl")) {
+            Ok(lines) => lines
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .enumerate()
+                .map(|(i, l)| serde_json::from_str(l).map_err(|e| err(&format!("reading #{cname}'s chat.jsonl, line {}", i + 1), e)))
+                .collect::<Result<_, _>>()?,
+            Err(_) => serde_json::from_value(c["messages"].clone()).map_err(|e| err(&format!("reading #{cname}'s messages"), e))?,
+        };
+        let history = dir.join("history.git");
+        channels.push(crate::store::ImportChannel {
+            name: cname,
+            topic: c["topic"].as_str().unwrap_or("").to_string(),
+            messages,
+            history: history.is_dir().then_some(history),
+        });
+    }
+    store.import_workspace(name, channels)
 }
 
 #[cfg(test)]
@@ -230,6 +272,119 @@ mod tests {
         let again = export_workspace(&store, &ws.id, &base.join("exports"), "2026-11-04 1200").unwrap();
         assert_eq!(again.file_name().unwrap(), "Front Desk 2026-11-04 1200 (2)");
         assert!(out.join("export-viewer.html").exists());
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Every message line without the ids, which a new home gives anew.
+    fn chat_without_ids(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v.as_object_mut().unwrap().retain(|k, _| k != "id" && k != "channel_id");
+                v
+            })
+            .collect()
+    }
+
+    fn refs(repo: &Path) -> Vec<(String, String)> {
+        let repo = gix::open(repo).unwrap();
+        let mut out: Vec<(String, String)> = repo
+            .references()
+            .unwrap()
+            .all()
+            .unwrap()
+            .map(|r| {
+                let mut r = r.unwrap();
+                (r.name().as_bstr().to_string(), r.peel_to_id().unwrap().to_string())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn export_then_import_then_export_gives_the_same_workspace() {
+        let base = std::env::temp_dir().join(format!("gild-roundtrip-{}-{}", std::process::id(), line!()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let store = Store::open(&a).unwrap();
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let intake = store.create_channel(&ws.id, "student-intake", "Students sent by partner schools").unwrap();
+        let empty = store.create_channel(&ws.id, "quiet", "").unwrap();
+        store.post(&general.id, DEMO_NAME, "person", "Morning, all. \"Quotes\", commas, and émoji 🎓").unwrap();
+        store.set_view(&intake.id, DEMO_NAME, &["Sent by".into()], &["New".into(), "Enrolled".into()]).unwrap();
+        let jordan = store.add_record(&intake.id, DEMO_NAME, "Jordan Lee", "New", [("Sent by".to_string(), "Northside".to_string())].into()).unwrap();
+        store.update_record(&intake.id, DEMO_NAME, &jordan.id, "Jordan Lee", "Enrolled", [("Sent by".to_string(), "Northside".to_string())].into()).unwrap();
+        let (agent, _) = store.create_agent("intake").unwrap();
+        store.set_access(&intake.id, DEMO_NAME, &agent.id, Some(crate::records::Access::Write)).unwrap();
+        let sop = store.create_doc(&intake.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# Intake SOP\n\nForms go in the blue folder.\n").unwrap();
+        store.propose_doc(&intake.id, "intake", Some(&sop.path), None, "# Intake SOP\n\nForms go in the red folder.\n", "Red now").unwrap();
+        store.post(&intake.id, "intake", "agent", "Jordan is enrolled.").unwrap();
+        let first = export_workspace(&store, &ws.id, &base.join("out1"), "one").unwrap();
+        drop(store);
+
+        // A new computer: import, and export again.
+        let other = Store::open(&b).unwrap();
+        let back = import_workspace(&other, &first).unwrap();
+        assert_eq!((back.name.as_str(), back.channels, back.messages), ("Front Desk", 3, 3));
+        let names: Vec<String> = other.channels(&back.id).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["general", "student-intake", "quiet"], "in the export's order");
+        let intake2 = other.channels(&back.id).unwrap().into_iter().find(|c| c.name == "student-intake").unwrap();
+        assert_eq!(other.proposals(&intake2.id).unwrap()[0].summary, "Red now", "open proposals come back");
+        assert!(other.agents().unwrap().is_empty() && other.pending_mentions(&agent.id).unwrap().is_empty(), "importing wakes no one");
+        let second = export_workspace(&other, &back.id, &base.join("out2"), "two").unwrap();
+
+        for c in ["general", "student-intake", "quiet"] {
+            let (x, y) = (first.join("channels").join(c), second.join("channels").join(c));
+            assert_eq!(chat_without_ids(&x.join("chat.jsonl")), chat_without_ids(&y.join("chat.jsonl")), "#{c} chat");
+            assert_eq!(fs::read_to_string(x.join("chat.md")).unwrap(), fs::read_to_string(y.join("chat.md")).unwrap(), "#{c} chat.md");
+            for f in ["table.csv", "table.json", "docs/intake-sop.md"] {
+                assert_eq!(fs::read(x.join(f)).ok(), fs::read(y.join(f)).ok(), "#{c} {f}");
+            }
+            assert_eq!(x.join("history.git").exists(), y.join("history.git").exists(), "#{c} history");
+            if x.join("history.git").exists() {
+                assert_eq!(refs(&x.join("history.git")), refs(&y.join("history.git")), "#{c}: the same commits, branches and all");
+            }
+        }
+        assert!(first.join("channels/student-intake/docs/intake-sop.md").exists() && !empty.id.is_empty());
+        drop(other);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn import_refuses_what_isn_t_an_export_and_never_follows_links() {
+        let base = std::env::temp_dir().join(format!("gild-import-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(base.join("data")).unwrap();
+        let store = Store::open(&base.join("data")).unwrap();
+        fs::create_dir_all(base.join("random")).unwrap();
+        assert!(import_workspace(&store, &base.join("random")).unwrap_err().contains("isn't a gild export"));
+
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        store.create_doc(&general.id, DEMO_NAME, "Notes").unwrap();
+        let out = export_workspace(&store, &ws.id, &base.join("out"), "x").unwrap();
+        // Someone slips a link to a private file into the history.
+        let secret = base.join("secret.txt");
+        fs::write(&secret, "private").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, out.join("channels/general/history.git/stolen")).unwrap();
+        let back = import_workspace(&store, &out).unwrap();
+        let id = store.channels(&back.id).unwrap()[0].id.clone();
+        assert!(!crate::records::repo_path(store.data_dir(), &id).join("stolen").exists(), "the link wasn't followed");
+        assert_eq!(store.docs(&id).unwrap()[0].title, "Notes");
+
+        // A hand-edited export with a bad channel name is refused before anything is written.
+        let js = fs::read_to_string(out.join("data/workspace.js")).unwrap().replace("\"name\":\"general\"", "\"name\":\"../general\"");
+        fs::write(out.join("data/workspace.js"), js).unwrap();
+        let before = store.workspaces().unwrap().len();
+        assert!(import_workspace(&store, &out).unwrap_err().contains("isn't a channel name"));
+        assert_eq!(store.workspaces().unwrap().len(), before);
         drop(store);
         fs::remove_dir_all(base).unwrap();
     }

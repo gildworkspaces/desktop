@@ -64,6 +64,7 @@ export const core = {
   activity: (channelId: string) => invoke<AuditEntry[]>('activity', { channelId }),
   mcpStatus: () => invoke<string>('mcp_status'),
   exportWorkspace: (workspaceId: string) => invoke<string>('export_workspace', { workspaceId }),
+  importWorkspace: (folder: string) => invoke<Workspace>('import_workspace', { folder }),
 }
 
 /** A message's text split into plain parts and @mentions, the way the core

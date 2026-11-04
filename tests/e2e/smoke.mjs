@@ -200,6 +200,38 @@ try {
   assert.match(readFileSync(`${dir}/docs/intake-sop.md`, 'utf8'), /red folder/)
   assert.ok(existsSync(`${out}/export-viewer.html`))
   console.log('exported:', out)
+
+  // Import that export back (the folder picker is the system's; the window
+  // calls this same command with the folder you pick), then check it in the
+  // window and through the core, and export it again: the same files.
+  const imported = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    ;(async () => {
+      const ws = await call('import_workspace', { folder: ${JSON.stringify(out)} })
+      const chans = await call('channels', { workspaceId: ws.id })
+      const intake = chans.find(c => c.name === 'student-intake')
+      const docs = await call('channel_docs', { channelId: intake.id })
+      const again = await call('export_workspace', { workspaceId: ws.id })
+      return { ws, channels: chans.map(c => c.name), doc: docs.docs[0].body, messages: (await call('messages', { channelId: intake.id })).length, again }
+    })().then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(imported.error, undefined, imported.error)
+  assert.deepEqual(imported.channels, ['general', 'student-intake'])
+  assert.match(imported.doc, /red folder/)
+  const before = readFileSync(`${dir}/chat.jsonl`, 'utf8').trim().split('\n').length
+  assert.equal(imported.messages, before, 'every message came back')
+  const dir2 = `${imported.again}/channels/student-intake`
+  assert.equal(readFileSync(`${dir2}/table.csv`, 'utf8'), readFileSync(`${dir}/table.csv`, 'utf8'))
+  assert.equal(readFileSync(`${dir2}/docs/intake-sop.md`, 'utf8'), readFileSync(`${dir}/docs/intake-sop.md`, 'utf8'))
+  const tip = d => { const head = readFileSync(`${d}/history.git/HEAD`, 'utf8').trim().replace(/^ref: /, ''); return readFileSync(`${d}/history.git/${head}`, 'utf8').trim() }
+  assert.match(tip(dir), /^[0-9a-f]{40}$/)
+  assert.equal(tip(dir2), tip(dir), 'the same history, commit for commit')
+  await driver.findElement(By.xpath("//button[contains(., 'All workspaces')]")).click()
+  const cards = await driver.wait(until.elementsLocated(By.css('button.card')), 10000)
+  assert.equal(cards.length, 2, 'the imported workspace is on the home screen')
+  assert.ok(await driver.findElement(By.xpath("//button[normalize-space(.)='Import a workspace']")).isDisplayed())
+  console.log('imported:', JSON.stringify({ channels: imported.channels, messages: imported.messages }))
 } finally {
   await driver.quit()
 }

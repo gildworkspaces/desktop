@@ -221,3 +221,4 @@ tbody tr:hover { background: var(--chip); }
 .agentrow:hover { color: var(--ink); background: var(--chip); }
 .agentrow .badge { margin-left: auto; }
 .modal .mono { font-family: var(--mono); font-size: 13px; }
+.importbox { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
