@@ -140,7 +140,12 @@ fn mcp_status() -> Result<String, String> {
 /// Export a workspace to Documents/gild exports and return the folder.
 #[tauri::command]
 fn export_workspace(app: tauri::AppHandle, core: State<Core>, workspace_id: String) -> Result<String, String> {
-    let docs = app.path().document_dir().map_err(|e| format!("finding Documents: {e}"))?;
+    // Documents, as the system names it; ~/Documents where it names none
+    // (Linux without XDG user directories).
+    let docs = match app.path().document_dir() {
+        Ok(d) => d,
+        Err(_) => app.path().home_dir().map_err(|e| format!("finding your home folder: {e}"))?.join("Documents"),
+    };
     let stamp = {
         let ms = store::now();
         let secs = ms / 1000;

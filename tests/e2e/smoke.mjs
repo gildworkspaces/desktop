@@ -105,7 +105,8 @@ try {
 
   // Export from the window: a folder of open files, and the history clones.
   await driver.findElement(By.xpath("//button[contains(., 'Export workspace')]")).click()
-  await driver.wait(until.elementLocated(By.xpath("//p[contains(., 'Saved to')]")), 20000)
+  const outcome = await driver.wait(until.elementLocated(By.xpath("//p[contains(., 'Saved to')] | //div[contains(@class,'exportbox')]//p[contains(@class,'error')]")), 20000)
+  assert.match(await outcome.getText(), /Saved to/)
   const out = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
