@@ -19,7 +19,8 @@ export type Proposal = { id: string; agent: string; summary: string; at: number;
 export type ChannelDocs = { docs: Doc[]; proposals: Proposal[] }
 
 export type Access = 'read' | 'write'
-export type Agent = { id: string; name: string; created_at: number }
+/** `wake`: the command gild runs when the agent is mentioned, if any. */
+export type Agent = { id: string; name: string; created_at: number; wake?: string | null }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
 export type AgentAccess = { agent: Agent; access: Access | null }
 export type AuditEntry = { agent: string; action: string; detail: string; ok: boolean; at: number }
@@ -57,11 +58,27 @@ export const core = {
   rejectProposal: (channelId: string, id: string) => invoke<ChannelDocs>('reject_proposal', { channelId, id }),
   agents: () => invoke<Agent[]>('agents'),
   createAgent: (name: string) => invoke<NewAgent>('create_agent', { name }),
+  setWake: (agentId: string, command: string) => invoke<Agent[]>('set_wake', { agentId, command }),
   channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
   setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),
   activity: (channelId: string) => invoke<AuditEntry[]>('activity', { channelId }),
   mcpStatus: () => invoke<string>('mcp_status'),
   exportWorkspace: (workspaceId: string) => invoke<string>('export_workspace', { workspaceId }),
+}
+
+/** A message's text split into plain parts and @mentions, the way the core
+ *  reads them (an @ inside a word, as in an email address, isn't one). */
+export function mentionParts(text: string): { text: string; mention: boolean }[] {
+  const out: { text: string; mention: boolean }[] = []
+  let last = 0
+  for (const m of text.matchAll(/(^|[^\p{L}\p{N}.])@([\p{L}\p{N}_-]+)/gu)) {
+    const at = (m.index ?? 0) + m[1].length
+    if (at > last) out.push({ text: text.slice(last, at), mention: false })
+    out.push({ text: '@' + m[2], mention: true })
+    last = at + 1 + m[2].length
+  }
+  if (last < text.length) out.push({ text: text.slice(last), mention: false })
+  return out
 }
 
 /** "Sent by, Program" → ["Sent by", "Program"] */

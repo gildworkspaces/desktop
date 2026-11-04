@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.6.0"
+version = "0.7.0"
 description = "gild: the open workspace where people and agents work together"
 license = "Apache-2.0"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -26,7 +26,7 @@ turso_core = "=0.8.3"
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1.54.1", features = ["net", "rt", "macros"] }
+tokio = { version = "1.54.1", features = ["net", "rt", "macros", "sync", "time", "process", "io-util"] }
 sha2 = "0.11.0"
 getrandom = "0.3"
 tokio-util = "0.7"

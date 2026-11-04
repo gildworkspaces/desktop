@@ -8,6 +8,7 @@ export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
   const [agents, setAgents] = useState<Agent[]>([])
   const [name, setName] = useState('')
   const [created, setCreated] = useState<NewAgent | null>(null)
+  const [editing, setEditing] = useState<Agent | null>(null)
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null)
   const [error, setError] = useState('')
 
@@ -32,7 +33,12 @@ export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
     <div className="group">
       <span className="label">Agents</span>
       {agents.length === 0 && <p className="note">No agents yet. Add one, then share channels with it.</p>}
-      {agents.map(a => <div key={a.id} className="member"><span className="dot agent" aria-hidden="true" />{a.name}</div>)}
+      {agents.map(a => (
+        <button key={a.id} className="member agentrow" onClick={() => setEditing(a)} aria-label={`${a.name}: settings`}>
+          <span className="dot agent" aria-hidden="true" />{a.name}
+          {a.wake && <span className="badge" title="Wakes when mentioned">wakes on @</span>}
+        </button>
+      ))}
       <form className="addchan" onSubmit={add}>
         <label htmlFor="new-agent" className="sr">New agent</label>
         <input id="new-agent" className="field" placeholder="+ add agent" value={name} onChange={e => setName(e.target.value)} />
@@ -40,12 +46,50 @@ export function AgentsSidebar({ onAdded }: { onAdded?: () => void }) {
       {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
       {status && !status.ok && <p className="error" style={{ padding: '0 10px' }}>{status.text}</p>}
       {created && <ConnectAgent made={created} onClose={() => setCreated(null)} />}
+      {editing && <AgentSettings agent={editing} onSaved={list => { setAgents(list); setEditing(null) }} onClose={() => setEditing(null)} />}
+    </div>
+  )
+}
+
+function AgentSettings({ agent, onSaved, onClose }: { agent: Agent; onSaved: (agents: Agent[]) => void; onClose: () => void }) {
+  const [command, setCommand] = useState(agent.wake ?? '')
+  const [error, setError] = useState('')
+  const example = `claude -p --allowedTools mcp__gild-${agent.name}`
+  async function save(value: string) {
+    setError('')
+    try { onSaved(await core.setWake(agent.id, value)) } catch (err) { setError(errorText(err)) }
+  }
+  return (
+    <div className="modalback" role="dialog" aria-modal="true" aria-labelledby="agent-title">
+      <form className="modal" onSubmit={e => { e.preventDefault(); save(command) }}>
+        <h2 id="agent-title">{agent.name}</h2>
+        <span className="label">When mentioned, run</span>
+        <p className="soft">
+          When someone writes <span className="mention">@{agent.name}</span> in a channel shared with {agent.name}, gild runs this command on this computer, as you, with the
+          mention as the prompt on its input. The agent then reads the channel and answers there through gild's tools.
+        </p>
+        <label htmlFor="wake-command" className="sr">Command</label>
+        <input id="wake-command" className="field mono" placeholder={example} value={command} onChange={e => setCommand(e.target.value)} spellCheck={false} />
+        <p className="faint" style={{ fontSize: 12 }}>
+          For Claude Code: <code>{example}</code> (connect it first with the command from when you added it). One run at a time; a run has ten minutes. Runs and failures show in the channel's Activity.
+        </p>
+        {error && <p className="error">{error}</p>}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="primary">Save</button>
+          {!command && <button type="button" className="ghost" onClick={() => setCommand(example)}>Use the Claude Code command</button>}
+          {agent.wake && <button type="button" className="ghost" onClick={() => save('')}>Stop waking it</button>}
+          <span className="spacer" />
+          <button type="button" className="ghost" onClick={onClose}>Cancel</button>
+        </div>
+      </form>
     </div>
   )
 }
 
 function ConnectAgent({ made, onClose }: { made: NewAgent; onClose: () => void }) {
-  const command = `claude mcp add --transport http gild-${made.agent.name} ${made.endpoint} --header "Authorization: Bearer ${made.token}"`
+  // User scope: the tools are found from any folder, including the home
+  // folder gild runs an agent's wake command in.
+  const command = `claude mcp add --scope user --transport http gild-${made.agent.name} ${made.endpoint} --header "Authorization: Bearer ${made.token}"`
   const [copied, setCopied] = useState('')
   async function copy(what: string, text: string) {
     try { await navigator.clipboard.writeText(text); setCopied(what) } catch { setCopied('') }
@@ -60,6 +104,7 @@ function ConnectAgent({ made, onClose }: { made: NewAgent; onClose: () => void }
         <span className="label">Claude Code</span>
         <div className="secret"><code>{command}</code><button className="ghost" onClick={() => copy('command', command)}>{copied === 'command' ? 'Copied' : 'Copy'}</button></div>
         <p className="faint" style={{ fontSize: 12 }}>Any MCP client works: Streamable HTTP at {made.endpoint}, header <code>Authorization: Bearer &lt;token&gt;</code>. The endpoint only answers on this computer.</p>
+        <p className="faint" style={{ fontSize: 12 }}>To have {made.agent.name} answer when someone writes @{made.agent.name}, click it in the sidebar and set what to run.</p>
         <div><button className="primary" onClick={onClose}>Done</button></div>
       </div>
     </div>
@@ -107,6 +152,11 @@ const ACTIONS: Record<string, string> = {
   add_record: 'added',
   update_record: 'changed a record',
   record_history: 'read a record’s history',
+  read_doc: 'read a doc',
+  search_docs: 'searched the docs',
+  propose_doc_edit: 'proposed a change',
+  wait_for_mentions: 'picked up a mention',
+  woken: 'was woken',
 }
 
 export function ActivityPanel({ channelId, channelName, onClose }: { channelId: string; channelName: string; onClose: () => void }) {

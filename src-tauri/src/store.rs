@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS indexed (channel_id TEXT PRIMARY KEY, commit_id TEXT 
 CREATE TABLE IF NOT EXISTS grants (channel_id TEXT NOT NULL, agent_id TEXT NOT NULL, access TEXT NOT NULL, PRIMARY KEY (channel_id, agent_id));
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_sha256 TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS docs (channel_id TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (channel_id, path));
+CREATE TABLE IF NOT EXISTS mentions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, delivered_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_wake (agent_id TEXT PRIMARY KEY, command TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -84,6 +86,16 @@ pub struct Store {
     conn: Arc<Connection>,
     // Held so the database outlives every statement on `conn`.
     _db: Arc<Database>,
+    signals: Signals,
+}
+
+/// Rung when an agent is mentioned: `waiters` wakes every agent blocked in
+/// `wait_for_mentions`; `runner` wakes the loop that runs agents' commands
+/// (and keeps the ring if the loop is busy, so nothing is missed).
+#[derive(Clone, Default)]
+pub struct Signals {
+    pub waiters: Arc<tokio::sync::Notify>,
+    pub runner: Arc<tokio::sync::Notify>,
 }
 
 fn err(context: &str, e: impl std::fmt::Display) -> String {
@@ -146,7 +158,7 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db };
+        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default() };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
@@ -308,6 +320,7 @@ impl Store {
                 Value::from_i64(message.created_at),
             ],
         )?;
+        self.record_mentions(&message)?;
         Ok(message)
     }
 }
@@ -977,6 +990,182 @@ impl Store {
     }
 }
 
+/// A mention waiting for its agent, with what the agent needs to act on it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Mention {
+    pub id: String,
+    pub agent_id: String,
+    pub channel_id: String,
+    pub channel: String,
+    pub workspace: String,
+    pub from: String,
+    pub text: String,
+    pub message_id: String,
+    pub at: i64,
+}
+
+/// An agent as the window lists it: with the command that wakes it, if any.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct AgentInfo {
+    #[serde(flatten)]
+    pub agent: Agent,
+    pub wake: Option<String>,
+}
+
+/// The names after `@` in a message (`@intake`, `@front-desk`), lower case,
+/// each once. An `@` inside a word (an email address) doesn't count.
+pub fn mentioned_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c != '@' || (i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '.')) {
+            continue;
+        }
+        let name: String = chars[i + 1..].iter().take_while(|c| c.is_alphanumeric() || **c == '-' || **c == '_').collect();
+        if let Some(name) = channel_name(&name) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+const MAX_WAKE_COMMAND: usize = 1000;
+
+impl Store {
+    /// What rings when an agent is mentioned.
+    pub fn signals(&self) -> Signals {
+        self.signals.clone()
+    }
+
+    /// Note who a message mentions. An agent the channel isn't shared with
+    /// isn't told, and gild says so in the channel.
+    fn record_mentions(&self, message: &Message) -> Result<(), String> {
+        let names = mentioned_names(&message.body);
+        if names.is_empty() {
+            return Ok(());
+        }
+        let agents = self.agents()?;
+        let mut told = false;
+        let mut unshared = Vec::new();
+        for name in names {
+            let Some(agent) = agents.iter().find(|a| a.name == name) else { continue };
+            if message.kind == "agent" && message.author == agent.name {
+                continue;
+            }
+            if self.access(&agent.id, &message.channel_id)?.is_none() {
+                unshared.push(agent.name.clone());
+                continue;
+            }
+            self.run(
+                "INSERT INTO mentions (id, agent_id, channel_id, message_id, created_at, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                &[
+                    Value::from_text(new_id()),
+                    Value::from_text(agent.id.clone()),
+                    Value::from_text(message.channel_id.clone()),
+                    Value::from_text(message.id.clone()),
+                    Value::from_i64(message.created_at),
+                ],
+            )?;
+            told = true;
+        }
+        for name in unshared {
+            self.post(&message.channel_id, "gild", "system", &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} from Access."))?;
+        }
+        if told {
+            self.signals.waiters.notify_waiters();
+            self.signals.runner.notify_one();
+        }
+        Ok(())
+    }
+
+    /// An agent's mentions that haven't reached it yet, oldest first.
+    pub fn pending_mentions(&self, agent_id: &str) -> Result<Vec<Mention>, String> {
+        let rows = self.query(
+            "SELECT n.id, n.agent_id, n.channel_id, c.name, w.name, m.author, m.body, m.id, m.created_at
+             FROM mentions n JOIN messages m ON m.id = n.message_id JOIN channels c ON c.id = n.channel_id JOIN workspaces w ON w.id = c.workspace_id
+             WHERE n.agent_id = ?1 AND n.delivered_at = 0 ORDER BY n.created_at, n.id",
+            &[Value::from_text(agent_id.to_string())],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| Mention {
+                id: text(&r[0]),
+                agent_id: text(&r[1]),
+                channel_id: text(&r[2]),
+                channel: text(&r[3]),
+                workspace: text(&r[4]),
+                from: text(&r[5]),
+                text: text(&r[6]),
+                message_id: text(&r[7]),
+                at: int(&r[8]),
+            })
+            .collect())
+    }
+
+    /// Hand an agent its waiting mentions: they won't be handed out again.
+    /// A mention in a channel that is no longer shared with it is dropped.
+    pub fn take_mentions(&self, agent: &Agent) -> Result<Vec<Mention>, String> {
+        let mut out = Vec::new();
+        for m in self.pending_mentions(&agent.id)? {
+            self.run("UPDATE mentions SET delivered_at = ?1 WHERE id = ?2", &[Value::from_i64(now_ms()), Value::from_text(m.id.clone())])?;
+            if self.access(&agent.id, &m.channel_id)?.is_some() {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Agents with a command to run when mentioned, and mentions waiting.
+    pub fn agents_to_wake(&self) -> Result<Vec<(Agent, String)>, String> {
+        let rows = self.query(
+            "SELECT a.id, a.name, a.created_at, k.command FROM agents a JOIN agent_wake k ON k.agent_id = a.id
+             WHERE EXISTS (SELECT 1 FROM mentions n WHERE n.agent_id = a.id AND n.delivered_at = 0) ORDER BY a.created_at",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| (Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }, text(&r[3]))).collect())
+    }
+
+    pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
+        let rows = self.query(
+            "SELECT a.id, a.name, a.created_at, k.command FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id ORDER BY a.created_at",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| AgentInfo {
+                agent: Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) },
+                wake: match &r[3] {
+                    Value::Null => None,
+                    v => Some(text(v)),
+                },
+            })
+            .collect())
+    }
+
+    /// Set (or, empty, remove) the command gild runs when the agent is
+    /// mentioned. Only the window calls this: an agent can't set what runs
+    /// on this computer.
+    pub fn set_wake(&self, agent_id: &str, command: &str) -> Result<(), String> {
+        if !self.agents()?.iter().any(|a| a.id == agent_id) {
+            return Err("That agent no longer exists.".into());
+        }
+        let command = command.trim();
+        if command.chars().count() > MAX_WAKE_COMMAND {
+            return Err("The command is at most 1,000 characters.".into());
+        }
+        let id = Value::from_text(agent_id.to_string());
+        self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        if !command.is_empty() {
+            self.run("INSERT INTO agent_wake (agent_id, command) VALUES (?1, ?2)", &[id, Value::from_text(command.to_string())])?;
+            // Mentions that were waiting for a way to wake it.
+            self.signals.runner.notify_one();
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1407,51 @@ mod tests {
         assert!(hits.iter().all(|h| h.channel_id == c.id), "only the channels searched");
         assert!(store.search_docs(std::slice::from_ref(&c.id), "where is it?").is_err());
         assert!(store.search_docs(std::slice::from_ref(&c.id), "zebra").unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mentions_reach_only_agents_the_channel_is_shared_with() {
+        assert_eq!(mentioned_names("@Intake can you check? cc @front-desk, mail sam@intake.org"), ["intake", "front-desk"]);
+        assert!(mentioned_names("no one here, just an @ sign").is_empty());
+
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (intake, _) = store.create_agent("intake").unwrap();
+        let (payroll, _) = store.create_agent("payroll").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &intake.id, Some(Access::Read)).unwrap();
+
+        store.post(&c.id, DEMO_NAME, "person", "@intake where do the forms go? @payroll too").unwrap();
+        let waiting = store.pending_mentions(&intake.id).unwrap();
+        assert_eq!((waiting.len(), waiting[0].from.as_str(), waiting[0].channel.as_str()), (1, "Demo", "general"));
+        assert!(store.pending_mentions(&payroll.id).unwrap().is_empty(), "payroll can't see the channel");
+        let said = store.messages(&c.id).unwrap().last().unwrap().body.clone();
+        assert_eq!(said, "payroll can't see this channel, so it wasn't told. Share the channel with payroll from Access.");
+
+        // An agent mentioning itself doesn't wake itself.
+        store.post(&c.id, "intake", "agent", "I'm @intake, on it.").unwrap();
+        assert_eq!(store.pending_mentions(&intake.id).unwrap().len(), 1);
+
+        // Mentions are handed out once.
+        assert_eq!(store.take_mentions(&intake).unwrap().len(), 1);
+        assert!(store.take_mentions(&intake).unwrap().is_empty());
+
+        // Only agents with a command and something waiting are woken.
+        store.post(&c.id, DEMO_NAME, "person", "@intake one more").unwrap();
+        assert!(store.agents_to_wake().unwrap().is_empty(), "no command yet");
+        store.set_wake(&intake.id, "  claude -p  ").unwrap();
+        let wake: Vec<(String, String)> = store.agents_to_wake().unwrap().into_iter().map(|(a, c)| (a.name, c)).collect();
+        assert_eq!(wake, [("intake".to_string(), "claude -p".to_string())]);
+        assert_eq!(store.agent_infos().unwrap().iter().find(|a| a.agent.id == intake.id).unwrap().wake.as_deref(), Some("claude -p"));
+        store.set_wake(&intake.id, "").unwrap();
+        assert!(store.agent_infos().unwrap().iter().all(|a| a.wake.is_none()));
+
+        // Unsharing the channel drops what was waiting there.
+        store.set_access(&c.id, DEMO_NAME, &intake.id, None).unwrap();
+        assert!(store.take_mentions(&intake).unwrap().is_empty());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
