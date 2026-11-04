@@ -79,7 +79,8 @@ try {
     import { readFileSync } from 'node:fs'
     const prompt = readFileSync(0, 'utf8')
     const channel = /channel_id ([^,)\\s]+)/.exec(prompt)[1]
-    const thread = /thread_id ([^,)\\s]+)/.exec(prompt)?.[1]
+    // Only from a place's header: "(channel_id …, thread_id …)".
+    const thread = /\\(channel_id [^,)]+, thread_id ([^)\\s]+)\\)/.exec(prompt)?.[1]
     const latest = prompt.split('\\n').filter(l => l.startsWith('→ ')).pop() || ''
     const token = readFileSync(process.argv[2], 'utf8').trim()
     const post = async (body, session) => {
