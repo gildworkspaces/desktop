@@ -2,7 +2,7 @@
 // window opens on the seeded demo workspace, and what you type reaches the
 // Rust core and comes back from its database.
 //   tauri-driver &   node tests/e2e/smoke.mjs <path to the built binary>
-import { Builder, By, until } from 'selenium-webdriver'
+import { Builder, By, Key, until } from 'selenium-webdriver'
 import assert from 'node:assert/strict'
 
 const application = process.argv[2]
@@ -22,9 +22,9 @@ try {
   assert.match(await driver.findElement(By.css('.list')).getText(), /Welcome to gild/)
 
   // A new channel and a message, through the window like a person would.
-  await driver.findElement(By.css('#new-channel')).sendKeys('Student Intake\n')
+  await driver.findElement(By.css('#new-channel')).sendKeys('Student Intake', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//h2[contains(., 'student-intake')]")), 10000)
-  await driver.findElement(By.css('#composer')).sendKeys('Northside sent three more students.\n')
+  await driver.findElement(By.css('#composer')).sendKeys('Northside sent three more students.', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//span[@class='text' and contains(., 'Northside sent three more students.')]")), 10000)
 
   // The core has it: read back through the command, not the screen.
@@ -50,7 +50,7 @@ try {
   await stats.sendKeys('New, Docs needed, Enrolled')
   await driver.findElement(By.css('form.columns button.primary')).click()
   await driver.wait(until.elementLocated(By.css('#rec-title')), 10000)
-  await driver.findElement(By.css('#rec-title')).sendKeys('Jordan Lee\n')
+  await driver.findElement(By.css('#rec-title')).sendKeys('Jordan Lee', Key.ENTER)
   await driver.wait(until.elementLocated(By.xpath("//td//button[contains(., 'Jordan Lee')]")), 10000)
   const history = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
