@@ -1,11 +1,11 @@
 [package]
 name = "gild-desktop"
-version = "0.1.4"
-description = "gild desktop: install gild into your own Cloudflare account and work in it"
+version = "0.2.0"
+description = "gild: the open workspace where people and agents work together"
 license = "Apache-2.0"
-repository = "https://github.com/gildforge/desktop"
+repository = "https://github.com/gildworkspaces/desktop"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85"
 
 [lib]
 name = "gild_desktop_lib"
@@ -16,19 +16,9 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 tauri = { version = "2.11.6", features = [] }
-# The installer talks to api.cloudflare.com and the instance from the window;
-# the webview's own fetch would be stopped by CORS.
-tauri-plugin-http = { version = "2", features = ["multipart"] }
-# The Agents channel streams over a WebSocket that needs an Authorization
-# header, which a webview's WebSocket cannot send.
-tauri-plugin-websocket = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dirs = "6"
-# A gild identity is an Ed25519 key kept as the CLI keeps it:
-# ed25519:<base64 SPKI> public, base64 PKCS#8 secret.
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "alloc"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
-base64 = "0.22"
-
+# Turso's Rust rewrite of SQLite (MIT): the workspace database. The same
+# engine and the same exact pin as Zega+SQLite (zegadb/zega), so the two can
+# share a file format later.
+turso_core = "=0.8.3"

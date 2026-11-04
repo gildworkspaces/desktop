@@ -5,54 +5,18 @@ on:
   pull_request:
 permissions:
   contents: read
+# Addis APS 11 says fresh mirab VMs. This org has no mirab runner yet, so the
+# jobs use the temporary host runners (Sami, 30 Oct). Each job runs inside a
+# fresh container that gets the checkout through stdin and writes nothing
+# back, so nothing is installed or left on the host.
 jobs:
-  web:
-    runs-on: ubuntu-latest
-    environment: public-ci
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [web, native, app]
+    name: ${{ matrix.job }}
+    runs-on: host-linux-x64
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: npm test
-      - run: npm run check
-      - run: npm run build
-  native:
-    runs-on: ubuntu-latest
-    environment: public-ci
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: npm run build
-      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
-  app:
-    # The real app on Linux, through tauri-driver: Tauri's HTTP client, the
-    # Rust commands and the bundled template (tests/e2e/smoke.mjs).
-    runs-on: ubuntu-22.04
-    environment: public-ci
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf webkit2gtk-driver xvfb
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: npm ci
-      - run: cargo install tauri-driver --locked
-      - run: npx tauri build --debug --no-bundle
-      - run: |
-          xvfb-run -a sh -c 'tauri-driver & sleep 3; node tests/e2e/smoke.mjs "$PWD/src-tauri/target/debug/gild-desktop"'
+      - run: tar -c --exclude=.git . | docker run --rm -i node:24-bookworm bash -c 'mkdir /w && tar -x -C /w && cd /w && ci/linux.sh ${{ matrix.job }}'

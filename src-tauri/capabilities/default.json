@@ -1,19 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the window may do: reach Cloudflare's API and gild instances on workers.dev, stream the Agents channel, and open links.",
+  "description": "What the window may do: call the app's own commands and open links. It reaches no network.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "opener:default",
-    "websocket:default",
-    {
-      "identifier": "http:default",
-      "allow": [
-        { "url": "https://api.cloudflare.com/*" },
-        { "url": "https://*.workers.dev/*" },
-        { "url": "https://*.workers.dev" }
-      ]
-    }
-  ]
+  "permissions": ["core:default", "opener:default"]
 }

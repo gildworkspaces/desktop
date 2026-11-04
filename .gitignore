@@ -8,3 +8,6 @@ src-tauri/gen/
 *.tsbuildinfo
 next-env.d.ts
 .target/
+dist/
+.vinext/
+.DS_Store
