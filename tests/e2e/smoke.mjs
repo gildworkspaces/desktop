@@ -18,7 +18,7 @@ try {
   const card = await driver.wait(until.elementLocated(By.css('button.card')), 30000)
   assert.match(await card.getText(), /Demo workspace/)
   // You, in the top bar: the profile's name until you change it.
-  assert.match(await driver.findElement(By.css('.usercard .me')).getText(), /Demo/)
+  assert.match(await driver.findElement(By.css('.usercard .me')).getAttribute('aria-label'), /^Demo: profile and status$/)
 
   // Open it: #general holds the welcome message from the seed.
   await card.click()
@@ -238,7 +238,15 @@ try {
   await driver.wait(until.elementLocated(inThread('Blue forms go back to Northside.')), 30000)
   const channelText = await driver.findElement(By.css('.msgs .list')).getText()
   assert.ok(!channelText.includes('Transfers use the red folder') && !channelText.includes('Blue forms go back'), 'replies stay in the thread')
-  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'msgs')]//button[contains(@class,'threadlink') and starts-with(., '4 replies')]")), 10000)
+  // The channel shows the thread's size under the message (the core's count, then the window's).
+  const counted = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    window.__TAURI_INTERNALS__.invoke('messages', { channelId: ${JSON.stringify(intakeId)} })
+      .then(ms => done(ms.filter(m => m.replies).map(m => m.body + ': ' + m.replies)), e => done({ error: String(e) }))
+  `)
+  assert.deepEqual(counted, ['Northside sent three more students.: 4'])
+  const link = await driver.wait(until.elementLocated(By.css('.msgs button.threadlink')), 10000)
+  await driver.wait(async () => /^4 replies/.test(await link.getAttribute('textContent')), 10000, 'the channel shows 4 replies')
   console.log('thread: tagged and untagged replies answered in the thread')
   await driver.findElement(By.xpath("//aside[contains(@class,'threadpanel')]//button[normalize-space(.)='Close']")).click()
 
