@@ -4,6 +4,8 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 export type Account = { name: string; demo: boolean }
+/** An agent running right now, and where it was called (thread: a thread in that channel). */
+export type Working = { agent: string; channel_id: string; thread: string | null }
 export type Status = 'online' | 'idle' | 'dnd' | 'invisible'
 export type Theme = 'system' | 'light' | 'dark'
 /** You: `picture` is a small data: URL; `banner` one of BANNERS. */
@@ -44,6 +46,14 @@ export type AuditEntry = { agent: string; action: string; detail: string; ok: bo
 
 export const inApp = () => isTauri()
 
+/** Call `f` whenever an agent starts or finishes a run. */
+export function onWorking(f: () => void): () => void {
+  let stop: (() => void) | null = null
+  let gone = false
+  listen('gild://working', () => f()).then(u => { if (gone) u(); else stop = u })
+  return () => { gone = true; stop?.() }
+}
+
 /** Call `f` with a channel id whenever an agent changes that channel. */
 export function onChanged(f: (channelId: string) => void): () => void {
   let stop: (() => void) | null = null
@@ -65,6 +75,7 @@ export const core = {
   createChannel: (workspaceId: string, name: string, topic = '') => invoke<Channel>('create_channel', { workspaceId, name, topic }),
   messages: (channelId: string) => invoke<Message[]>('messages', { channelId }),
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
+  working: () => invoke<Working[]>('working'),
   thread: (channelId: string, threadId: string) => invoke<Message[]>('thread', { channelId, threadId }),
   reply: (channelId: string, threadId: string, body: string) => invoke<Message>('send_reply', { channelId, threadId, body }),
   channelData: (channelId: string) => invoke<ChannelData>('channel_data', { channelId }),

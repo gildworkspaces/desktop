@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.12.0)
+## What works (0.13.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -51,7 +51,9 @@ everything after that is the design doc.
   `claude -p --allowedTools mcp__gild-intake`) on this computer with the
   mention and the channel's recent messages as the prompt on stdin, and the
   agent answers in the channel.
-  Nothing stays open in the background. Only the window can set that
+  Nothing stays open in the background. While a run is going, the channel
+  (or thread) shows "ava is working…", and the channel's Activity says
+  whether each run replied or stayed quiet. Only the window can set that
   command, never an agent. An agent that's already running can call
   `wait_for_mentions` instead. Mentioning an agent the channel isn't shared
   with tells you so.

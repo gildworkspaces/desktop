@@ -149,6 +149,16 @@ pub struct Store {
     _db: Arc<Database>,
     signals: Signals,
     on_hold: Option<HoldHook>,
+    /// Agents running right now, and where they were called.
+    working: Vec<Working>,
+}
+
+/// An agent at work on a mention in a place (a channel, or a thread in it).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Working {
+    pub agent: String,
+    pub channel_id: String,
+    pub thread: Option<String>,
 }
 
 /// Rung when an agent is mentioned: `waiters` wakes every agent blocked in
@@ -220,7 +230,7 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None };
+        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new() };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
@@ -1389,6 +1399,34 @@ impl Store {
         }
         self.set_setting("theme", Some(theme))?;
         self.profile()
+    }
+
+    /// Agents running right now, for the window's "… is working" line.
+    pub fn working(&self) -> Vec<Working> {
+        self.working.clone()
+    }
+
+    /// Mark an agent as running for these mentions, or done.
+    pub fn set_working(&mut self, agent: &str, mentions: &[Mention], on: bool) {
+        self.working.retain(|w| w.agent != agent);
+        if on {
+            for m in mentions {
+                let w = Working { agent: agent.to_string(), channel_id: m.channel_id.clone(), thread: m.thread.clone() };
+                if !self.working.contains(&w) {
+                    self.working.push(w);
+                }
+            }
+        }
+    }
+
+    /// Whether an agent posted in a channel (threads included) since `since`.
+    pub fn posted_since(&self, agent: &str, channel_id: &str, since: i64) -> Result<bool, String> {
+        Ok(!self
+            .query(
+                "SELECT 1 FROM messages WHERE channel_id = ?1 AND author = ?2 AND kind = 'agent' AND created_at >= ?3 LIMIT 1",
+                &[Value::from_text(channel_id.to_string()), Value::from_text(agent.to_string()), Value::from_i64(since)],
+            )?
+            .is_empty())
     }
 
     /// How a desktop notification is shown, when the person wants one.

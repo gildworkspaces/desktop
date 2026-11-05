@@ -405,3 +405,14 @@ tbody tr:hover { background: var(--chip); }
 .loops .ctxrow { gap: 10px; }
 .loops .ctxrow { display: flex; align-items: center; flex-wrap: wrap; font-size: 14px; }
 .loops .field.num { width: 84px; text-align: right; }
+
+/* An agent at work; your picture on your messages */
+.workingline { display: flex; align-items: center; gap: 8px; margin: 0 20px 8px; font-size: 12px; color: var(--soft); }
+.threadpanel .workingline { margin: 0 18px 8px; }
+.workingline .dots { display: inline-flex; gap: 3px; }
+.workingline .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--mark); animation: blink 1.2s infinite ease-in-out; }
+.workingline .dots i:nth-child(2) { animation-delay: .2s; }
+.workingline .dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .workingline .dots i { animation: none; opacity: .7; } }
+.avatar.pic { object-fit: cover; }
