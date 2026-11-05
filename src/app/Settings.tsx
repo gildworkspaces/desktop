@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { core, errorText, BANNERS, MAX_BIO, type Agent, type Channel, type Grant, type Manifest, type Profile, type Theme, type Workspace } from '@/lib/core'
+import { core, errorText, BANNERS, MAX_BIO, type Agent, type Channel, type Grant, type Manifest, type Profile, type ProviderInfo, type Theme, type Workspace } from '@/lib/core'
 import { Avatar, type SettingsSection } from './Profile'
 import { AgentPage, AgentsSettings, Toggle } from './Agents'
 
@@ -27,7 +27,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
 
   const groups: Group[] = [
     { label: 'Personal', items: [{ key: 'profile', label: 'My Profile' }] },
-    { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }, { key: 'addons', label: 'Add-ons' }] },
+    { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }, { key: 'providers', label: 'Providers' }, { key: 'addons', label: 'Add-ons' }] },
     { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'data', label: 'Export and import' }] },
   ]
   // An agent's or add-on's own page sits under its section.
@@ -63,6 +63,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
           {at === 'appearance' && <AppearancePage profile={profile} onProfile={onProfile} />}
           {at === 'agents' && <AgentsSettings channels={channels} current={current} onOpenAgent={a => setAt(`agent:${a.id}`)} />}
           {at.startsWith('agent:') && <AgentPage key={at} agentId={at.slice(6)} channels={channels} current={current} onBack={() => setAt('agents')} />}
+          {at === 'providers' && <ProvidersPage />}
           {at === 'addons' && <AddonsPage onPermissions={id => setAt(`addon:${id}`)} />}
           {at.startsWith('addon:') && <AddonPermissions key={at} addonId={at.slice(6)} onBack={() => setAt('addons')} />}
           {at === 'data' && <DataPage workspace={workspace} onImported={onImported} />}
@@ -188,6 +189,50 @@ function AppearancePage({ profile, onProfile }: { profile: Profile; onProfile: (
         <span className="faint hint">System follows your computer’s light or dark setting.</span>
       </div>
       {error && <p className="error">{error}</p>}
+    </div>
+  )
+}
+
+/** Settings › Providers: where cloud agents' models run. */
+function ProvidersPage() {
+  const [list, setList] = useState<ProviderInfo[] | null>(null)
+  const [account, setAccount] = useState('')
+  const [token, setToken] = useState('')
+  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => { core.providers().then(l => { setList(l); setAccount(l[0]?.account_id ?? '') }, e => setNote({ ok: false, text: errorText(e) })) }, [])
+  const p = list?.[0]
+  if (!p) return note ? <p className="error" style={{ padding: 32 }}>{note.text}</p> : null
+  async function save() {
+    setBusy(true); setNote(null)
+    try { setList(await core.saveProvider(p!.id, account, token || null)); setToken(''); setNote({ ok: true, text: 'Saved. The token is in your keychain.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) }
+  }
+  async function check() {
+    setBusy(true); setNote(null)
+    try { const ms = await core.providerModels(p!.id); setNote({ ok: true, text: `Connected: ${ms.length} models, ${ms.filter(m => m.tools).length} of them can use tools.` }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) }
+  }
+  return (
+    <div className="spage">
+      <p className="soft lead">An agent can run on this computer (Claude Code, Codex) or on a provider’s model in the cloud. For a cloud agent, gild calls the model and runs the tools it asks for here; the provider never connects to this computer.</p>
+      <div className="addon">
+        <div className="row"><b>{p.name}</b>{p.account_id && p.has_token && <span className="tag">set up</span>}</div>
+        <div className="sfield">
+          <label htmlFor="cf-account" className="flabel">Account ID</label>
+          <input id="cf-account" className="field mono" value={account} onChange={e => setAccount(e.target.value)} spellCheck={false} placeholder="From the Cloudflare dashboard" />
+        </div>
+        <div className="sfield">
+          <label htmlFor="cf-token" className="flabel">API token</label>
+          <input id="cf-token" className="field mono" type="password" value={token} onChange={e => setToken(e.target.value)} spellCheck={false} autoComplete="off"
+            placeholder={p.has_token ? 'Saved in your keychain. Paste a new one to replace it.' : 'A token with Workers AI access'} />
+          <span className="faint hint">Kept in your system keychain, not in gild’s database, so agents on this computer can’t read it.</span>
+        </div>
+        <div className="row">
+          <button className="primary" onClick={save} disabled={busy}>Save</button>
+          <button className="ghost" onClick={check} disabled={busy || !p.account_id || !p.has_token}>Check</button>
+          {p.has_token && <button className="ghost" onClick={async () => { setBusy(true); try { setList(await core.saveProvider(p.id, account, '')); setNote({ ok: true, text: 'The token was removed from your keychain.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) } }} disabled={busy}>Remove token</button>}
+        </div>
+        {note && <span className={note.ok ? 'ok' : 'error'}>{note.text}</span>}
+      </div>
     </div>
   )
 }

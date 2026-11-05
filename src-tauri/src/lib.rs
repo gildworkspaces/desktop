@@ -2,6 +2,7 @@ mod addons;
 mod clients;
 mod export;
 mod mcp;
+mod providers;
 mod records;
 mod store;
 mod view;
@@ -97,6 +98,34 @@ fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<M
 #[tauri::command]
 fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
     with(&core, |s| Ok(s.addons()))
+}
+
+/// The cloud providers, set up or not (never their tokens).
+#[tauri::command]
+fn providers(core: State<Core>) -> Result<Vec<store::ProviderInfo>, String> {
+    with(&core, |s| s.providers())
+}
+
+/// Save a provider's account and token (null: keep the saved token; "": forget it).
+#[tauri::command]
+fn save_provider(core: State<Core>, provider: String, account_id: String, token: Option<String>) -> Result<Vec<store::ProviderInfo>, String> {
+    with(&core, |s| s.save_provider(&provider, &account_id, token.as_deref()))
+}
+
+/// The provider's models, which also checks the account and token work.
+#[tauri::command]
+async fn provider_models(core: State<'_, Core>, provider: String) -> Result<Vec<providers::ModelInfo>, String> {
+    let creds = with(&core, |s| s.creds(&provider))?;
+    providers::models(&creds).await
+}
+
+/// Run an agent on a provider's model, or (null) on this computer again.
+#[tauri::command]
+fn set_runner(core: State<Core>, agent_id: String, runner: Option<store::Runner>) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.set_runner(&agent_id, runner.as_ref())?;
+        s.agent_infos()
+    })
 }
 
 /// Every agent tool, grouped, for turning tools on or off per agent.
@@ -476,6 +505,10 @@ pub fn run() {
             thread,
             working,
             addons,
+            providers,
+            save_provider,
+            provider_models,
+            set_runner,
             tool_catalog,
             agent_tools_off,
             set_agent_tool,

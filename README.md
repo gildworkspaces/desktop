@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.16.0)
+## What works (0.17.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -96,6 +96,15 @@ everything after that is the design doc.
   budget. gild's own add-ons are built the same way: each is a crate under
   `src-tauri/addons/<name>` that `build.rs` compiles to
   `wasm32-unknown-unknown` (`rustup target add wasm32-unknown-unknown`).
+- **Cloud agents.** An agent runs on this computer (Claude Code, Codex) or
+  in the cloud: its Connect tab, *Cloud*, then a provider and a model (the
+  provider's live list, those that can use tools first). The first provider
+  is Cloudflare Workers AI (Settings › Providers: account ID and an API
+  token, kept in the system keychain). When a cloud agent is mentioned, gild
+  calls the model (OpenAI-compatible chat completions), runs the tool calls
+  it asks for through the same path as the MCP endpoint (same switches,
+  Activity, limits), for up to 12 rounds, and posts its closing answer if it
+  didn't post one. The provider never connects to this computer.
 - **Permissions.** Every agent tool, gild's own and each add-on
   operation, can be turned on or off per agent: Settings › Agents › an
   agent › **Tools**. A tool that's off isn't offered to that agent, and a

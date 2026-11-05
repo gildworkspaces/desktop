@@ -32,7 +32,7 @@ export function Avatar({ profile, size, status, ring }: { profile: Pick<Profile,
   )
 }
 
-export type SettingsSection = 'profile' | 'appearance' | 'agents' | 'addons' | 'data' | `agent:${string}` | `addon:${string}`
+export type SettingsSection = 'profile' | 'appearance' | 'agents' | 'providers' | 'addons' | 'data' | `agent:${string}` | `addon:${string}`
 
 /** Your card: in the sidebar's foot, or (`compact`) in the home screen's top bar. */
 export function UserCard({ profile, onProfile, onSettings, placement = 'up' }: {

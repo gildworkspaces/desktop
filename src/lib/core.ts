@@ -52,7 +52,11 @@ export type ChannelDocs = { docs: Doc[]; proposals: Proposal[] }
 export type Access = 'read' | 'write'
 /** `wake`: the command gild runs when the agent is mentioned, if any. */
 /** `context`: how many recent messages come with a mention. */
-export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean }
+export type Runner = { provider: string; model: string }
+export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean; runner?: Runner | null }
+/** A cloud provider (never its token). */
+export type ProviderInfo = { id: string; name: string; account_id: string | null; has_token: boolean }
+export type ModelInfo = { id: string; description: string; tools: boolean; context_window: number | null }
 /** Settings › Agents › Runaway loops. */
 export type LoopRules = { limit: number; ask_coordinator: boolean; notify_me: boolean }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
@@ -103,6 +107,10 @@ export const core = {
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
   working: () => invoke<Working[]>('working'),
   addons: () => invoke<Manifest[]>('addons'),
+  providers: () => invoke<ProviderInfo[]>('providers'),
+  saveProvider: (provider: string, accountId: string, token: string | null) => invoke<ProviderInfo[]>('save_provider', { provider, accountId, token }),
+  providerModels: (provider: string) => invoke<ModelInfo[]>('provider_models', { provider }),
+  setRunner: (agentId: string, runner: Runner | null) => invoke<Agent[]>('set_runner', { agentId, runner }),
   toolCatalog: () => invoke<ToolInfo[]>('tool_catalog'),
   agentToolsOff: (agentId: string) => invoke<string[]>('agent_tools_off', { agentId }),
   setAgentTool: (agentId: string, tool: string, allowed: boolean) => invoke<string[]>('set_agent_tool', { agentId, tool, allowed }),

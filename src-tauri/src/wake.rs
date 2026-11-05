@@ -15,7 +15,11 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
-use crate::store::{Agent, Mention, Place, Store};
+use serde_json::{json, Value};
+
+use crate::mcp::Gild;
+use crate::providers;
+use crate::store::{Agent, Mention, Place, Runner, Store, Wake};
 
 pub const LIMIT: Duration = Duration::from_secs(600);
 
@@ -127,7 +131,47 @@ pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<
 }
 
 /// Wake one agent for its mentions, and record how it went.
-async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, command: String, mentions: Vec<Mention>, endpoint: String) {
+/// The most model rounds a cloud agent gets per wake.
+pub const MAX_STEPS: usize = 12;
+
+const SYSTEM: &str = "You are an agent in gild, a workspace where people and agents work together in channels. You act only through the tools you are given; everything you do is recorded under your name. To answer, use post_message where you were mentioned (with thread_id for a thread). Be brief.";
+
+/// A cloud agent's run: gild calls the provider's model, runs the tool calls
+/// it asks for (as the MCP endpoint would, through the same `call_as`), and
+/// returns what the model says at the end.
+async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: &Agent, runner: &Runner, prompt: &str) -> Result<String, String> {
+    let (creds, off) = {
+        let store = core.lock().map_err(|_| "the workspace database is unavailable".to_string())?;
+        (store.creds(&runner.provider)?, store.tools_off(&agent.id)?)
+    };
+    // The agent's tools, as the provider takes them (waiting on mentions is
+    // for agents that keep running; a cloud agent is woken instead).
+    let tools: Vec<Value> = crate::mcp::tools()
+        .into_iter()
+        .filter(|t| t.name != "wait_for_mentions" && !off.iter().any(|o| o == t.name.as_ref()))
+        .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.input_schema.as_ref() } }))
+        .collect();
+    let gild = Gild { core: core.clone(), app: app.clone() };
+    let mut messages = vec![json!({ "role": "system", "content": SYSTEM }), json!({ "role": "user", "content": prompt })];
+    for _ in 0..MAX_STEPS {
+        let turn = providers::chat(&creds, &runner.model, &messages, &tools).await?;
+        messages.push(turn.message.clone());
+        if turn.tool_calls.is_empty() {
+            return Ok(turn.content.unwrap_or_default());
+        }
+        for call in &turn.tool_calls {
+            let args = call.arguments.as_object().cloned().unwrap_or_default();
+            let result = match gild.call_as(agent, &call.name, &args).await {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("error: {e}"),
+            };
+            messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": result }));
+        }
+    }
+    Err(format!("it was still working after {MAX_STEPS} rounds, so gild stopped it"))
+}
+
+async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, how: Wake, mentions: Vec<Mention>, endpoint: String) {
     let started = crate::store::now();
     let context = match core.lock() {
         Ok(mut s) => {
@@ -139,11 +183,25 @@ async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, com
     if let Some(app) = &app {
         let _ = app.emit("gild://working", ());
     }
-    let outcome = run_command(&command, &prompt(&agent.name, &mentions, &context, &endpoint), LIMIT).await;
+    let said = prompt(&agent.name, &mentions, &context, &endpoint);
+    let outcome = match &how {
+        Wake::Command(command) => run_command(command, &said, LIMIT).await,
+        Wake::Provider(runner) => match tokio::time::timeout(LIMIT, run_provider(&core, &app, &agent, runner, &said)).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("it was still running after {} minutes, so it was stopped", LIMIT.as_secs() / 60)),
+        },
+    };
     let mut channels: Vec<String> = mentions.iter().map(|m| m.channel_id.clone()).collect();
     channels.dedup();
     if let Ok(mut store) = core.lock() {
         store.set_working(&agent.name, &mentions, false);
+        // A cloud model that ends with an answer but didn't post it: gild
+        // posts it where the agent was mentioned.
+        if let (Wake::Provider(_), Ok(text), Some(first)) = (&how, &outcome, mentions.first()) {
+            if !text.trim().is_empty() && !store.posted_since(&agent.name, &first.channel_id, started).unwrap_or(true) {
+                let _ = store.post_in(&first.channel_id, first.thread.as_deref(), &agent.name, "agent", text.trim());
+            }
+        }
         for channel in &channels {
             let detail = match &outcome {
                 Ok(_) => format!(
@@ -175,7 +233,7 @@ pub async fn run(core: Arc<Mutex<Store>>, app: Option<AppHandle>, endpoint: Stri
     let Some(signals) = core.lock().ok().map(|s| s.signals()) else { return };
     let running: Arc<Mutex<HashSet<String>>> = Arc::default();
     loop {
-        let jobs: Vec<(Agent, String, Vec<Mention>)> = match core.lock() {
+        let jobs: Vec<(Agent, Wake, Vec<Mention>)> = match core.lock() {
             Ok(store) => {
                 let busy = running.lock().map(|r| r.clone()).unwrap_or_default();
                 store
@@ -191,14 +249,14 @@ pub async fn run(core: Arc<Mutex<Store>>, app: Option<AppHandle>, endpoint: Stri
             }
             Err(_) => return,
         };
-        for (agent, command, mentions) in jobs {
+        for (agent, how, mentions) in jobs {
             if let Ok(mut r) = running.lock() {
                 r.insert(agent.id.clone());
             }
             let (core, app, endpoint, running, signals) = (core.clone(), app.clone(), endpoint.clone(), running.clone(), signals.clone());
             tokio::spawn(async move {
                 let id = agent.id.clone();
-                wake(core, app, agent, command, mentions, endpoint).await;
+                wake(core, app, agent, how, mentions, endpoint).await;
                 if let Ok(mut r) = running.lock() {
                     r.remove(&id);
                 }
@@ -289,5 +347,188 @@ mod tests {
     async fn a_run_that_overstays_is_stopped() {
         let err = run_command("sleep 5", "", Duration::from_millis(300)).await.unwrap_err();
         assert!(err.contains("still running"), "{err}");
+    }
+
+    /// A stand-in for Cloudflare's API, answering as the real one does
+    /// (OpenAI-shaped chat completions with tool_calls; model search with
+    /// properties): first a post_message call, then "Done." — or, when the
+    /// prompt says "plain", only text.
+    async fn workers_ai() -> (String, Arc<Mutex<Vec<Value>>>) {
+        use axum::{routing::{get, post}, Json, Router};
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = seen.clone();
+        let app = Router::new()
+            .route(
+                "/accounts/acct1/ai/v1/chat/completions",
+                post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let log = log.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer test-token");
+                        log.lock().unwrap().push(body.clone());
+                        let messages = body["messages"].as_array().unwrap();
+                        // As the real one does: every message's content is a string.
+                        if let Some(bad) = messages.iter().position(|m| !m["content"].is_string()) {
+                            return (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "message": format!("Type mismatch of '/messages/{bad}/content'") }] })));
+                        }
+                        let prompt = messages[1]["content"].as_str().unwrap();
+                        let message = if prompt.contains("plain") {
+                            json!({ "role": "assistant", "content": "Plain answer." })
+                        } else if messages.last().unwrap()["role"] == "tool" {
+                            json!({ "role": "assistant", "content": "Done." })
+                        } else {
+                            let at = prompt.find("channel_id ").unwrap() + 11;
+                            let channel: String = prompt[at..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                            json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
+                                "function": { "name": "post_message", "arguments": json!({ "channel_id": channel, "text": "The forms go in the red folder." }).to_string() } }] })
+                        };
+                        (axum::http::StatusCode::OK, Json(json!({ "id": "x", "object": "chat.completion", "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }] })))
+                    }
+                }),
+            )
+            .route(
+                "/accounts/acct1/ai/models/search",
+                get(|| async {
+                    Json(json!({ "success": true, "errors": [], "result": [
+                        { "name": "@cf/a/plain", "description": "No tools.", "properties": [{ "property_id": "context_window", "value": "8000" }] },
+                        { "name": "@cf/b/tools", "description": "Calls tools.", "properties": [{ "property_id": "function_calling", "value": "true" }] }
+                    ] }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cloud_agent_is_run_by_gild_through_the_same_tools() {
+        let dir = std::env::temp_dir().join(format!("gild-wake-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, seen) = workers_ai().await;
+        let mut store = Store::open(&dir).unwrap();
+        store.set_provider_base(&base);
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (cloud, _) = store.create_agent("cloud").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &cloud.id, Some(Access::Write)).unwrap();
+        let runner = Runner { provider: providers::WORKERS_AI.into(), model: "@cf/b/tools".into() };
+        store.set_runner(&cloud.id, Some(&runner)).unwrap();
+        assert!(store.creds(providers::WORKERS_AI).err().unwrap().contains("Settings › Providers"), "not set up yet");
+        store.save_provider(providers::WORKERS_AI, "acct1", Some("test-token")).unwrap();
+        let info = &store.providers().unwrap()[0];
+        assert_eq!((info.account_id.as_deref(), info.has_token), (Some("acct1"), true), "the token itself is never handed out");
+        store.set_tool(&cloud.id, "read_doc", false).unwrap();
+        let core = Arc::new(Mutex::new(store));
+        tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
+
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@cloud where do the forms go?").unwrap();
+        let woken = wait_woken(&core, &c.id, 1).await;
+        assert_eq!(woken, ["cloud: woken by Demo · replied (ok)"]);
+        let store = core.lock().unwrap();
+        let said: Vec<(String, String)> = store.messages(&c.id).unwrap().into_iter().map(|m| (m.author, m.body)).collect();
+        assert_eq!(said.last().unwrap(), &("cloud".to_string(), "The forms go in the red folder.".to_string()), "its post_message went through gild");
+        assert!(!said.iter().any(|(_, b)| b == "Done."), "its closing words aren't posted when it already answered");
+        let calls: Vec<(String, bool)> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action != "woken").map(|a| (a.action, a.ok)).collect();
+        assert_eq!(calls, [("post_message".to_string(), true)], "logged like any agent's call");
+        drop(store);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one round with the tool call, one to finish");
+        assert_eq!(seen[0]["model"], "@cf/b/tools");
+        let offered: Vec<&str> = seen[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert!(offered.contains(&"post_message") && offered.contains(&"markdown_replace_section"));
+        assert!(!offered.contains(&"read_doc"), "a tool turned off isn't offered");
+        assert!(!offered.contains(&"wait_for_mentions"));
+        assert_eq!(seen[1]["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], "call_1");
+        drop(seen);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cloud_model_that_only_talks_gets_its_answer_posted() {
+        let dir = std::env::temp_dir().join(format!("gild-wake-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, _) = workers_ai().await;
+        let mut store = Store::open(&dir).unwrap();
+        store.set_provider_base(&base);
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (cloud, _) = store.create_agent("cloud").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &cloud.id, Some(Access::Write)).unwrap();
+        store.save_provider(providers::WORKERS_AI, "acct1", Some("test-token")).unwrap();
+        store.set_runner(&cloud.id, Some(&Runner { provider: providers::WORKERS_AI.into(), model: "@cf/a/plain".into() })).unwrap();
+        let root = store.post(&c.id, DEMO_NAME, "person", "Question time.").unwrap();
+        let core = Arc::new(Mutex::new(store));
+        tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
+        core.lock().unwrap().post_in(&c.id, Some(&root.id), DEMO_NAME, "person", "@cloud plain please").unwrap();
+        assert_eq!(wait_woken(&core, &c.id, 1).await, ["cloud: woken by Demo · replied (ok)"]);
+        let thread = core.lock().unwrap().thread(&c.id, &root.id).unwrap();
+        assert_eq!((thread.last().unwrap().author.as_str(), thread.last().unwrap().body.as_str()), ("cloud", "Plain answer."), "posted where it was asked: the thread");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_provider_lists_its_models_tools_first() {
+        let (base, _) = workers_ai().await;
+        let creds = providers::Creds { base, account: "acct1".into(), token: "test-token".into() };
+        let models = providers::models(&creds).await.unwrap();
+        assert_eq!(models.iter().map(|m| (m.id.as_str(), m.tools, m.context_window)).collect::<Vec<_>>(), [("@cf/b/tools", true, None), ("@cf/a/plain", false, Some(8000))]);
+    }
+
+    async fn wait_woken(core: &Arc<Mutex<Store>>, channel: &str, n: usize) -> Vec<String> {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let woken: Vec<String> = core
+                .lock()
+                .unwrap()
+                .activity(channel)
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.action == "woken")
+                .map(|a| format!("{}: {} ({})", a.agent, a.detail, if a.ok { "ok" } else { "failed" }))
+                .collect();
+            if woken.len() >= n {
+                return woken;
+            }
+        }
+        panic!("nobody was woken");
+    }
+
+    /// The real Workers AI, end to end: run by hand with
+    /// `GILD_LIVE_CF=<file with ACCOUNT_ID= and TOKEN=> cargo test --lib live_ -- --ignored`.
+    /// The token is read from the file and never printed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_workers_ai_answers_a_mention() {
+        let file = std::fs::read_to_string(std::env::var("GILD_LIVE_CF").expect("GILD_LIVE_CF names the token file")).unwrap();
+        let field = |k: &str| file.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).unwrap().trim().to_string();
+        let dir = std::env::temp_dir().join(format!("gild-wake-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (cloud, _) = store.create_agent("cloud").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &cloud.id, Some(Access::Write)).unwrap();
+        store.save_provider(providers::WORKERS_AI, &field("ACCOUNT_ID"), Some(&field("TOKEN"))).unwrap();
+        let models = providers::models(&store.creds(providers::WORKERS_AI).unwrap()).await.unwrap();
+        println!("models: {} ({} can use tools)", models.len(), models.iter().filter(|m| m.tools).count());
+        let model = std::env::var("GILD_LIVE_MODEL").unwrap_or_else(|_| "@cf/meta/llama-3.3-70b-instruct-fp8-fast".into());
+        store.set_runner(&cloud.id, Some(&Runner { provider: providers::WORKERS_AI.into(), model })).unwrap();
+        let core = Arc::new(Mutex::new(store));
+        tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@cloud please say hello to the team in this channel, in one short sentence.").unwrap();
+        for _ in 0..240 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let store = core.lock().unwrap();
+            let woken: Vec<String> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action == "woken").map(|a| format!("{} {}", a.detail, a.ok)).collect();
+            if !woken.is_empty() {
+                println!("woken: {woken:?}");
+                let calls: Vec<String> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action != "woken").map(|a| format!("{} {}", a.action, a.ok)).collect();
+                println!("calls: {calls:?}");
+                println!("answer: {:?}", store.messages(&c.id).unwrap().last().map(|m| (m.author.clone(), m.body.clone())));
+                assert!(woken[0].ends_with("replied true"), "{woken:?}");
+                return;
+            }
+        }
+        panic!("no answer within a minute");
     }
 }
