@@ -15,7 +15,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
-use crate::store::{Agent, Mention, Message, Store};
+use crate::store::{Agent, Mention, Place, Store};
 
 pub const LIMIT: Duration = Duration::from_secs(600);
 
@@ -24,37 +24,55 @@ fn utc(ms: i64) -> String {
     format!("{} {:02}:{:02} UTC", crate::export::date(ms), s / 3600, s / 60 % 60)
 }
 
-/// What the agent is told: who mentioned it, where, the conversation
-/// leading up to it, and how to answer.
-pub fn prompt(agent: &str, mentions: &[Mention], context: &[(String, Vec<Message>)], endpoint: &str) -> String {
-    let mut out = format!("You are {agent}, an agent in gild: a workspace where people and agents work together in channels. You were mentioned.\n");
-    let mut channels: Vec<&Mention> = Vec::new();
+/// What the agent is told: where it was mentioned (or, untagged, where a
+/// person wrote in a thread it's in), the conversation there, and how to
+/// answer.
+pub fn prompt(agent: &str, mentions: &[Mention], places: &[Place], endpoint: &str) -> String {
+    let tagged = mentions.iter().any(|m| m.tagged);
+    let mut out = format!(
+        "You are {agent}, an agent in gild: a workspace where people and agents work together in channels. {}\n",
+        if tagged { "You were mentioned." } else { "Someone wrote in a thread you're part of." }
+    );
+    let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
     for m in mentions {
-        if !channels.iter().any(|c| c.channel_id == m.channel_id) {
-            channels.push(m);
+        let key = (m.channel_id.as_str(), m.thread.as_deref());
+        if seen.contains(&key) {
+            continue;
         }
-    }
-    for c in channels {
-        out.push_str(&format!("\n#{} in {} (channel_id {})\n", c.channel, c.workspace, c.channel_id));
-        let here: Vec<&Mention> = mentions.iter().filter(|m| m.channel_id == c.channel_id).collect();
-        match context.iter().find(|(id, _)| id == &c.channel_id).map(|(_, msgs)| msgs) {
+        seen.push(key);
+        let here: Vec<&Mention> = mentions.iter().filter(|x| x.channel_id == m.channel_id && x.thread == m.thread).collect();
+        match &m.thread {
+            Some(t) => out.push_str(&format!("\nA thread in #{} in {} (channel_id {}, thread_id {t})\n", m.channel, m.workspace, m.channel_id)),
+            None => out.push_str(&format!("\n#{} in {} (channel_id {})\n", m.channel, m.workspace, m.channel_id)),
+        }
+        let msgs = places.iter().find(|p| p.channel_id == m.channel_id && p.thread == m.thread).map(|p| &p.messages);
+        match msgs {
             Some(msgs) if !msgs.is_empty() => {
-                out.push_str(&format!("The last {} messages, oldest first; → marks where you were mentioned:\n", msgs.len()));
-                for m in msgs {
-                    let mark = if here.iter().any(|h| h.message_id == m.id) { "→ " } else { "  " };
-                    out.push_str(&format!("{mark}{} at {}: {}\n", m.author, utc(m.created_at), m.body));
+                out.push_str(&format!(
+                    "{}, oldest first; → marks what's new for you:\n",
+                    if m.thread.is_some() { "The thread" } else { "The last messages" }
+                ));
+                for x in msgs {
+                    let mark = if here.iter().any(|h| h.message_id == x.id) { "→ " } else { "  " };
+                    out.push_str(&format!("{mark}{} at {}: {}\n", x.author, utc(x.created_at), x.body));
                 }
             }
             _ => {
-                for m in here {
-                    out.push_str(&format!("→ {} at {}: {}\n", m.from, utc(m.at), m.text));
+                for x in &here {
+                    out.push_str(&format!("→ {} at {}: {}\n", x.from, utc(x.at), x.text));
                 }
             }
         }
     }
     out.push_str(&format!(
-        "\nUse gild's tools (MCP at {endpoint}): read_channel for more of the conversation, search_docs to answer from the channel's docs, and post_message to answer in the channel you were mentioned in. Do what was asked if you can; if you can't, say why in the channel. Everything you do is in the channel's activity log.\n"
+        "\nUse gild's tools (MCP at {endpoint}): read_channel and read_thread for more of the conversation, search_docs to answer from the channel's docs, and post_message to answer where it happened (with thread_id for a thread). "
     ));
+    out.push_str(if tagged {
+        "Do what was asked if you can; if you can't, say why there."
+    } else {
+        "You weren't @mentioned, so reply only if you have something useful to add. Saying nothing is fine."
+    });
+    out.push_str(" Everything you do is in the channel's activity log.\n");
     out
 }
 
@@ -122,7 +140,8 @@ async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, com
             };
             let _ = store.audit(&agent, "woken", channel, &detail, outcome.is_ok());
             if let Err(why) = &outcome {
-                let _ = store.post(channel, "gild", "system", &format!("Couldn't wake {}: {why}", agent.name));
+                let thread = mentions.iter().find(|m| &m.channel_id == channel).and_then(|m| m.thread.clone());
+                let _ = store.post_in(channel, thread.as_deref(), "gild", "system", &format!("Couldn't wake {}: {why}", agent.name));
             }
         }
     }

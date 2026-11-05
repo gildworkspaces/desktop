@@ -113,14 +113,30 @@ pub fn chat_md(channel: &Channel, messages: &[Message]) -> String {
         out.push_str(&format!("\n{}\n", channel.topic));
     }
     let mut current = String::new();
-    for m in messages {
+    for m in threaded(messages) {
+        let who = if m.kind == "agent" { format!("{} (agent)", m.author) } else { m.author.clone() };
+        if m.thread.is_some() {
+            // A reply: quoted under the message its thread hangs off.
+            let body: String = m.body.lines().map(|l| format!("> {l}\n")).collect();
+            out.push_str(&format!("> ↳ **{who}** · {} {}\n>\n{body}\n", day(m.created_at), time(m.created_at)));
+            continue;
+        }
         let d = day(m.created_at);
         if d != current {
             out.push_str(&format!("\n## {d}\n\n"));
             current = d;
         }
-        let who = if m.kind == "agent" { format!("{} (agent)", m.author) } else { m.author.clone() };
         out.push_str(&format!("**{who}** · {}\n\n{}\n\n", time(m.created_at), m.body));
+    }
+    out
+}
+
+/// Messages in reading order: each one followed by its thread's replies.
+pub fn threaded(messages: &[Message]) -> Vec<&Message> {
+    let mut out = Vec::new();
+    for m in messages.iter().filter(|m| m.thread.is_none()) {
+        out.push(m);
+        out.extend(messages.iter().filter(|r| r.thread.as_ref() == Some(&m.id)));
     }
     out
 }
@@ -148,7 +164,8 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
     let mut channels = Vec::new();
     for c in store.channels(&ws.id)? {
         let dir = root.join("channels").join(safe(&c.name));
-        let messages = store.messages(&c.id)?;
+        // Every message, replies too, each reply naming its thread.
+        let messages = store.all_messages(&c.id)?;
         let data = store.channel_data(&c.id)?;
         write(&dir.join("chat.md"), chat_md(&c, &messages))?;
         let jsonl: String = messages.iter().map(|m| serde_json::to_string(m).unwrap_or_default() + "\n").collect();
@@ -170,7 +187,7 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
             copy_dir(&repo, &dir.join("history.git"))?;
         }
         let docs: Vec<_> = docs.iter().map(|d| json!({ "path": d.path, "title": d.title, "text": d.body })).collect();
-        channels.push(json!({ "name": c.name, "topic": c.topic, "messages": messages, "table": table, "docs": docs }));
+        channels.push(json!({ "name": c.name, "topic": c.topic, "messages": threaded(&messages), "table": table, "docs": docs }));
     }
     let manifest = json!({
         "workspace": ws.name,
@@ -277,12 +294,17 @@ mod tests {
     }
 
     /// Every message line without the ids, which a new home gives anew.
+    /// The chat with ids left out, and each reply's thread given as the
+    /// position of the message it hangs off.
     fn chat_without_ids(path: &Path) -> Vec<serde_json::Value> {
-        fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|l| {
-                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        let lines: Vec<serde_json::Value> = fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let ids: Vec<String> = lines.iter().map(|v| v["id"].as_str().unwrap().to_string()).collect();
+        lines
+            .into_iter()
+            .map(|mut v| {
+                if let Some(t) = v["thread"].as_str() {
+                    v["thread"] = serde_json::json!(ids.iter().position(|i| i == t).expect("a reply's thread is in the chat"));
+                }
                 v.as_object_mut().unwrap().retain(|k, _| k != "id" && k != "channel_id");
                 v
             })
@@ -325,17 +347,22 @@ mod tests {
         let sop = store.create_doc(&intake.id, DEMO_NAME, "Intake SOP").unwrap();
         store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# Intake SOP\n\nForms go in the blue folder.\n").unwrap();
         store.propose_doc(&intake.id, "intake", Some(&sop.path), None, "# Intake SOP\n\nForms go in the red folder.\n", "Red now").unwrap();
-        store.post(&intake.id, "intake", "agent", "Jordan is enrolled.").unwrap();
+        let enrolled = store.post(&intake.id, "intake", "agent", "Jordan is enrolled.").unwrap();
+        store.post_in(&intake.id, Some(&enrolled.id), DEMO_NAME, "person", "Which program?").unwrap();
         let first = export_workspace(&store, &ws.id, &base.join("out1"), "one").unwrap();
         drop(store);
 
         // A new computer: import, and export again.
         let other = Store::open(&b).unwrap();
         let back = import_workspace(&other, &first).unwrap();
-        assert_eq!((back.name.as_str(), back.channels, back.messages), ("Front Desk", 3, 3));
+        assert_eq!((back.name.as_str(), back.channels, back.messages), ("Front Desk", 3, 4));
         let names: Vec<String> = other.channels(&back.id).unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(names, ["general", "student-intake", "quiet"], "in the export's order");
         let intake2 = other.channels(&back.id).unwrap().into_iter().find(|c| c.name == "student-intake").unwrap();
+        let top = other.messages(&intake2.id).unwrap();
+        let enrolled2 = top.iter().find(|m| m.body == "Jordan is enrolled.").unwrap();
+        assert_eq!(enrolled2.replies, 1, "the thread came back, not as a channel message");
+        assert_eq!(other.thread(&intake2.id, &enrolled2.id).unwrap()[1].body, "Which program?");
         assert_eq!(other.proposals(&intake2.id).unwrap()[0].summary, "Red now", "open proposals come back");
         assert!(other.agents().unwrap().is_empty() && other.pending_mentions(&agent.id).unwrap().is_empty(), "importing wakes no one");
         let second = export_workspace(&other, &back.id, &base.join("out2"), "two").unwrap();

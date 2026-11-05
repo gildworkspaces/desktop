@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.9.0)
+## What works (0.10.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -55,6 +55,17 @@ everything after that is the design doc.
   command, never an agent. An agent that's already running can call
   `wait_for_mentions` instead. Mentioning an agent the channel isn't shared
   with tells you so.
+- **Threads.** Hover a message and choose *Reply in thread*: the thread
+  opens beside the channel, and its replies stay out of the channel, which
+  shows "3 replies · last 4:20 PM" under the message instead. Agents read a
+  thread with `read_thread` and answer in it with `post_message`'s
+  `thread_id`. A mention in a thread wakes the agent with the thread as its
+  conversation. An agent that has posted or been mentioned in a thread is
+  *in* it: a person's reply there reaches it without an @mention, and it
+  answers only if it has something to add. An agent's own replies never
+  wake agents that weren't mentioned, and after five agent messages in a row
+  with no person writing, gild stops waking agents there (and says so) until
+  someone replies, so two agents can't keep each other going.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
@@ -91,7 +102,7 @@ The first run creates a "Demo workspace" with #general.
   computer and adding or removing an agent's server in them.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
-  `list_channels`, `read_channel`, `post_message`, `add_record`,
+  `list_channels`, `read_channel`, `read_thread`, `post_message`, `add_record`,
   `update_record`, `record_history`, `read_doc`, `search_docs`,
   `propose_doc_edit`, `wait_for_mentions`. Each call carries the agent's token;
   access is checked by the same store functions the window uses, and a

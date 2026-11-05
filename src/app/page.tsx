@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
 import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
+import { MessageRow, ThreadPanel } from './Thread'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, mentionParts, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
@@ -201,6 +202,8 @@ function ChannelView({ channel }: { channel: Channel }) {
   const list = useRef<HTMLDivElement>(null)
 
   const [panel, setPanel] = useState<'access' | 'activity' | null>(null)
+  const [threadId, setThreadId] = useState<string | null>(null)
+  const openThread = (m: Message) => { setPanel(null); setThreadId(m.id) }
   const [version, setVersion] = useState(0)
   const refresh = () => setVersion(v => v + 1)
   useEffect(() => { core.messages(channel.id).then(setMessages, e => setError(errorText(e))) }, [channel.id, version])
@@ -239,8 +242,8 @@ function ChannelView({ channel }: { channel: Channel }) {
             Docs{waiting > 0 && <span className="count" aria-label={`${waiting} waiting for approval`}>{waiting}</span>}
           </button>
         </div>
-        <button className="ghost" onClick={() => setPanel(p => (p === 'access' ? null : 'access'))}>Access</button>
-        <button className="ghost" onClick={() => setPanel(p => (p === 'activity' ? null : 'activity'))}>Activity</button>
+        <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'access' ? null : 'access')) }}>Access</button>
+        <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'activity' ? null : 'activity')) }}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
@@ -256,17 +259,7 @@ function ChannelView({ channel }: { channel: Channel }) {
             return (
               <div key={m.id} style={{ display: 'contents' }}>
                 {newDay && <div className="daybreak">{day(m.created_at)}</div>}
-                <div className="msg">
-                  <div className={`avatar ${m.kind}`} aria-hidden="true">{initial(m.author)}</div>
-                  <div className="body">
-                    <div className="meta">
-                      <span className="author">{m.author}</span>
-                      {m.kind !== 'person' && <span className="badge">{m.kind}</span>}
-                      <span className="time">{clock(m.created_at)}</span>
-                    </div>
-                    <span className="text">{mentionParts(m.body).map((p, j) => p.mention ? <span key={j} className="mention">{p.text}</span> : p.text)}</span>
-                  </div>
-                </div>
+                <MessageRow m={m} onThread={openThread} />
               </div>
             )
           })}
@@ -281,6 +274,7 @@ function ChannelView({ channel }: { channel: Channel }) {
         </div>
       </section>
       {panel === 'access' && <AccessPanel channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
+      {threadId && <ThreadPanel key={threadId} channelId={channel.id} channelName={channel.name} rootId={threadId} onReplied={refresh} onClose={() => setThreadId(null)} />}
       {panel === 'activity' && <ActivityPanel key={version} channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
     </main>
   )

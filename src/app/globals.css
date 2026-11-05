@@ -251,3 +251,16 @@ tbody tr:hover { background: var(--chip); }
 .setup .ctxrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; color: var(--ink); margin: 0; }
 .setup .field.num { width: 72px; text-align: right; }
 .setup .manual .field { width: 100%; box-sizing: border-box; }
+
+/* Threads */
+.msg { position: relative; border-radius: 8px; }
+.msgs .msg:hover { background: var(--sunk); box-shadow: 0 0 0 6px var(--sunk); }
+.msg .replybtn { position: absolute; top: -6px; right: 0; font-size: 12px; padding: 3px 8px; opacity: 0; background: var(--surface); }
+.msg:hover .replybtn, .msg .replybtn:focus-visible { opacity: 1; }
+.threadlink { align-self: flex-start; margin-top: 4px; background: none; border: 0; padding: 0; font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer; }
+.threadlink:hover { text-decoration: underline; }
+.threadpanel { width: min(460px, 94vw); overflow: hidden; }
+.threadpanel .list { padding: 16px 18px; }
+.threadpanel .composer { padding: 0 18px 16px; }
+.threadrule { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--faint); }
+.threadrule::after { content: ''; flex: 1; border-top: 1px solid var(--rule); }

@@ -6,7 +6,7 @@
 //! never touches the file.
 
 use std::num::NonZero;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS docs (channel_id TEXT NOT NULL, path TEXT NOT NULL, t
 CREATE TABLE IF NOT EXISTS mentions (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, delivered_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_wake (agent_id TEXT PRIMARY KEY, command TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_context (agent_id TEXT PRIMARY KEY, messages INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS thread_replies (message_id TEXT PRIMARY KEY, root_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -62,16 +64,32 @@ pub struct Channel {
     pub created_at: i64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Message {
     pub id: String,
     pub channel_id: String,
     pub author: String,
-    /// `person` or `system`; `agent` arrives with agents.
+    /// `person`, `agent` or `system`.
     pub kind: String,
     pub body: String,
     pub created_at: i64,
+    /// A reply: the id of the message whose thread it's in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// A message with a thread: how many replies, and when the last came.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replies: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_at: Option<i64>,
 }
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
+/// Agent messages in a row, with no person writing, after which gild stops
+/// waking agents there: two agents can't keep each other going.
+pub const MAX_AGENT_RUN: usize = 5;
 
 /// A channel's view and records, as the index has them.
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -276,9 +294,12 @@ impl Store {
         Ok(channel)
     }
 
-    pub fn messages(&self, channel_id: &str) -> Result<Vec<Message>, String> {
+    /// Every message in a channel, replies included (each with its thread),
+    /// oldest first.
+    pub fn all_messages(&self, channel_id: &str) -> Result<Vec<Message>, String> {
         let rows = self.query(
-            "SELECT id, channel_id, author, kind, body, created_at FROM messages WHERE channel_id = ?1 ORDER BY created_at, id",
+            "SELECT m.id, m.channel_id, m.author, m.kind, m.body, m.created_at, t.root_id FROM messages m
+             LEFT JOIN thread_replies t ON t.message_id = m.id WHERE m.channel_id = ?1 ORDER BY m.created_at, m.id",
             &[Value::from_text(channel_id.to_string())],
         )?;
         Ok(rows
@@ -290,11 +311,50 @@ impl Store {
                 kind: text(&r[3]),
                 body: text(&r[4]),
                 created_at: int(&r[5]),
+                thread: match &r[6] {
+                    Value::Null => None,
+                    v => Some(text(v)),
+                },
+                ..Message::default()
             })
             .collect())
     }
 
+    /// The channel as it reads: messages that aren't replies, each with its
+    /// thread's size.
+    pub fn messages(&self, channel_id: &str) -> Result<Vec<Message>, String> {
+        let all = self.all_messages(channel_id)?;
+        let mut top: Vec<Message> = all.iter().filter(|m| m.thread.is_none()).cloned().collect();
+        for reply in all.iter().filter(|m| m.thread.is_some()) {
+            if let Some(root) = top.iter_mut().find(|m| Some(&m.id) == reply.thread.as_ref()) {
+                root.replies += 1;
+                root.last_reply_at = Some(reply.created_at);
+            }
+        }
+        Ok(top)
+    }
+
+    /// A thread: the message it hangs off, then its replies, oldest first.
+    pub fn thread(&self, channel_id: &str, root_id: &str) -> Result<Vec<Message>, String> {
+        let all = self.all_messages(channel_id)?;
+        let mut out: Vec<Message> = all.iter().filter(|m| m.id == root_id && m.thread.is_none()).cloned().collect();
+        if out.is_empty() {
+            return Err("That thread isn't in this channel.".into());
+        }
+        out.extend(all.into_iter().filter(|m| m.thread.as_deref() == Some(root_id)));
+        let n = out.len() as i64 - 1;
+        out[0].replies = n;
+        out[0].last_reply_at = (n > 0).then(|| out[out.len() - 1].created_at);
+        Ok(out)
+    }
+
     pub fn post(&self, channel_id: &str, author: &str, kind: &str, body: &str) -> Result<Message, String> {
+        self.post_in(channel_id, None, author, kind, body)
+    }
+
+    /// Post in a channel, or, with `thread`, in the thread of that message
+    /// (a reply to a reply goes in the same thread).
+    pub fn post_in(&self, channel_id: &str, thread: Option<&str>, author: &str, kind: &str, body: &str) -> Result<Message, String> {
         let body = body.trim();
         if body.is_empty() {
             return Err("A message needs some text.".into());
@@ -302,6 +362,20 @@ impl Store {
         if self.query("SELECT 1 FROM channels WHERE id = ?1", &[Value::from_text(channel_id.to_string())])?.is_empty() {
             return Err("That channel no longer exists.".into());
         }
+        let thread = match thread {
+            None => None,
+            Some(id) => {
+                let rows = self.query(
+                    "SELECT m.id, t.root_id FROM messages m LEFT JOIN thread_replies t ON t.message_id = m.id WHERE m.id = ?1 AND m.channel_id = ?2",
+                    &[Value::from_text(id.to_string()), Value::from_text(channel_id.to_string())],
+                )?;
+                let r = rows.first().ok_or("That thread isn't in this channel.")?;
+                Some(match &r[1] {
+                    Value::Null => text(&r[0]),
+                    v => text(v),
+                })
+            }
+        };
         let message = Message {
             id: new_id(),
             channel_id: channel_id.to_string(),
@@ -309,6 +383,8 @@ impl Store {
             kind: kind.to_string(),
             body: body.to_string(),
             created_at: now_ms(),
+            thread,
+            ..Message::default()
         };
         self.run(
             "INSERT INTO messages (id, channel_id, author, kind, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -321,6 +397,12 @@ impl Store {
                 Value::from_i64(message.created_at),
             ],
         )?;
+        if let Some(root) = &message.thread {
+            self.run(
+                "INSERT INTO thread_replies (message_id, root_id) VALUES (?1, ?2)",
+                &[Value::from_text(message.id.clone()), Value::from_text(root.clone())],
+            )?;
+        }
         self.record_mentions(&message)?;
         Ok(message)
     }
@@ -904,6 +986,7 @@ impl Store {
         }
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agents WHERE id = ?1", &[id])?;
         Ok(agent)
@@ -1062,6 +1145,20 @@ impl Store {
                 gix::open(h).map_err(|e| format!("#{}'s history.git isn't a git repository: {e}", c.name))?;
             }
         }
+        for c in &channels {
+            // A reply's thread is a message earlier in the same channel that
+            // isn't itself a reply.
+            let mut roots: Vec<&str> = Vec::new();
+            for m in &c.messages {
+                match &m.thread {
+                    Some(t) if !roots.contains(&t.as_str()) => {
+                        return Err(format!("#{}'s chat has a reply to a message that isn't before it in the channel.", c.name));
+                    }
+                    Some(_) => {}
+                    None => roots.push(&m.id),
+                }
+            }
+        }
         let (ws_id, at) = (new_id(), now_ms());
         self.run(
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
@@ -1084,11 +1181,20 @@ impl Store {
                     Value::from_i64(created),
                 ],
             )?;
+            let mut ids: HashMap<&str, String> = HashMap::new();
             for m in &c.messages {
+                let new = new_id();
+                ids.insert(&m.id, new.clone());
+                if let Some(root) = m.thread.as_deref().and_then(|t| ids.get(t)) {
+                    self.run(
+                        "INSERT INTO thread_replies (message_id, root_id) VALUES (?1, ?2)",
+                        &[Value::from_text(new.clone()), Value::from_text(root.clone())],
+                    )?;
+                }
                 self.run(
                     "INSERT INTO messages (id, channel_id, author, kind, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     &[
-                        Value::from_text(new_id()),
+                        Value::from_text(new),
                         Value::from_text(id.clone()),
                         Value::from_text(m.author.clone()),
                         Value::from_text(m.kind.clone()),
@@ -1103,6 +1209,14 @@ impl Store {
     }
 }
 
+/// Where an agent was mentioned, with the conversation there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub channel_id: String,
+    pub thread: Option<String>,
+    pub messages: Vec<Message>,
+}
+
 /// A mention waiting for its agent, with what the agent needs to act on it.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Mention {
@@ -1115,6 +1229,11 @@ pub struct Mention {
     pub text: String,
     pub message_id: String,
     pub at: i64,
+    /// In a thread: the id of the message it hangs off.
+    pub thread: Option<String>,
+    /// False when the agent wasn't @mentioned but is in the thread: it may
+    /// stay quiet.
+    pub tagged: bool,
 }
 
 /// An agent as the window lists it: with the command that wakes it, if any.
@@ -1161,15 +1280,16 @@ impl Store {
 
     /// Note who a message mentions. An agent the channel isn't shared with
     /// isn't told, and gild says so in the channel.
+    /// Tell agents about a message: those it @mentions, and, for a person's
+    /// reply in a thread, the agents already in that thread (they posted
+    /// there or were mentioned there), untagged: they answer if it helps.
+    /// After MAX_AGENT_RUN agent messages in a row there, no agent is told
+    /// until a person writes.
     fn record_mentions(&self, message: &Message) -> Result<(), String> {
-        let names = mentioned_names(&message.body);
-        if names.is_empty() {
-            return Ok(());
-        }
         let agents = self.agents()?;
-        let mut told = false;
+        let mut tagged: Vec<&Agent> = Vec::new();
         let mut unshared = Vec::new();
-        for name in names {
+        for name in mentioned_names(&message.body) {
             let Some(agent) = agents.iter().find(|a| a.name == name) else { continue };
             if message.kind == "agent" && message.author == agent.name {
                 continue;
@@ -1178,33 +1298,85 @@ impl Store {
                 unshared.push(agent.name.clone());
                 continue;
             }
+            tagged.push(agent);
+        }
+        let mut quiet: Vec<&Agent> = Vec::new();
+        if let (Some(root), "person") = (&message.thread, message.kind.as_str()) {
+            let thread = self.thread(&message.channel_id, root)?;
+            let mentioned: Vec<String> = self
+                .query(
+                    "SELECT DISTINCT n.agent_id FROM mentions n LEFT JOIN thread_replies t ON t.message_id = n.message_id
+                     WHERE n.message_id = ?1 OR t.root_id = ?1",
+                    &[Value::from_text(root.clone())],
+                )?
+                .iter()
+                .map(|r| text(&r[0]))
+                .collect();
+            for agent in &agents {
+                let in_thread = mentioned.contains(&agent.id) || thread.iter().any(|m| m.kind == "agent" && m.author == agent.name);
+                if in_thread && !tagged.iter().any(|t| t.id == agent.id) && self.access(&agent.id, &message.channel_id)?.is_some() {
+                    quiet.push(agent);
+                }
+            }
+        }
+        if !tagged.is_empty() && message.kind == "agent" && self.agent_run(message)? >= MAX_AGENT_RUN {
+            self.post_in(
+                &message.channel_id,
+                message.thread.as_deref(),
+                "gild",
+                "system",
+                &format!("Agents have written {MAX_AGENT_RUN} messages in a row here, so gild isn't waking {} until someone replies.", tagged.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" or ")),
+            )?;
+            tagged.clear();
+        }
+        for (agent, is_quiet) in tagged.iter().map(|a| (a, false)).chain(quiet.iter().map(|a| (a, true))) {
+            let id = new_id();
             self.run(
                 "INSERT INTO mentions (id, agent_id, channel_id, message_id, created_at, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
                 &[
-                    Value::from_text(new_id()),
+                    Value::from_text(id.clone()),
                     Value::from_text(agent.id.clone()),
                     Value::from_text(message.channel_id.clone()),
                     Value::from_text(message.id.clone()),
                     Value::from_i64(message.created_at),
                 ],
             )?;
-            told = true;
+            if is_quiet {
+                self.run("INSERT INTO quiet_mentions (mention_id) VALUES (?1)", &[Value::from_text(id)])?;
+            }
         }
         for name in unshared {
-            self.post(&message.channel_id, "gild", "system", &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} from Access."))?;
+            self.post_in(
+                &message.channel_id,
+                message.thread.as_deref(),
+                "gild",
+                "system",
+                &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} from Access."),
+            )?;
         }
-        if told {
+        if !tagged.is_empty() || !quiet.is_empty() {
             self.signals.waiters.notify_waiters();
             self.signals.runner.notify_one();
         }
         Ok(())
     }
 
+    /// Agent messages in a row up to and including `message`, in its thread
+    /// (or the channel, outside threads). gild's own notes don't count.
+    fn agent_run(&self, message: &Message) -> Result<usize, String> {
+        let here: Vec<Message> = match &message.thread {
+            Some(root) => self.thread(&message.channel_id, root)?,
+            None => self.messages(&message.channel_id)?,
+        };
+        Ok(here.iter().rev().filter(|m| m.kind != "system").take_while(|m| m.kind == "agent").count())
+    }
+
     /// An agent's mentions that haven't reached it yet, oldest first.
     pub fn pending_mentions(&self, agent_id: &str) -> Result<Vec<Mention>, String> {
         let rows = self.query(
-            "SELECT n.id, n.agent_id, n.channel_id, c.name, w.name, m.author, m.body, m.id, m.created_at
+            "SELECT n.id, n.agent_id, n.channel_id, c.name, w.name, m.author, m.body, m.id, m.created_at, t.root_id, q.mention_id
              FROM mentions n JOIN messages m ON m.id = n.message_id JOIN channels c ON c.id = n.channel_id JOIN workspaces w ON w.id = c.workspace_id
+             LEFT JOIN thread_replies t ON t.message_id = m.id LEFT JOIN quiet_mentions q ON q.mention_id = n.id
              WHERE n.agent_id = ?1 AND n.delivered_at = 0 ORDER BY n.created_at, n.id",
             &[Value::from_text(agent_id.to_string())],
         )?;
@@ -1220,6 +1392,11 @@ impl Store {
                 text: text(&r[6]),
                 message_id: text(&r[7]),
                 at: int(&r[8]),
+                thread: match &r[9] {
+                    Value::Null => None,
+                    v => Some(text(v)),
+                },
+                tagged: matches!(r[10], Value::Null),
             })
             .collect())
     }
@@ -1281,27 +1458,27 @@ impl Store {
         )
     }
 
-    /// For each channel the mentions are in: its last `context` messages up
-    /// to the latest mention there, oldest first.
-    pub fn mention_context(&self, agent_id: &str, mentions: &[Mention]) -> Result<Vec<(String, Vec<Message>)>, String> {
-        let n = self.agent_infos()?.into_iter().find(|a| a.agent.id == agent_id).map(|a| a.context).unwrap_or(DEFAULT_CONTEXT);
-        let mut out: Vec<(String, Vec<Message>)> = Vec::new();
+    /// For each place the mentions are in (a channel, or a thread in it):
+    /// its last `context` messages up to the latest mention there, oldest
+    /// first. A thread always starts with the message it hangs off.
+    pub fn mention_context(&self, agent_id: &str, mentions: &[Mention]) -> Result<Vec<Place>, String> {
+        let n = self.agent_infos()?.into_iter().find(|a| a.agent.id == agent_id).map(|a| a.context).unwrap_or(DEFAULT_CONTEXT) as usize;
+        let mut out: Vec<Place> = Vec::new();
         for m in mentions {
-            if n == 0 || out.iter().any(|(c, _)| c == &m.channel_id) {
+            if out.iter().any(|p| p.channel_id == m.channel_id && p.thread == m.thread) {
                 continue;
             }
-            let last = mentions.iter().filter(|x| x.channel_id == m.channel_id).map(|x| x.at).max().unwrap_or(m.at);
-            let rows = self.query(
-                "SELECT id, channel_id, author, kind, body, created_at FROM messages WHERE channel_id = ?1 AND created_at <= ?2
-                 ORDER BY created_at DESC, id DESC LIMIT ?3",
-                &[Value::from_text(m.channel_id.clone()), Value::from_i64(last), Value::from_i64(n)],
-            )?;
-            let mut msgs: Vec<Message> = rows
-                .iter()
-                .map(|r| Message { id: text(&r[0]), channel_id: text(&r[1]), author: text(&r[2]), kind: text(&r[3]), body: text(&r[4]), created_at: int(&r[5]) })
-                .collect();
-            msgs.reverse();
-            out.push((m.channel_id.clone(), msgs));
+            let last = mentions.iter().filter(|x| x.channel_id == m.channel_id && x.thread == m.thread).map(|x| x.at).max().unwrap_or(m.at);
+            let mut here: Vec<Message> = match &m.thread {
+                Some(root) => self.thread(&m.channel_id, root)?,
+                None => self.messages(&m.channel_id)?,
+            };
+            here.retain(|x| x.created_at <= last);
+            let mut recent: Vec<Message> = here[here.len().saturating_sub(n)..].to_vec();
+            if m.thread.is_some() && n > 0 && recent.first().map(|x| &x.id) != here.first().map(|x| &x.id) {
+                recent.insert(0, here[0].clone());
+            }
+            out.push(Place { channel_id: m.channel_id.clone(), thread: m.thread.clone(), messages: recent });
         }
         Ok(out)
     }
@@ -1728,7 +1905,7 @@ mod tests {
         }
         let mentions = store.pending_mentions(&agent.id).unwrap();
         let bodies = |store: &Store| -> Vec<String> {
-            store.mention_context(&agent.id, &mentions).unwrap().into_iter().flat_map(|(_, m)| m).map(|m| m.body).collect()
+            store.mention_context(&agent.id, &mentions).unwrap().into_iter().flat_map(|p| p.messages).map(|m| m.body).collect()
         };
         assert_eq!(bodies(&store), ["one", "two", "three", "@ava what did I just say?"]);
         store.set_context(&agent.id, 2).unwrap();
@@ -1740,6 +1917,100 @@ mod tests {
         assert!(bodies(&store).is_empty());
         assert!(store.set_context(&agent.id, MAX_CONTEXT + 1).is_err());
         assert_eq!(store.agent_infos().unwrap()[0].context, 0);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn threads_keep_replies_out_of_the_channel_and_agents_in_them_listen() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let other = store.create_channel(&ws.id, "other", "").unwrap();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (bob, _) = store.create_agent("bob").unwrap();
+        let (cat, _) = store.create_agent("cat").unwrap();
+        for a in [&ava, &bob, &cat] {
+            store.set_access(&general.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
+        }
+        let root = store.post(&general.id, DEMO_NAME, "person", "Northside sent three more.").unwrap();
+        let r1 = store.post_in(&general.id, Some(&root.id), DEMO_NAME, "person", "@ava which forms?").unwrap();
+        // A reply to a reply goes in the same thread.
+        let r2 = store.post_in(&general.id, Some(&r1.id), "ava", "agent", "The intake form and proof of address.").unwrap();
+        assert_eq!(r2.thread.as_deref(), Some(root.id.as_str()));
+        assert!(store.post_in(&other.id, Some(&root.id), DEMO_NAME, "person", "x").is_err(), "a thread in another channel");
+
+        let top = store.messages(&general.id).unwrap();
+        assert_eq!(top.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["Northside sent three more."], "replies stay out of the channel");
+        assert_eq!((top[0].replies, top[0].last_reply_at), (2, Some(r2.created_at)));
+        let thread = store.thread(&general.id, &root.id).unwrap();
+        assert_eq!(thread.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["Northside sent three more.", "@ava which forms?", "The intake form and proof of address."]);
+
+        // ava was tagged; bob and cat weren't, and aren't in the thread.
+        let m = store.take_mentions(&ava).unwrap();
+        assert_eq!((m.len(), m[0].tagged, m[0].thread.as_deref()), (1, true, Some(root.id.as_str())));
+        assert!(store.take_mentions(&bob).unwrap().is_empty());
+
+        // A person writes in the thread without tagging: ava is in it, so
+        // it's told, untagged. bob still isn't.
+        store.post_in(&general.id, Some(&root.id), DEMO_NAME, "person", "And for transfers?").unwrap();
+        let m = store.take_mentions(&ava).unwrap();
+        assert_eq!((m.len(), m[0].tagged), (1, false));
+        assert!(store.take_mentions(&bob).unwrap().is_empty());
+
+        // An agent's untagged reply tells no one.
+        store.post_in(&general.id, Some(&root.id), "ava", "agent", "Same forms.").unwrap();
+        assert!(store.take_mentions(&bob).unwrap().is_empty() && store.take_mentions(&cat).unwrap().is_empty());
+
+        // The context for a thread starts with the message it hangs off.
+        store.post_in(&general.id, Some(&root.id), DEMO_NAME, "person", "Thanks @bob").unwrap();
+        store.set_context(&bob.id, 2).unwrap();
+        let mentions = store.pending_mentions(&bob.id).unwrap();
+        let places = store.mention_context(&bob.id, &mentions).unwrap();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].thread.as_deref(), Some(root.id.as_str()));
+        assert_eq!(places[0].messages.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["Northside sent three more.", "Same forms.", "Thanks @bob"]);
+        store.take_mentions(&bob).unwrap();
+        store.take_mentions(&ava).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn two_agents_can_t_keep_each_other_going() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (bob, _) = store.create_agent("bob").unwrap();
+        for a in [&ava, &bob] {
+            store.set_access(&general.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
+        }
+        let root = store.post(&general.id, DEMO_NAME, "person", "@ava @bob sort this out between you").unwrap();
+        store.take_mentions(&ava).unwrap();
+        store.take_mentions(&bob).unwrap();
+        // They tag each other, back and forth.
+        let mut told = Vec::new();
+        for i in 0..8 {
+            let (from, to) = if i % 2 == 0 { ("ava", &bob) } else { ("bob", &ava) };
+            let other = if i % 2 == 0 { "bob" } else { "ava" };
+            store.post_in(&general.id, Some(&root.id), from, "agent", &format!("@{other} over to you ({i})")).unwrap();
+            told.push(!store.take_mentions(to).unwrap().is_empty());
+        }
+        assert_eq!(told, [true, true, true, true, false, false, false, false], "the fifth agent message in a row wakes no one");
+        let notes = store.thread(&general.id, &root.id).unwrap().into_iter().filter(|m| m.kind == "system").count();
+        assert!(notes >= 1, "gild says why");
+        // A person writing starts it again.
+        store.post_in(&general.id, Some(&root.id), DEMO_NAME, "person", "@ava one more thing").unwrap();
+        let m = store.take_mentions(&ava).unwrap();
+        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("@ava one more thing", true)]);
+        // bob is in the thread too, so it hears the person, untagged.
+        let m = store.take_mentions(&bob).unwrap();
+        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("@ava one more thing", false)]);
+        store.post_in(&general.id, Some(&root.id), "ava", "agent", "@bob your turn").unwrap();
+        assert_eq!(store.take_mentions(&bob).unwrap().len(), 1);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

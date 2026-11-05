@@ -50,17 +50,26 @@ fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "read_channel",
-            "A channel's recent messages and, if it has one, its table: the columns, the statuses, and every record.",
+            "A channel's recent messages and, if it has one, its table: the columns, the statuses, and every record. A message with replies has a thread: read it with read_thread.",
             schema(json!({ "type": "object", "properties": {
                 "channel_id": channel,
                 "messages": { "type": "integer", "description": "How many recent messages to include (default 50, at most 200)." }
             }, "required": ["channel_id"] })),
         ),
         Tool::new(
-            "post_message",
-            "Post a message in a channel, as yourself. Needs write access.",
+            "read_thread",
+            "A thread: the message it hangs off, then every reply, oldest first.",
             schema(json!({ "type": "object", "properties": {
-                "channel_id": channel, "text": { "type": "string" }
+                "channel_id": channel,
+                "thread_id": { "type": "string", "description": "The id of the message the thread hangs off." }
+            }, "required": ["channel_id", "thread_id"] })),
+        ),
+        Tool::new(
+            "post_message",
+            "Post a message in a channel, as yourself, or with thread_id as a reply in that message's thread. Needs write access.",
+            schema(json!({ "type": "object", "properties": {
+                "channel_id": channel, "text": { "type": "string" },
+                "thread_id": { "type": "string", "description": "Reply in the thread of this message instead of the channel." }
             }, "required": ["channel_id", "text"] })),
         ),
         Tool::new(
@@ -164,7 +173,7 @@ impl Gild {
                 let all = store.messages(id)?;
                 let recent: Vec<Value> = all[all.len().saturating_sub(n)..]
                     .iter()
-                    .map(|m| json!({ "author": m.author, "kind": m.kind, "text": m.body, "at_ms": m.created_at }))
+                    .map(message_json)
                     .collect();
                 let data = store.channel_data(id)?;
                 Ok((None, json!({
@@ -194,11 +203,18 @@ impl Gild {
                 let p = store.propose_doc(id, &agent.name, path, title, arg(args, "text")?, arg(args, "summary")?)?;
                 Ok((Some(id.to_string()), json!({ "proposal": p.id, "doc": p.path, "status": "waiting for a person to approve it" })))
             }
+            "read_thread" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                let thread = store.thread(id, arg(args, "thread_id")?)?;
+                Ok((None, json!({ "messages": thread.iter().map(message_json).collect::<Vec<_>>() })))
+            }
             "post_message" => {
                 let id = arg(args, "channel_id")?;
                 store.require(agent, id, Access::Write)?;
-                let m = store.post(id, &agent.name, "agent", arg(args, "text")?)?;
-                Ok((Some(id.to_string()), json!({ "posted": m.id })))
+                let thread = args.get("thread_id").and_then(Value::as_str).filter(|t| !t.is_empty());
+                let m = store.post_in(id, thread, &agent.name, "agent", arg(args, "text")?)?;
+                Ok((Some(id.to_string()), json!({ "posted": m.id, "thread_id": m.thread })))
             }
             "add_record" => {
                 let id = arg(args, "channel_id")?;
@@ -233,6 +249,18 @@ impl Gild {
             other => Err(format!("There is no tool called {other}.")),
         }
     }
+}
+
+/// A message as agents see it.
+fn message_json(m: &crate::store::Message) -> Value {
+    let mut v = json!({ "id": m.id, "author": m.author, "kind": m.kind, "text": m.body, "at_ms": m.created_at });
+    if m.replies > 0 {
+        v["replies"] = json!(m.replies);
+    }
+    if let Some(t) = &m.thread {
+        v["thread_id"] = json!(t);
+    }
+    v
 }
 
 fn no_token() -> CallToolResponse {
