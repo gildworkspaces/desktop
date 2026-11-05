@@ -121,8 +121,12 @@ try {
 
   // Its settings, under Mentions: what runs (this test's stand-in for an AI
   // tool) and how much of the conversation comes with a mention.
+  // Clicking the agent opens its page in Settings: its tools (all on to
+  // start), then Mentions.
   await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
-  await driver.wait(until.elementLocated(By.xpath("//ol[contains(@class,'steps')]//button[contains(., 'Mentions')]")), 10000).click()
+  const postSwitch = await driver.wait(until.elementLocated(By.css('#tool-post_message')), 10000)
+  assert.equal(await postSwitch.getAttribute('aria-checked'), 'true')
+  await driver.findElement(By.xpath("//div[@role='tablist']//button[.='Mentions']")).click()
   const ctx = await driver.wait(until.elementLocated(By.css('#context')), 10000)
   assert.equal(await ctx.getAttribute('value'), '20')
   await ctx.clear()
@@ -130,7 +134,7 @@ try {
   await driver.findElement(By.css('#wake-command')).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
   await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//span[@class='ok' and .='Saved.']")), 10000)
-  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Close']")).click()
+  await driver.findElement(By.css("button[aria-label='Close settings']")).click()
   const agentsNow = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context + ':' + x.wake)), e => done({ error: String(e) }))
@@ -274,9 +278,11 @@ try {
   // Removing it, from its settings: gone from the sidebar, and its token
   // refused.
   await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//div[@role='tablist']//button[.='Connect']")), 10000).click()
   await driver.wait(until.elementLocated(By.xpath("//button[normalize-space(.)='Remove agent']")), 10000).click()
   await driver.findElement(By.xpath("//button[contains(@class,'danger') and normalize-space(.)='Remove intake']")).click()
   await driver.wait(async () => (await driver.findElements(By.css('button.agentrow'))).length === 0, 10000)
+  await driver.findElement(By.css("button[aria-label='Close settings']")).click()
   const after = await mcp({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)
   assert.equal(after.json.result.isError, true)
   assert.match(after.json.result.content[0].text, /no valid agent token/, 'the removed agent is refused')

@@ -98,6 +98,16 @@ impl Registry {
         self.addons.iter().map(|a| &a.manifest).collect()
     }
 
+    /// The add-on whose file type a path is.
+    pub fn addon_for(&self, path: &str) -> Option<&Manifest> {
+        let t = self.file_type(path)?;
+        self.addons.iter().map(|a| &a.manifest).find(|m| m.contributes.file_types.iter().any(|f| f.id == t.id))
+    }
+
+    pub fn manifest(&self, id: &str) -> Option<&Manifest> {
+        self.addons.iter().map(|a| &a.manifest).find(|m| m.id == id)
+    }
+
     /// The file type a path is, by its extension.
     pub fn file_type(&self, path: &str) -> Option<&FileType> {
         let lower = path.to_lowercase();
@@ -139,6 +149,16 @@ impl Registry {
             .map(|(_, e)| e)
             .ok_or_else(|| format!("The {} editor isn't available.", file_type.name))?;
         editor.apply(text, op, args)
+    }
+}
+
+/// A permission glob: `*` stands for anything (slashes included).
+pub fn glob(pattern: &str, path: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == path,
+        Some((head, rest)) => {
+            path.starts_with(head) && (0..=path.len() - head.len()).any(|i| path.is_char_boundary(head.len() + i) && glob(rest, &path[head.len() + i..]))
+        }
     }
 }
 
@@ -240,6 +260,13 @@ mod tests {
         let tools: Vec<String> = r.tools().into_iter().map(|t| t.tool).collect();
         assert_eq!(tools, ["markdown_replace_section", "markdown_insert_after", "markdown_replace_text", "markdown_append", "markdown_set_text"]);
         assert!(r.tool("markdown_replace_section").is_some_and(|t| t.op.params["required"] == json!(["heading", "text"])));
+    }
+
+    #[test]
+    fn permission_globs() {
+        assert!(glob("*.md", "docs/a.md") && glob("*.md", "a.md") && glob("*", "x/y") && glob("docs/*.md", "docs/a.md"));
+        assert!(!glob("*.md", "a.csv") && !glob("docs/*.md", "notes/a.md") && !glob("a.md", "b.md"));
+        assert!(glob("*é*", "café.md"));
     }
 
     #[test]

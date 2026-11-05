@@ -99,6 +99,47 @@ fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
     with(&core, |s| Ok(s.addons()))
 }
 
+/// Every agent tool, grouped, for turning tools on or off per agent.
+#[tauri::command]
+fn tool_catalog() -> Vec<mcp::ToolInfo> {
+    mcp::catalog()
+}
+
+/// The tools turned off for an agent.
+#[tauri::command]
+fn agent_tools_off(core: State<Core>, agent_id: String) -> Result<Vec<String>, String> {
+    with(&core, |s| s.tools_off(&agent_id))
+}
+
+#[tauri::command]
+fn set_agent_tool(core: State<Core>, agent_id: String, tool: String, allowed: bool) -> Result<Vec<String>, String> {
+    with(&core, |s| {
+        s.set_tool(&agent_id, &tool, allowed)?;
+        s.tools_off(&agent_id)
+    })
+}
+
+#[derive(Serialize)]
+struct Grant {
+    kind: String,
+    value: String,
+    granted: bool,
+}
+
+/// What an add-on asks to touch, and whether it may.
+#[tauri::command]
+fn addon_grants(core: State<Core>, addon_id: String) -> Result<Vec<Grant>, String> {
+    with(&core, |s| Ok(s.addon_grants(&addon_id)?.into_iter().map(|(kind, value, granted)| Grant { kind, value, granted }).collect()))
+}
+
+#[tauri::command]
+fn set_addon_grant(core: State<Core>, addon_id: String, kind: String, value: String, granted: bool) -> Result<Vec<Grant>, String> {
+    with(&core, |s| {
+        s.set_addon_grant(&addon_id, &kind, &value, granted)?;
+        Ok(s.addon_grants(&addon_id)?.into_iter().map(|(kind, value, granted)| Grant { kind, value, granted }).collect())
+    })
+}
+
 /// A channel's shared view: its files, what's open, who controls it.
 #[tauri::command]
 fn channel_view(core: State<Core>, channel_id: String) -> Result<ChannelView, String> {
@@ -435,6 +476,11 @@ pub fn run() {
             thread,
             working,
             addons,
+            tool_catalog,
+            agent_tools_off,
+            set_agent_tool,
+            addon_grants,
+            set_addon_grant,
             channel_view,
             drive_view,
             edit_file,

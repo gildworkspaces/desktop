@@ -167,7 +167,7 @@ function WorkspaceView({ me, workspace, onPlace, onBack }: {
             ))}
             {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
           </div>
-          <MembersGroup profile={me.profile} channels={channels} current={current} />
+          <MembersGroup profile={me.profile} channels={channels} current={current} onOpenAgent={a => me.settings(`agent:${a.id}`)} />
         </div>
         <div className="foot"><UserCard profile={me.profile} onProfile={me.setProfile} onSettings={me.settings} /></div>
       </nav>

@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS thread_replies (message_id TEXT PRIMARY KEY, root_id 
 CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS agent_tools (agent_id TEXT NOT NULL, tool TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (agent_id, tool));
+CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, granted INTEGER NOT NULL, PRIMARY KEY (addon_id, kind, value));
 CREATE TABLE IF NOT EXISTS held_mentions (mention_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, root TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
@@ -1062,6 +1064,7 @@ impl Store {
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_tools WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM held_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
@@ -1427,6 +1430,73 @@ impl Store {
         self.addons.manifests().into_iter().cloned().collect()
     }
 
+    /// Whether an agent may use a tool (on unless someone turned it off).
+    pub fn tool_allowed(&self, agent_id: &str, tool: &str) -> Result<bool, String> {
+        let rows = self.query(
+            "SELECT allowed FROM agent_tools WHERE agent_id = ?1 AND tool = ?2",
+            &[Value::from_text(agent_id.to_string()), Value::from_text(tool.to_string())],
+        )?;
+        Ok(rows.first().map(|r| int(&r[0]) != 0).unwrap_or(true))
+    }
+
+    /// The tools turned off for an agent.
+    pub fn tools_off(&self, agent_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .query("SELECT tool FROM agent_tools WHERE agent_id = ?1 AND allowed = 0 ORDER BY tool", &[Value::from_text(agent_id.to_string())])?
+            .iter()
+            .map(|r| text(&r[0]))
+            .collect())
+    }
+
+    /// Turn a tool on or off for an agent. Only the window calls this.
+    pub fn set_tool(&self, agent_id: &str, tool: &str, allowed: bool) -> Result<(), String> {
+        self.agent(agent_id)?;
+        self.run(
+            "INSERT INTO agent_tools (agent_id, tool, allowed) VALUES (?1, ?2, ?3) ON CONFLICT (agent_id, tool) DO UPDATE SET allowed = excluded.allowed",
+            &[Value::from_text(agent_id.to_string()), Value::from_text(tool.to_string()), Value::from_i64(allowed as i64)],
+        )
+    }
+
+    /// Whether an add-on has a permission its manifest asks for. gild's own
+    /// add-ons start with theirs.
+    pub fn addon_granted(&self, addon_id: &str, kind: &str, value: &str) -> Result<bool, String> {
+        let rows = self.query(
+            "SELECT granted FROM addon_grants WHERE addon_id = ?1 AND kind = ?2 AND value = ?3",
+            &[Value::from_text(addon_id.to_string()), Value::from_text(kind.to_string()), Value::from_text(value.to_string())],
+        )?;
+        Ok(rows.first().map(|r| int(&r[0]) != 0).unwrap_or(true))
+    }
+
+    /// Grant or withdraw one of the permissions an add-on's manifest asks for.
+    pub fn set_addon_grant(&self, addon_id: &str, kind: &str, value: &str, granted: bool) -> Result<(), String> {
+        let m = self.addons.manifest(addon_id).ok_or("There's no add-on with that id.")?;
+        let asked = match kind {
+            "files" => &m.permissions.files,
+            "network" => &m.permissions.network,
+            "secrets" => &m.permissions.secrets,
+            _ => return Err("Unknown kind of permission.".into()),
+        };
+        if !asked.iter().any(|v| v == value) {
+            return Err(format!("{} doesn't ask for that.", m.name));
+        }
+        self.run(
+            "INSERT INTO addon_grants (addon_id, kind, value, granted) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (addon_id, kind, value) DO UPDATE SET granted = excluded.granted",
+            &[Value::from_text(addon_id.to_string()), Value::from_text(kind.to_string()), Value::from_text(value.to_string()), Value::from_i64(granted as i64)],
+        )
+    }
+
+    /// Every permission each add-on asks for, and whether it has it.
+    pub fn addon_grants(&self, addon_id: &str) -> Result<Vec<(String, String, bool)>, String> {
+        let m = self.addons.manifest(addon_id).ok_or("There's no add-on with that id.")?;
+        let mut out = Vec::new();
+        for (kind, values) in [("files", &m.permissions.files), ("network", &m.permissions.network), ("secrets", &m.permissions.secrets)] {
+            for v in values {
+                out.push((kind.to_string(), v.clone(), self.addon_granted(&m.id, kind, v)?));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn addon_registry(&self) -> &Registry {
         &self.addons
     }
@@ -1507,6 +1577,18 @@ impl Store {
                 name.clone()
             }
         };
+        // The add-on edits only the files it has been granted.
+        if let Some(m) = self.addons.addon_for(path) {
+            let mut allowed = false;
+            for g in &m.permissions.files {
+                if crate::addons::glob(g, path) && self.addon_granted(&m.id, "files", g)? {
+                    allowed = true;
+                }
+            }
+            if !allowed {
+                return Err(format!("The {} add-on isn't allowed to edit {path} (Settings › Add-ons › {} › Permissions).", m.name, m.name));
+            }
+        }
         let text = self.file_text(channel_id, path)?.ok_or_else(|| format!("{path} isn't a text file gild can edit."))?;
         let new = self.addons.apply(path, &text, op, args)?;
         if new.chars().count() > MAX_OPEN {
@@ -2586,6 +2668,38 @@ mod tests {
         assert!(store.edit_file(&c.id, &a, &sop.path, "append", &serde_json::json!({ "text": "x" })).unwrap_err().contains("took over"));
         store.edit_file(&c.id, &Actor::Person(DEMO_NAME.into()), &sop.path, "append", &serde_json::json!({ "text": "Thanks." })).unwrap();
         assert_eq!(store.doc_history(&c.id, &sop.path).unwrap()[0].author, DEMO_NAME);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tools_are_switched_per_agent_and_add_ons_keep_to_their_grants() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &ava.id, Some(Access::Write)).unwrap();
+        assert!(store.tool_allowed(&ava.id, "post_message").unwrap(), "on unless turned off");
+        store.set_tool(&ava.id, "post_message", false).unwrap();
+        store.set_tool(&ava.id, "markdown_set_text", false).unwrap();
+        assert!(!store.tool_allowed(&ava.id, "post_message").unwrap());
+        assert_eq!(store.tools_off(&ava.id).unwrap(), ["markdown_set_text", "post_message"]);
+        store.set_tool(&ava.id, "post_message", true).unwrap();
+        assert_eq!(store.tools_off(&ava.id).unwrap(), ["markdown_set_text"]);
+
+        // Markdown asks for *.md and has it, until it's withdrawn.
+        assert_eq!(store.addon_grants("gild.markdown").unwrap(), [("files".to_string(), "*.md".to_string(), true)]);
+        let sop = store.create_doc(&c.id, DEMO_NAME, "SOP").unwrap();
+        let me = Actor::Person(DEMO_NAME.into());
+        store.edit_file(&c.id, &me, &sop.path, "append", &serde_json::json!({ "text": "One." })).unwrap();
+        store.set_addon_grant("gild.markdown", "files", "*.md", false).unwrap();
+        let e = store.edit_file(&c.id, &me, &sop.path, "append", &serde_json::json!({ "text": "Two." })).unwrap_err();
+        assert_eq!(e, "The Markdown add-on isn't allowed to edit docs/sop.md (Settings › Add-ons › Markdown › Permissions).");
+        assert!(store.set_addon_grant("gild.markdown", "network", "evil.example", true).unwrap_err().contains("doesn't ask for that"));
+        assert!(store.set_addon_grant("nope", "files", "*.md", true).is_err());
+        store.remove_agent(&ava.id, DEMO_NAME).unwrap();
+        assert!(store.tools_off(&ava.id).unwrap().is_empty());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

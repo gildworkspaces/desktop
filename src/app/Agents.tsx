@@ -3,7 +3,7 @@
 // the members list, Settings' agents page, what an agent may do in a
 // channel, and what agents did there.
 import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type Profile } from '@/lib/core'
+import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type Profile, type ToolInfo } from '@/lib/core'
 import { Avatar } from './Profile'
 
 /** Tell every agents list in the window that the agents changed. */
@@ -102,7 +102,7 @@ export function NameModal({ title, label, hint, action, id, onSubmit, onClose, e
 }
 
 /** The sidebar's members: you, then the agents. */
-export function MembersGroup({ profile, channels, current }: { profile: Profile; channels: Channel[]; current: Channel | null }) {
+export function MembersGroup({ profile, channels, current, onOpenAgent }: { profile: Profile; channels: Channel[]; current: Channel | null; onOpenAgent: (a: Agent) => void }) {
   const [agents, setAgents, error] = useAgents()
   const [status, setStatus] = useState<string>('')
   useEffect(() => { core.mcpStatus().then(() => setStatus(''), e => setStatus(errorText(e))) }, [])
@@ -112,7 +112,7 @@ export function MembersGroup({ profile, channels, current }: { profile: Profile;
       <div className="grouphead"><span className="label">Members</span><PlusButton label="Add an agent" onClick={adding.add} /></div>
       <div className="member"><Avatar profile={profile} size={20} />{profile.name} <span className="faint">(you)</span></div>
       {agents.map(a => (
-        <button key={a.id} className="member agentrow" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>
+        <button key={a.id} className="member agentrow" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>
           <span className="aavatar" aria-hidden="true">{a.name[0]?.toUpperCase()}</span>{a.name}
           <span className="tag">{a.coordinator ? 'coordinator' : 'agent'}</span>
         </button>
@@ -166,7 +166,7 @@ function LoopSettings() {
 }
 
 /** Settings › Agents. */
-export function AgentsSettings({ channels, current }: { channels: Channel[]; current: Channel | null }) {
+export function AgentsSettings({ channels, current, onOpenAgent }: { channels: Channel[]; current: Channel | null; onOpenAgent: (a: Agent) => void }) {
   const [agents, setAgents, error] = useAgents()
   const [endpoint, setEndpoint] = useState<{ ok: boolean; text: string } | null>(null)
   const [where, setWhere] = useState<Record<string, number>>({})
@@ -189,7 +189,7 @@ export function AgentsSettings({ channels, current }: { channels: Channel[]; cur
               <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b>{a.coordinator && <span className="tag">coordinator</span>}</span>
               <span className="soft">{channels.length > 0 ? `${where[a.id] ?? 0} ${(where[a.id] ?? 0) === 1 ? 'channel' : 'channels'} here` : ''}</span>
               <span className="soft">{a.wake ? 'wakes on @' : 'not woken'}</span>
-              <button className="ghost" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>Settings</button>
+              <button className="ghost" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>Settings</button>
             </div>
           ))}
         </div>
@@ -228,10 +228,13 @@ const SETTINGS: { key: Step; label: string }[] = [
 /** Setting an agent up: gild adds it to the AI tools on this computer (and
  *  wakes it through the first of them), shares channels with it, and says
  *  how to use it. Opened again from the sidebar, it's the agent's settings. */
-export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose }: {
+export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose, page }: {
   agent: Agent; fresh: boolean; channels: Channel[]; current: Channel | null; onAgents: (agents: Agent[]) => void; onClose: () => void
+  /** Shown as one tab of the agent's settings page, not as a dialog. */
+  page?: Exclude<Step, 'done'>
 }) {
-  const [step, setStep] = useState<Step>('connect')
+  const [ownStep, setStep] = useState<Step>(page ?? 'connect')
+  const step = page ?? ownStep
   const [clients, setClients] = useState<ClientStatus[] | null>(null)
   const [chosen, setChosen] = useState<Set<string>>(new Set())
   const [connected, setConnected] = useState<Connected | null>(null)
@@ -314,11 +317,10 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose 
   const index = steps.findIndex(s => s.key === step)
   const go = (s: Step) => { setSaved(''); setError(''); setStep(s) }
 
-  return (
-    <div className="modalback top" role="dialog" aria-modal="true" aria-labelledby="setup-title">
-      <div className="modal setup">
-        <h2 id="setup-title">{fresh ? `Set up ${agent.name}` : agent.name}</h2>
-        <ol className="steps" aria-label="Steps">
+  const body = (
+      <>
+        {!page && <h2 id="setup-title">{fresh ? `Set up ${agent.name}` : agent.name}</h2>}
+        {!page && <ol className="steps" aria-label="Steps">
           {steps.map((s, i) => (
             <li key={s.key} className={s.key === step ? 'on' : i < index ? 'past' : ''}>
               <button type="button" className="link" onClick={() => go(s.key)} disabled={fresh && i > index} aria-current={s.key === step ? 'step' : undefined}>
@@ -326,7 +328,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose 
               </button>
             </li>
           ))}
-        </ol>
+        </ol>}
 
         {step === 'connect' && (
           <>
@@ -455,13 +457,81 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose 
               <>
                 <button className="ghost" onClick={() => setRemoving(true)}>Remove agent</button>
                 <span className="spacer" />
-                <button className="ghost" onClick={onClose}>Close</button>
+                {!page && <button className="ghost" onClick={onClose}>Close</button>}
               </>
             )}
           </div>
         )}
         {fresh && step !== 'done' && <div className="row"><span className="spacer" /><button className="ghost" onClick={onClose}>Finish later</button></div>}
+      </>
+  )
+  if (page) return <div className="setup page">{body}</div>
+  return (
+    <div className="modalback top" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+      <div className="modal setup">{body}</div>
+    </div>
+  )
+}
+
+type AgentTab = 'tools' | 'channels' | 'mentions' | 'connect'
+const AGENT_TABS: { key: AgentTab; label: string }[] = [
+  { key: 'tools', label: 'Tools' },
+  { key: 'channels', label: 'Channels' },
+  { key: 'mentions', label: 'Mentions' },
+  { key: 'connect', label: 'Connect' },
+]
+
+/** Settings › Agents › an agent: what it may use, where, and how it's woken. */
+export function AgentPage({ agentId, channels, current, onBack }: { agentId: string; channels: Channel[]; current: Channel | null; onBack: () => void }) {
+  const [agents, setAgents] = useAgents()
+  const [tab, setTab] = useState<AgentTab>('tools')
+  const agent = agents.find(a => a.id === agentId)
+  if (!agent) return <div className="spage"><button className="link back" onClick={onBack}>← Agents</button><p className="faint">Loading…</p></div>
+  return (
+    <div className="spage">
+      <button className="link back" onClick={onBack}>← Agents</button>
+      <div className="row"><span className="aavatar big" aria-hidden="true">{agent.name[0]?.toUpperCase()}</span><h2 style={{ fontSize: 20 }}>{agent.name}</h2>{agent.coordinator && <span className="tag">coordinator</span>}</div>
+      <div className="seg" role="tablist" aria-label={`${agent.name} settings`}>
+        {AGENT_TABS.map(t => <button key={t.key} role="tab" aria-selected={tab === t.key} className={tab === t.key ? 'on' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}
       </div>
+      {tab === 'tools'
+        ? <ToolsTab agent={agent} />
+        : <AgentSetup key={tab} agent={agent} fresh={false} page={tab} channels={channels} current={current} onAgents={setAgents} onClose={onBack} />}
+    </div>
+  )
+}
+
+/** One agent's tools, on or off, by group. */
+function ToolsTab({ agent }: { agent: Agent }) {
+  const [catalog, setCatalog] = useState<ToolInfo[] | null>(null)
+  const [off, setOff] = useState<string[]>([])
+  const [error, setError] = useState('')
+  useEffect(() => {
+    core.toolCatalog().then(setCatalog, e => setError(errorText(e)))
+    core.agentToolsOff(agent.id).then(setOff, e => setError(errorText(e)))
+  }, [agent.id])
+  async function set(tools: string[], allowed: boolean) {
+    setError('')
+    try { let last = off; for (const t of tools) last = await core.setAgentTool(agent.id, t, allowed); setOff(last) } catch (e) { setError(errorText(e)) }
+  }
+  if (!catalog) return error ? <p className="error">{error}</p> : null
+  const groups = [...new Set(catalog.map(t => t.group))]
+  return (
+    <div className="toolgroups">
+      <p className="soft lead">{agent.name} can use the tools that are on. A tool that’s off isn’t offered to it, and if it calls it anyway, gild refuses and says so in Activity. Access to each channel is set under Channels.</p>
+      {groups.map(g => {
+        const tools = catalog.filter(t => t.group === g)
+        const allOn = tools.every(t => !off.includes(t.name))
+        return (
+          <section key={g} className="toolgroup" aria-label={g}>
+            <div className="row"><span className="flabel">{g}</span><span className="spacer" /><button className="link" onClick={() => set(tools.map(t => t.name), !allOn)}>{allOn ? 'Turn all off' : 'Turn all on'}</button></div>
+            {tools.map(t => (
+              <Toggle key={t.name} id={`tool-${t.name}`} label={t.name} hint={t.description.split('. ')[0].replace(/\.$/, '') + '.'} on={!off.includes(t.name)} onChange={v => set([t.name], v)} />
+            ))}
+          </section>
+        )
+      })}
+      {error && <p className="error">{error}</p>}
     </div>
   )
 }

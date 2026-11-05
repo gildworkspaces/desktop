@@ -185,6 +185,36 @@ fn tools() -> Vec<Tool> {
     tools
 }
 
+/// A tool as the window lists it, for turning it on or off per agent.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub group: String,
+    /// The add-on it comes from, if any.
+    pub addon: Option<String>,
+}
+
+/// Every tool, grouped the way people think of them.
+pub fn catalog() -> Vec<ToolInfo> {
+    let registry = Registry::built_in();
+    tools()
+        .into_iter()
+        .map(|t| {
+            let name = t.name.to_string();
+            let from = registry.tool(&name).map(|op| (op.file_type.name.clone(), registry.addon_for(&format!("x{}", op.file_type.extensions[0])).map(|m| m.id.clone())));
+            let group = match (&from, name.as_str()) {
+                (Some((file_type, _)), _) => format!("{file_type} files"),
+                (None, "list_channels" | "read_channel" | "read_thread" | "post_message" | "wait_for_mentions") => "Channels and messages".into(),
+                (None, "add_record" | "update_record" | "record_history") => "Table".into(),
+                (None, "read_doc" | "search_docs" | "propose_doc_edit") => "Docs".into(),
+                _ => "View".into(),
+            };
+            ToolInfo { name, description: t.description.as_deref().unwrap_or("").to_string(), group, addon: from.and_then(|(_, a)| a) }
+        })
+        .collect()
+}
+
 /// The view as an agent reads it.
 fn view_json(v: &ChannelView) -> Value {
     json!({
@@ -426,12 +456,32 @@ impl ServerHandler for Gild {
         )
     }
 
-    async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+    async fn list_tools(&self, _request: Option<PaginatedRequestParams>, context: RequestContext<RoleServer>) -> Result<ListToolsResult, ErrorData> {
+        // An agent sees only the tools it may use.
+        let off = {
+            let store = self.core.lock().map_err(|_| ErrorData::internal_error("the workspace database is unavailable", None))?;
+            match bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
+                Ok(Some(Some(agent))) => store.tools_off(&agent.id).map_err(|e| ErrorData::internal_error(e, None))?,
+                _ => Vec::new(),
+            }
+        };
+        Ok(ListToolsResult::with_all_items(tools().into_iter().filter(|t| !off.iter().any(|o| o == t.name.as_ref())).collect()))
     }
 
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.clone().unwrap_or_default();
+        // A tool turned off for this agent is refused, and the refusal logged.
+        {
+            let store = self.core.lock().map_err(|_| ErrorData::internal_error("the workspace database is unavailable", None))?;
+            if let Ok(Some(Some(agent))) = bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
+                if !store.tool_allowed(&agent.id, &request.name).map_err(|e| ErrorData::internal_error(e, None))? {
+                    let why = format!("{} isn't allowed to use {} (Settings › Agents › {} › Tools).", agent.name, request.name, agent.name);
+                    let channel = args.get("channel_id").and_then(Value::as_str).unwrap_or("");
+                    store.audit(&agent, &request.name, channel, &why, false).map_err(|e| ErrorData::internal_error(e, None))?;
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(why)]).into());
+                }
+            }
+        }
         if request.name == "wait_for_mentions" {
             return self.wait_for_mentions(&args, &context).await;
         }
@@ -557,6 +607,12 @@ mod tests {
             let result = &v["result"];
             (result["isError"].as_bool().unwrap_or(false), result["content"][0]["text"].as_str().unwrap_or_default().to_string())
         }
+
+        async fn list_tools(&mut self) -> Vec<String> {
+            self.next += 1;
+            let (_, v) = self.post(json!({ "jsonrpc": "2.0", "id": self.next, "method": "tools/list", "params": {} })).await;
+            v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -667,6 +723,16 @@ mod tests {
     }
 
     #[test]
+    fn the_catalog_groups_every_tool() {
+        let c = catalog();
+        assert_eq!(c.len(), tools().len());
+        let group = |n: &str| c.iter().find(|t| t.name == n).map(|t| (t.group.clone(), t.addon.clone())).unwrap();
+        assert_eq!(group("post_message"), ("Channels and messages".into(), None));
+        assert_eq!(group("open_file"), ("View".into(), None));
+        assert_eq!(group("markdown_replace_section"), ("Markdown files".into(), Some("gild.markdown".into())));
+    }
+
+    #[test]
     fn every_add_on_operation_is_a_tool_with_its_own_arguments() {
         let all = tools();
         let t = all.iter().find(|t| t.name == "markdown_replace_section").expect("generated from the markdown add-on");
@@ -723,11 +789,17 @@ mod tests {
         assert!(err && text.contains("Demo took over"), "{text}");
         let (err, text) = c.call("take_view", json!({ "channel_id": ch })).await;
         assert!(err && text.contains("Demo is using the view"), "{text}");
+        // A tool turned off for the agent is gone from its list and refused.
+        core.lock().unwrap().set_tool(&agent.id, "markdown_append", false).unwrap();
+        let listed = c.list_tools().await;
+        assert!(!listed.contains(&"markdown_append".to_string()) && listed.contains(&"markdown_replace_section".to_string()));
+        let (err, text) = c.call("markdown_append", json!({ "channel_id": ch, "path": sop.path, "text": "x" })).await;
+        assert_eq!((err, text.as_str()), (true, "intake isn't allowed to use markdown_append (Settings › Agents › intake › Tools)."));
         let store = core.lock().unwrap();
         let log: Vec<(String, bool)> = store.activity(ch).unwrap().into_iter().map(|a| (a.action, a.ok)).collect();
         assert_eq!(
             log,
-            [("take_view", false), ("markdown_append", false), ("markdown_replace_section", true), ("open_file", true), ("open_folder", true), ("take_view", true), ("open_folder", false), ("view_state", true)]
+            [("markdown_append", false), ("take_view", false), ("markdown_append", false), ("markdown_replace_section", true), ("open_file", true), ("open_folder", true), ("take_view", true), ("open_folder", false), ("view_state", true)]
                 .map(|(a, ok)| (a.to_string(), ok))
         );
         assert_eq!(store.doc_history(ch, &sop.path).unwrap()[0].author, "intake");
