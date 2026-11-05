@@ -159,7 +159,7 @@ pub struct Store {
     working: Vec<Working>,
     /// Each channel's shared view (in memory: it's what's on screen now).
     views: std::sync::Mutex<HashMap<String, ViewState>>,
-    addons: Registry,
+    addons: &'static Registry,
 }
 
 /// A channel's view: its state and the files it shows.
@@ -1498,7 +1498,7 @@ impl Store {
     }
 
     pub fn addon_registry(&self) -> &Registry {
-        &self.addons
+        self.addons
     }
 
     pub fn files(&self, channel_id: &str) -> Result<Vec<FileEntry>, String> {

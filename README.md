@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.15.0)
+## What works (0.16.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -90,9 +90,12 @@ everything after that is the design doc.
   and what it may touch. Every operation is an agent tool
   (`markdown_replace_section`, …), and the window's own edits go through the
   same operations; each is a commit and an Activity entry. Markdown is the
-  first add-on (Settings › Add-ons). Add-on logic is to run as WebAssembly
-  components behind the same editor interface; today Markdown's runs in the
-  core.
+  first add-on (Settings › Add-ons). An add-on's logic is a WebAssembly
+  module the app runs in a sandbox: it may import nothing (no files,
+  network or clock), and each call has 64 MB of memory and an instruction
+  budget. gild's own add-ons are built the same way: each is a crate under
+  `src-tauri/addons/<name>` that `build.rs` compiles to
+  `wasm32-unknown-unknown` (`rustup target add wasm32-unknown-unknown`).
 - **Permissions.** Every agent tool, gild's own and each add-on
   operation, can be turned on or off per agent: Settings › Agents › an
   agent › **Tools**. A tool that's off isn't offered to that agent, and a

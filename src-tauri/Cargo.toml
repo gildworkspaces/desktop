@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.15.0"
+version = "0.16.0"
 description = "gild: the open workspace where people and agents work together"
 license = "Apache-2.0"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -35,7 +35,9 @@ http = "1"
 # Line diffs of agents' proposed doc edits (Apache-2.0, pure Rust).
 similar = "2.7"
 tauri-plugin-notification = "2"
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
+wat = "1"

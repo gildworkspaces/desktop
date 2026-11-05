@@ -9,13 +9,17 @@
 //! so a file type works with agents, history and the shared view without its
 //! author doing anything more.
 //!
-//! gild's own file types are add-ons too, built against the same interface.
-//! Their logic runs in the core for now; third-party logic will run as a
-//! WebAssembly component behind this same `Editor` trait, reaching the
-//! network only through gild and only to the hosts its manifest names.
+//! An add-on's logic is a WebAssembly module (`WasmEditor`): it imports
+//! nothing, so it can't reach files, the network or the clock; each call
+//! has a memory limit and an instruction budget. gild's own file types are
+//! add-ons built the same way (`addons/<name>`, compiled by build.rs), so the
+//! app runs exactly what a third party would ship.
+
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +80,90 @@ struct Addon {
     editors: Vec<(String, Box<dyn Editor>)>,
 }
 
+impl Addon {
+    /// An add-on from its manifest and its module: the module edits every
+    /// file type the manifest names.
+    fn load(manifest: &str, module: &[u8]) -> Result<Addon, String> {
+        let manifest: Manifest = serde_json::from_str(manifest).map_err(|e| format!("its gild-addon.json: {e}"))?;
+        let editors = manifest
+            .contributes
+            .file_types
+            .iter()
+            .map(|t| WasmEditor::new(&manifest.name, module).map(|e| (t.id.clone(), Box::new(e) as Box<dyn Editor>)))
+            .collect::<Result<_, _>>()?;
+        Ok(Addon { manifest, editors })
+    }
+}
+
+/// How much an add-on call may use: memory, and instructions (wasmtime's
+/// fuel, about one per instruction).
+pub const ADDON_MEMORY: usize = 64 << 20;
+pub const ADDON_FUEL: u64 = 2_000_000_000;
+
+/// An editor that is a WebAssembly module, run in a sandbox: it may import
+/// nothing, and every call starts fresh, with ADDON_MEMORY and ADDON_FUEL.
+pub struct WasmEditor {
+    name: String,
+    engine: Engine,
+    module: Module,
+}
+
+impl WasmEditor {
+    pub fn new(name: &str, bytes: &[u8]) -> Result<WasmEditor, String> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).map_err(|e| format!("starting the add-on sandbox: {e}"))?;
+        let module = Module::new(&engine, bytes).map_err(|e| format!("{name} isn't a WebAssembly module gild can run: {e}"))?;
+        if let Some(i) = module.imports().next() {
+            return Err(format!("{name} asks for {}.{}; add-ons may import nothing (they reach the world only through gild).", i.module(), i.name()));
+        }
+        for export in ["memory", "gild_alloc", "gild_apply"] {
+            if module.get_export(export).is_none() {
+                return Err(format!("{name} has no `{export}`, which every add-on editor exports."));
+            }
+        }
+        Ok(WasmEditor { name: name.to_string(), engine, module })
+    }
+
+    fn call(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+        let limits = StoreLimitsBuilder::new().memory_size(ADDON_MEMORY).instances(1).build();
+        let mut store: Store<StoreLimits> = Store::new(&self.engine, limits);
+        store.limiter(|l| l);
+        store.set_fuel(ADDON_FUEL).map_err(|e| e.to_string())?;
+        let failed = |e: wasmtime::Error| {
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::OutOfFuel)) {
+                format!("The {} add-on took too long, so gild stopped it.", self.name)
+            } else {
+                format!("The {} add-on failed: {e}", self.name)
+            }
+        };
+        let instance = Instance::new(&mut store, &self.module, &[]).map_err(failed)?;
+        let memory = instance.get_memory(&mut store, "memory").ok_or("no memory")?;
+        let alloc = instance.get_typed_func::<i32, i32>(&mut store, "gild_alloc").map_err(failed)?;
+        let apply = instance.get_typed_func::<(i32, i32), i64>(&mut store, "gild_apply").map_err(failed)?;
+        let len = i32::try_from(request.len()).map_err(|_| "too big for an add-on".to_string())?;
+        let ptr = alloc.call(&mut store, len).map_err(failed)?;
+        memory.write(&mut store, ptr as u32 as usize, request).map_err(|e| format!("The {} add-on's memory: {e}", self.name))?;
+        let answer = apply.call(&mut store, (ptr, len)).map_err(failed)? as u64;
+        let (at, n) = ((answer >> 32) as usize, (answer & 0xffff_ffff) as usize);
+        let mut out = vec![0; n];
+        memory.read(&store, at, &mut out).map_err(|e| format!("The {} add-on's answer: {e}", self.name))?;
+        Ok(out)
+    }
+}
+
+impl Editor for WasmEditor {
+    fn apply(&self, text: &str, op: &str, args: &Value) -> Result<String, String> {
+        let request = serde_json::to_vec(&serde_json::json!({ "text": text, "op": op, "args": args })).map_err(|e| e.to_string())?;
+        let answer: Value = serde_json::from_slice(&self.call(&request)?).map_err(|e| format!("The {} add-on answered something gild can't read: {e}", self.name))?;
+        match (answer["ok"].as_str(), answer["err"].as_str()) {
+            (Some(text), _) => Ok(text.to_string()),
+            (_, Some(why)) => Err(why.to_string()),
+            _ => Err(format!("The {} add-on answered neither ok nor err.", self.name)),
+        }
+    }
+}
+
 pub struct Registry {
     addons: Vec<Addon>,
 }
@@ -87,11 +175,17 @@ pub struct ToolOp<'a> {
     pub op: &'a Operation,
 }
 
+static BUILT_IN: OnceLock<Registry> = OnceLock::new();
+
 impl Registry {
-    /// The add-ons that ship with gild.
-    pub fn built_in() -> Registry {
-        let markdown: Manifest = serde_json::from_str(include_str!("../addons/markdown/gild-addon.json")).expect("the markdown add-on's manifest is valid");
-        Registry { addons: vec![Addon { manifest: markdown, editors: vec![("markdown".into(), Box::new(Markdown))] }] }
+    /// The add-ons that ship with gild, loaded (and their modules compiled)
+    /// once.
+    pub fn built_in() -> &'static Registry {
+        BUILT_IN.get_or_init(|| {
+            let markdown = Addon::load(include_str!("../addons/markdown/gild-addon.json"), include_bytes!(env!("GILD_ADDON_MARKDOWN_WASM")))
+                .expect("the markdown add-on that ships with gild loads");
+            Registry { addons: vec![markdown] }
+        })
     }
 
     pub fn manifests(&self) -> Vec<&Manifest> {
@@ -162,88 +256,6 @@ pub fn glob(pattern: &str, path: &str) -> bool {
     }
 }
 
-/// gild's markdown editor.
-struct Markdown;
-
-fn heading(line: &str) -> Option<(usize, &str)> {
-    let level = line.chars().take_while(|c| *c == '#').count();
-    (1..=6).contains(&level).then(|| line[level..].strip_prefix(' ')).flatten().map(|t| (level, t.trim()))
-}
-
-fn arg<'a>(args: &'a Value, name: &str) -> &'a str {
-    args.get(name).and_then(Value::as_str).unwrap_or("")
-}
-
-impl Markdown {
-    /// The section under a heading: (heading line, first line after the section).
-    fn section(lines: &[&str], wanted: &str) -> Result<(usize, usize), String> {
-        let want = wanted.trim().trim_start_matches('#').trim().to_lowercase();
-        let (start, level) = lines
-            .iter()
-            .enumerate()
-            .find_map(|(i, l)| heading(l).filter(|(_, t)| t.to_lowercase() == want).map(|(lv, _)| (i, lv)))
-            .ok_or_else(|| {
-                let all: Vec<&str> = lines.iter().filter_map(|l| heading(l).map(|(_, t)| t)).collect();
-                format!("No heading “{wanted}” in this file. Its headings: {}.", if all.is_empty() { "none".into() } else { all.join(", ") })
-            })?;
-        let end = lines.iter().enumerate().skip(start + 1).find(|(_, l)| heading(l).is_some_and(|(lv, _)| lv <= level)).map(|(i, _)| i).unwrap_or(lines.len());
-        Ok((start, end))
-    }
-
-    fn join(before: &[&str], middle: &str, after: &[&str]) -> String {
-        let mut out = before.join("\n");
-        let middle = middle.trim_matches('\n');
-        if !middle.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(middle);
-        }
-        let rest = after.join("\n");
-        let rest = rest.trim_start_matches('\n');
-        if !rest.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(rest);
-        }
-        out.push('\n');
-        out
-    }
-}
-
-impl Editor for Markdown {
-    fn apply(&self, text: &str, op: &str, args: &Value) -> Result<String, String> {
-        let lines: Vec<&str> = text.lines().collect();
-        match op {
-            "replace_section" => {
-                let (start, end) = Self::section(&lines, arg(args, "heading"))?;
-                Ok(Self::join(&lines[..=start], arg(args, "text"), &lines[end..]))
-            }
-            "insert_after" => {
-                let (start, end) = Self::section(&lines, arg(args, "heading"))?;
-                let body = lines[start + 1..end].join("\n");
-                let body = body.trim_matches('\n');
-                let added = arg(args, "text").trim_matches('\n');
-                let middle = if body.is_empty() { added.to_string() } else { format!("{body}\n\n{added}") };
-                Ok(Self::join(&lines[..=start], &middle, &lines[end..]))
-            }
-            "replace_text" => {
-                let find = arg(args, "find");
-                match text.matches(find).count() {
-                    _ if find.is_empty() => Err("“find” is empty.".into()),
-                    1 => Ok(text.replacen(find, arg(args, "replace"), 1)),
-                    0 => Err("That text isn't in the file.".into()),
-                    n => Err(format!("That text appears {n} times; give more of it so it's found once.")),
-                }
-            }
-            "append" => {
-                let base = text.trim_end_matches('\n');
-                let added = arg(args, "text").trim_matches('\n');
-                Ok(if base.is_empty() { format!("{added}\n") } else { format!("{base}\n\n{added}\n") })
-            }
-            "set_text" => Ok(arg(args, "text").to_string()),
-            other => Err(format!("Markdown has no operation “{other}”.")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +272,31 @@ mod tests {
         let tools: Vec<String> = r.tools().into_iter().map(|t| t.tool).collect();
         assert_eq!(tools, ["markdown_replace_section", "markdown_insert_after", "markdown_replace_text", "markdown_append", "markdown_set_text"]);
         assert!(r.tool("markdown_replace_section").is_some_and(|t| t.op.params["required"] == json!(["heading", "text"])));
+    }
+
+    /// A module in the WebAssembly text format.
+    fn module(wat: &str) -> Vec<u8> {
+        wat::parse_str(wat).unwrap()
+    }
+
+    const SHELL: &str = r#"(memory (export "memory") 1)
+        (func (export "gild_alloc") (param i32) (result i32) (i32.const 1024))"#;
+
+    #[test]
+    fn add_ons_run_in_a_sandbox() {
+        // A module that asks for anything from outside is refused.
+        let importer = module(&format!(r#"(module (import "env" "open" (func)) {SHELL} (func (export "gild_apply") (param i32 i32) (result i64) (i64.const 0)))"#));
+        assert!(WasmEditor::new("Sneaky", &importer).err().unwrap().contains("asks for env.open"));
+        // One that runs for ever is stopped.
+        let spinner = module(&format!(r#"(module {SHELL} (func (export "gild_apply") (param i32 i32) (result i64) (loop (br 0)) (i64.const 0)))"#));
+        let e = WasmEditor::new("Spinner", &spinner).unwrap().apply("x", "op", &json!({})).unwrap_err();
+        assert_eq!(e, "The Spinner add-on took too long, so gild stopped it.");
+        // One that grabs memory past the limit is refused it.
+        let hog = module(&format!(r#"(module {SHELL} (func (export "gild_apply") (param i32 i32) (result i64)
+            (if (i32.lt_s (memory.grow (i32.const 2000)) (i32.const 0)) (then unreachable)) (i64.const 0)))"#));
+        assert!(WasmEditor::new("Hog", &hog).unwrap().apply("x", "op", &json!({})).unwrap_err().starts_with("The Hog add-on failed"));
+        // One without the interface is refused.
+        assert!(WasmEditor::new("Empty", &module("(module)")).err().unwrap().contains("no `memory`"));
     }
 
     #[test]

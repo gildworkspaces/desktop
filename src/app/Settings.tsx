@@ -206,6 +206,7 @@ function AddonsPage({ onPermissions }: { onPermissions: (id: string) => void }) 
         <div key={m.id} className="addon">
           <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span><span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span><span className="spacer" /><button className="ghost" onClick={() => onPermissions(m.id)}>Permissions</button></div>
           <p className="soft" style={{ margin: 0, fontSize: 13 }}>{m.description}</p>
+          <p className="faint" style={{ margin: 0, fontSize: 12 }}>Runs as a WebAssembly module in a sandbox: it reaches no files, network or clock except what gild hands it, with limits on memory and time.</p>
           {m.contributes.fileTypes.map(t => (
             <div key={t.id} className="addonpart">
               <span className="flabel">{t.name} files ({t.extensions.join(', ')})</span>

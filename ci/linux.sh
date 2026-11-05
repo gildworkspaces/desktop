@@ -8,6 +8,8 @@ apt() { apt-get update -qq && apt-get install -y -qq --no-install-recommends "$@
 rust() {
   curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --component clippy > /dev/null
   . "$HOME/.cargo/env"
+  # gild's own add-ons are WebAssembly modules, built with the app.
+  rustup target add wasm32-unknown-unknown > /dev/null
 }
 tauri_deps="build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev"
 case $job in
@@ -22,6 +24,7 @@ case $job in
     npm ci
     npm run build
     cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+    cargo clippy --locked --target wasm32-unknown-unknown --manifest-path src-tauri/addons/markdown/Cargo.toml -- -D warnings
     cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
     ;;
   app)
