@@ -2,48 +2,68 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
-import { AgentsSidebar, AccessPanel, ActivityPanel } from './Agents'
+import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
+import { UserCard, type SettingsSection } from './Profile'
+import { SettingsModal } from './Settings'
 import { MessageRow, ThreadPanel } from './Thread'
-import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { core, inApp, onChanged, mentionParts, tint, initial, clock, day, errorText, type Account, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
+import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
+
+/** What every screen needs: you, and a way to open Settings. */
+type Me = { profile: Profile; setProfile: (p: Profile) => void; settings: (s: SettingsSection) => void }
 
 export default function App() {
   const [ready, setReady] = useState<'checking' | 'app' | 'browser'>('checking')
-  const [account, setAccount] = useState<Account | null>(null)
+  const [profile, setProfile] = useState<Profile | null>(null)
   const [open, setOpen] = useState<Workspace | null>(null)
+  const [settings, setSettings] = useState<SettingsSection | null>(null)
+  // The open workspace's channels, for Settings' agent pages.
+  const [place, setPlace] = useState<{ channels: Channel[]; current: Channel | null }>({ channels: [], current: null })
   const [error, setError] = useState('')
 
   useEffect(() => {
     if (!inApp()) return setReady('browser')
     setReady('app')
-    core.account().then(setAccount, e => setError(errorText(e)))
+    core.profile().then(setProfile, e => setError(errorText(e)))
   }, [])
+  // The theme: "system" leaves it to the computer's setting.
+  useEffect(() => {
+    const root = document.documentElement
+    if (!profile || profile.theme === 'system') delete root.dataset.theme
+    else root.dataset.theme = profile.theme
+  }, [profile])
 
   if (ready === 'checking') return <main className="center" aria-busy="true" />
   if (ready === 'browser') return <main className="center"><p className="soft">This page is gild's desktop interface. Open it in the gild app.</p></main>
   if (error) return <main className="center"><p className="error">{error}</p></main>
-  if (!account) return <main className="center" aria-busy="true" />
-  return open
-    ? <WorkspaceView account={account} workspace={open} onBack={() => setOpen(null)} />
-    : <Home account={account} onOpen={setOpen} />
+  if (!profile) return <main className="center" aria-busy="true" />
+  const me: Me = { profile, setProfile, settings: setSettings }
+  return (
+    <>
+      {open
+        ? <WorkspaceView key={open.id} me={me} workspace={open} onPlace={setPlace} onBack={() => { setOpen(null); setPlace({ channels: [], current: null }) }} />
+        : <Home me={me} onOpen={setOpen} />}
+      {settings && (
+        <SettingsModal
+          section={settings}
+          profile={profile}
+          onProfile={setProfile}
+          workspace={open}
+          channels={place.channels}
+          current={place.current}
+          onImported={w => { setSettings(null); setOpen(w) }}
+          onClose={() => setSettings(null)}
+        />
+      )}
+    </>
+  )
 }
 
 function Logo({ size = 28 }: { size?: number }) {
   return <img src="/logo.svg" width={size} height={size} alt="" aria-hidden="true" />
 }
 
-function Who({ account }: { account: Account }) {
-  return (
-    <div className="who">
-      {account.demo && <span className="chip" title="Accounts arrive later. Everything is written as the demo account.">demo account</span>}
-      <div className="avatar person" aria-hidden="true">{initial(account.name)}</div>
-      <span>{account.name}</span>
-    </div>
-  )
-}
-
-function Home({ account, onOpen }: { account: Account; onOpen: (w: Workspace) => void }) {
+function Home({ me, onOpen }: { me: Me; onOpen: (w: Workspace) => void }) {
   const [list, setList] = useState<Workspace[] | null>(null)
   const [name, setName] = useState('')
   const [error, setError] = useState('')
@@ -64,7 +84,7 @@ function Home({ account, onOpen }: { account: Account; onOpen: (w: Workspace) =>
     <main className="home">
       <div className="topbar">
         <div className="brand"><Logo /><b>gild</b></div>
-        <Who account={account} />
+        <UserCard profile={me.profile} onProfile={me.setProfile} onSettings={me.settings} placement="down" />
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         <h1>Workspaces</h1>
@@ -115,76 +135,59 @@ function ImportWorkspace({ onImported }: { onImported: (w: Workspace) => void })
   )
 }
 
-function WorkspaceView({ account, workspace, onBack }: { account: Account; workspace: Workspace; onBack: () => void }) {
+function WorkspaceView({ me, workspace, onPlace, onBack }: {
+  me: Me; workspace: Workspace; onPlace: (p: { channels: Channel[]; current: Channel | null }) => void; onBack: () => void
+}) {
   const [channels, setChannels] = useState<Channel[]>([])
   const [current, setCurrent] = useState<Channel | null>(null)
-  const [newName, setNewName] = useState('')
+  const [naming, setNaming] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
     core.channels(workspace.id).then(cs => { setChannels(cs); setCurrent(cs[0] ?? null) }, e => setError(errorText(e)))
   }, [workspace.id])
-
-  async function addChannel(e: React.FormEvent) {
-    e.preventDefault()
-    setError('')
-    try {
-      const c = await core.createChannel(workspace.id, newName)
-      setChannels(cs => [...cs, c])
-      setCurrent(c)
-      setNewName('')
-    } catch (err) { setError(errorText(err)) }
-  }
+  useEffect(() => { onPlace({ channels, current }) }, [channels, current, onPlace])
 
   return (
     <div className="ws">
       <nav className="side" aria-label="Channels">
-        <button className="back" onClick={onBack}>← All workspaces</button>
-        <div className="wsname">
-          <div className="tile" style={{ background: tint(workspace.name) }} aria-hidden="true">{initial(workspace.name)}</div>
-          <span>{workspace.name}</span>
+        <div className="sidescroll">
+          <button className="back" onClick={onBack}>← All workspaces</button>
+          <div className="wsname">
+            <div className="tile" style={{ background: tint(workspace.name) }} aria-hidden="true">{initial(workspace.name)}</div>
+            <span>{workspace.name}</span>
+          </div>
+          <div className="group">
+            <div className="grouphead"><span className="label">Channels</span><PlusButton label="Create a channel" onClick={() => setNaming(true)} /></div>
+            {channels.map(c => (
+              <button key={c.id} className={c.id === current?.id ? 'chan on' : 'chan'} onClick={() => setCurrent(c)} aria-current={c.id === current?.id ? 'page' : undefined}>
+                <span className="hash" aria-hidden="true">#</span>{c.name}
+              </button>
+            ))}
+            {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
+          </div>
+          <MembersGroup profile={me.profile} channels={channels} current={current} />
         </div>
-        <div className="group">
-          <span className="label">Channels</span>
-          {channels.map(c => (
-            <button key={c.id} className={c.id === current?.id ? 'chan on' : 'chan'} onClick={() => setCurrent(c)} aria-current={c.id === current?.id ? 'page' : undefined}>
-              <span className="hash" aria-hidden="true">#</span>{c.name}
-            </button>
-          ))}
-          <form className="addchan" onSubmit={addChannel}>
-            <label htmlFor="new-channel" className="label" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>New channel</label>
-            <input id="new-channel" className="field" placeholder="+ new channel" value={newName} onChange={e => setNewName(e.target.value)} />
-          </form>
-          {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
-        </div>
-        <div className="group">
-          <span className="label">Members</span>
-          <div className="member"><span className="dot" aria-hidden="true" />{account.name} (you)</div>
-        </div>
-        <AgentsSidebar channels={channels} current={current} />
-        <ExportWorkspace workspace={workspace} />
-        <div className="foot"><Who account={account} /></div>
+        <div className="foot"><UserCard profile={me.profile} onProfile={me.setProfile} onSettings={me.settings} /></div>
       </nav>
       {current ? <ChannelView key={current.id} channel={current} /> : <main className="channel" />}
-    </div>
-  )
-}
-
-
-function ExportWorkspace({ workspace }: { workspace: Workspace }) {
-  const [state, setState] = useState<{ busy: boolean; path?: string; error?: string }>({ busy: false })
-  async function run() {
-    setState({ busy: true })
-    try { setState({ busy: false, path: await core.exportWorkspace(workspace.id) }) } catch (e) { setState({ busy: false, error: errorText(e) }) }
-  }
-  return (
-    <div className="group exportbox">
-      <button className="ghost" onClick={run} disabled={state.busy}>{state.busy ? 'Exporting…' : 'Export workspace'}</button>
-      <p className="note">A folder of open files: chat as markdown, tables as CSV, full history as git, and a page that browses it all offline.</p>
-      {state.path && (
-        <p className="note">Saved to <span className="mono">{state.path.split('/').slice(-2).join('/')}</span>. <button className="link" onClick={() => revealItemInDir(state.path!)}>Show in Finder</button></p>
+      {naming && (
+        <NameModal
+          title="Create a channel"
+          label="Name"
+          hint="Lower case, with dashes: “Student Intake” becomes #student-intake."
+          action="Create channel"
+          id="channel-name"
+          extra={{ id: 'channel-topic', label: 'Topic (optional)', placeholder: 'What this channel is for' }}
+          onSubmit={async (name, topic) => {
+            const c = await core.createChannel(workspace.id, name, topic)
+            setChannels(cs => [...cs, c])
+            setCurrent(c)
+            setNaming(false)
+          }}
+          onClose={() => setNaming(false)}
+        />
       )}
-      {state.error && <p className="error" style={{ padding: '0 10px' }}>{state.error}</p>}
     </div>
   )
 }

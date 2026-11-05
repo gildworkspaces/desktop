@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.10.0)
+## What works (0.11.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -76,8 +76,18 @@ everything after that is the design doc.
   `history.git`). Imported chat keeps its authors and times and wakes no
   one. A test exports, imports and exports again, and checks the two
   exports match.
-- A built-in **demo account**. Accounts and sign-in come later; until then
-  everything is written as "Demo".
+- **You.** Your card sits at the bottom of the sidebar: picture, name and
+  status. Clicking it opens your profile (banner, picture, name, About me)
+  with **Edit Profile**, your status (Online, Idle, Do Not Disturb,
+  Invisible) and the way into **Settings**. Your display name is what new
+  messages and changes are written under ("Demo" until you change it).
+  Accounts and sign-in come later.
+- **Settings** is a two-column window: *Personal* (My Profile), *App*
+  (Appearance: system, light or dark; Agents: every agent, its settings,
+  adding one, the agent endpoint) and the open workspace (Export and
+  import). The sidebar keeps only the workspace, its channels and its
+  members; **+** beside Channels and Members creates a channel or adds an
+  agent.
 
 The first run creates a "Demo workspace" with #general.
 

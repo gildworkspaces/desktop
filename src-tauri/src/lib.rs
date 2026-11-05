@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Store, Workspace, DEMO_NAME};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Profile, Store, Workspace};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -25,14 +25,40 @@ fn with<T>(core: &State<Core>, f: impl FnOnce(&Store) -> Result<T, String>) -> R
 
 #[derive(Serialize)]
 struct Account {
-    name: &'static str,
+    name: String,
     /// True until real accounts exist: everything is written as the demo account.
     demo: bool,
 }
 
 #[tauri::command]
-fn account() -> Account {
-    Account { name: DEMO_NAME, demo: true }
+fn account(core: State<Core>) -> Result<Account, String> {
+    Ok(Account { name: with(&core, |s| s.me())?, demo: true })
+}
+
+#[tauri::command]
+fn profile(core: State<Core>) -> Result<Profile, String> {
+    with(&core, |s| s.profile())
+}
+
+#[tauri::command]
+fn save_profile(core: State<Core>, name: String, bio: String, picture: Option<String>, banner: String) -> Result<Profile, String> {
+    with(&core, |s| s.save_profile(&name, &bio, picture.as_deref(), &banner))
+}
+
+#[tauri::command]
+fn set_status(core: State<Core>, status: String) -> Result<Profile, String> {
+    with(&core, |s| s.set_status(&status))
+}
+
+#[tauri::command]
+fn set_theme(core: State<Core>, theme: String) -> Result<Profile, String> {
+    with(&core, |s| s.set_theme(&theme))
+}
+
+/// The app's version, for Settings.
+#[tauri::command]
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 #[tauri::command]
@@ -62,7 +88,7 @@ fn messages(core: State<Core>, channel_id: String) -> Result<Vec<Message>, Strin
 
 #[tauri::command]
 fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<Message, String> {
-    with(&core, |s| s.post(&channel_id, DEMO_NAME, "person", &body))
+    with(&core, |s| s.post(&channel_id, &s.me()?, "person", &body))
 }
 
 /// A thread: the message it hangs off, then its replies.
@@ -73,7 +99,7 @@ fn thread(core: State<Core>, channel_id: String, thread_id: String) -> Result<Ve
 
 #[tauri::command]
 fn send_reply(core: State<Core>, channel_id: String, thread_id: String, body: String) -> Result<Message, String> {
-    with(&core, |s| s.post_in(&channel_id, Some(&thread_id), DEMO_NAME, "person", &body))
+    with(&core, |s| s.post_in(&channel_id, Some(&thread_id), &s.me()?, "person", &body))
 }
 
 #[tauri::command]
@@ -83,12 +109,12 @@ fn channel_data(core: State<Core>, channel_id: String) -> Result<ChannelData, St
 
 #[tauri::command]
 fn set_view(core: State<Core>, channel_id: String, fields: Vec<String>, statuses: Vec<String>) -> Result<ChannelData, String> {
-    with(&core, |s| s.set_view(&channel_id, DEMO_NAME, &fields, &statuses))
+    with(&core, |s| s.set_view(&channel_id, &s.me()?, &fields, &statuses))
 }
 
 #[tauri::command]
 fn add_record(core: State<Core>, channel_id: String, title: String, status: String, fields: BTreeMap<String, String>) -> Result<Record, String> {
-    with(&core, |s| s.add_record(&channel_id, DEMO_NAME, &title, &status, fields))
+    with(&core, |s| s.add_record(&channel_id, &s.me()?, &title, &status, fields))
 }
 
 #[tauri::command]
@@ -100,7 +126,7 @@ fn update_record(
     status: String,
     fields: BTreeMap<String, String>,
 ) -> Result<Record, String> {
-    with(&core, |s| s.update_record(&channel_id, DEMO_NAME, &record_id, &title, &status, fields))
+    with(&core, |s| s.update_record(&channel_id, &s.me()?, &record_id, &title, &status, fields))
 }
 
 #[tauri::command]
@@ -115,12 +141,12 @@ fn channel_docs(core: State<Core>, channel_id: String) -> Result<ChannelDocs, St
 
 #[tauri::command]
 fn create_doc(core: State<Core>, channel_id: String, title: String) -> Result<Doc, String> {
-    with(&core, |s| s.create_doc(&channel_id, DEMO_NAME, &title))
+    with(&core, |s| s.create_doc(&channel_id, &s.me()?, &title))
 }
 
 #[tauri::command]
 fn save_doc(core: State<Core>, channel_id: String, path: String, body: String) -> Result<Doc, String> {
-    with(&core, |s| s.save_doc(&channel_id, DEMO_NAME, &path, &body))
+    with(&core, |s| s.save_doc(&channel_id, &s.me()?, &path, &body))
 }
 
 #[tauri::command]
@@ -131,7 +157,7 @@ fn doc_history(core: State<Core>, channel_id: String, path: String) -> Result<Ve
 #[tauri::command]
 fn approve_proposal(core: State<Core>, channel_id: String, id: String) -> Result<ChannelDocs, String> {
     with(&core, |s| {
-        s.approve_proposal(&channel_id, DEMO_NAME, &id)?;
+        s.approve_proposal(&channel_id, &s.me()?, &id)?;
         s.channel_docs(&channel_id)
     })
 }
@@ -139,7 +165,7 @@ fn approve_proposal(core: State<Core>, channel_id: String, id: String) -> Result
 #[tauri::command]
 fn reject_proposal(core: State<Core>, channel_id: String, id: String) -> Result<ChannelDocs, String> {
     with(&core, |s| {
-        s.reject_proposal(&channel_id, DEMO_NAME, &id)?;
+        s.reject_proposal(&channel_id, &s.me()?, &id)?;
         s.channel_docs(&channel_id)
     })
 }
@@ -243,7 +269,7 @@ async fn remove_agent(core: State<'_, Core>, agent_id: String) -> Result<Vec<Age
         here.disconnect(kind, &agent.name).await;
     }
     with(&core, |s| {
-        s.remove_agent(&agent_id, DEMO_NAME)?;
+        s.remove_agent(&agent_id, &s.me()?)?;
         s.agent_infos()
     })
 }
@@ -256,7 +282,7 @@ fn channel_access(core: State<Core>, channel_id: String) -> Result<Vec<AgentAcce
 #[tauri::command]
 fn set_access(core: State<Core>, channel_id: String, agent_id: String, access: Option<Access>) -> Result<Vec<AgentAccess>, String> {
     with(&core, |s| {
-        s.set_access(&channel_id, DEMO_NAME, &agent_id, access)?;
+        s.set_access(&channel_id, &s.me()?, &agent_id, access)?;
         s.channel_access(&channel_id)
     })
 }
@@ -313,6 +339,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             account,
+            profile,
+            save_profile,
+            set_status,
+            set_theme,
+            version,
             workspaces,
             create_workspace,
             channels,

@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS agent_wake (agent_id TEXT PRIMARY KEY, command TEXT N
 CREATE TABLE IF NOT EXISTS agent_context (agent_id TEXT PRIMARY KEY, messages INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_replies (message_id TEXT PRIMARY KEY, root_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
 
@@ -45,6 +46,28 @@ pub const DB_FILE: &str = "gild.db";
 
 /// The account everything is written as until real accounts exist.
 pub const DEMO_NAME: &str = "Demo";
+
+/// The person using this computer, as others see them, and how they want
+/// the app to look.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub bio: String,
+    /// A small picture as a data: URL, made in the window.
+    pub picture: Option<String>,
+    pub banner: String,
+    /// online, idle, dnd or invisible.
+    pub status: String,
+    /// system, light or dark.
+    pub theme: String,
+}
+
+pub const STATUSES: [&str; 4] = ["online", "idle", "dnd", "invisible"];
+pub const THEMES: [&str; 3] = ["system", "light", "dark"];
+pub const BANNERS: [&str; 6] = ["#f38020", "#3b6fd8", "#2f8f62", "#a2509a", "#c2410c", "#4a4d55"];
+pub const MAX_BIO: usize = 190;
+/// A data: URL for a picture the window has already made small.
+pub const MAX_PICTURE: usize = 300_000;
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Workspace {
@@ -1273,6 +1296,75 @@ pub fn mentioned_names(text: &str) -> Vec<String> {
 const MAX_WAKE_COMMAND: usize = 1000;
 
 impl Store {
+    fn setting(&self, key: &str) -> Result<Option<String>, String> {
+        Ok(self.query("SELECT value FROM profile WHERE key = ?1", &[Value::from_text(key.to_string())])?.first().map(|r| text(&r[0])))
+    }
+
+    fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), String> {
+        let k = Value::from_text(key.to_string());
+        self.run("DELETE FROM profile WHERE key = ?1", std::slice::from_ref(&k))?;
+        if let Some(v) = value {
+            self.run("INSERT INTO profile (key, value) VALUES (?1, ?2)", &[k, Value::from_text(v.to_string())])?;
+        }
+        Ok(())
+    }
+
+    pub fn profile(&self) -> Result<Profile, String> {
+        Ok(Profile {
+            name: self.setting("name")?.unwrap_or_else(|| DEMO_NAME.to_string()),
+            bio: self.setting("bio")?.unwrap_or_default(),
+            picture: self.setting("picture")?,
+            banner: self.setting("banner")?.unwrap_or_else(|| BANNERS[0].to_string()),
+            status: self.setting("status")?.unwrap_or_else(|| "online".into()),
+            theme: self.setting("theme")?.unwrap_or_else(|| "system".into()),
+        })
+    }
+
+    /// The name new messages and commits are written under.
+    pub fn me(&self) -> Result<String, String> {
+        Ok(self.profile()?.name)
+    }
+
+    pub fn save_profile(&self, name: &str, bio: &str, picture: Option<&str>, banner: &str) -> Result<Profile, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 40 {
+            return Err("A display name has 1 to 40 characters.".into());
+        }
+        let bio = bio.trim();
+        if bio.chars().count() > MAX_BIO {
+            return Err(format!("About me is at most {MAX_BIO} characters."));
+        }
+        if let Some(p) = picture {
+            if !p.starts_with("data:image/") || p.len() > MAX_PICTURE {
+                return Err("That picture can't be used; choose another.".into());
+            }
+        }
+        if !BANNERS.contains(&banner) {
+            return Err("Pick one of the banner colours.".into());
+        }
+        self.set_setting("name", Some(name))?;
+        self.set_setting("bio", (!bio.is_empty()).then_some(bio))?;
+        self.set_setting("picture", picture)?;
+        self.set_setting("banner", Some(banner))?;
+        self.profile()
+    }
+
+    pub fn set_status(&self, status: &str) -> Result<Profile, String> {
+        if !STATUSES.contains(&status) {
+            return Err("Unknown status.".into());
+        }
+        self.set_setting("status", Some(status))?;
+        self.profile()
+    }
+
+    pub fn set_theme(&self, theme: &str) -> Result<Profile, String> {
+        if !THEMES.contains(&theme) {
+            return Err("Unknown theme.".into());
+        }
+        self.set_setting("theme", Some(theme))?;
+        self.profile()
+    }
+
     /// What rings when an agent is mentioned.
     pub fn signals(&self) -> Signals {
         self.signals.clone()
@@ -2011,6 +2103,31 @@ mod tests {
         assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("@ava one more thing", false)]);
         store.post_in(&general.id, Some(&root.id), "ava", "agent", "@bob your turn").unwrap();
         assert_eq!(store.take_mentions(&bob).unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_profile_is_kept_and_checked() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let p = store.profile().unwrap();
+        assert_eq!((p.name.as_str(), p.status.as_str(), p.theme.as_str(), p.picture), (DEMO_NAME, "online", "system", None));
+        store.save_profile("Sami Fouad", "Building gild.", Some("data:image/png;base64,AAAA"), "#3b6fd8").unwrap();
+        store.set_status("dnd").unwrap();
+        store.set_theme("light").unwrap();
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        let p = store.profile().unwrap();
+        assert_eq!((p.name.as_str(), p.bio.as_str(), p.banner.as_str(), p.status.as_str(), p.theme.as_str()), ("Sami Fouad", "Building gild.", "#3b6fd8", "dnd", "light"));
+        assert_eq!(store.me().unwrap(), "Sami Fouad");
+        assert!(store.save_profile("  ", "", None, "#3b6fd8").is_err());
+        assert!(store.save_profile("x", &"y".repeat(MAX_BIO + 1), None, "#3b6fd8").is_err());
+        assert!(store.save_profile("x", "", Some("javascript:alert(1)"), "#3b6fd8").is_err());
+        assert!(store.save_profile("x", "", None, "red").is_err());
+        assert!(store.set_status("away").is_err() && store.set_theme("blue").is_err());
+        // Removing the picture.
+        assert_eq!(store.save_profile("Sami", "", None, "#f38020").unwrap().picture, None);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
