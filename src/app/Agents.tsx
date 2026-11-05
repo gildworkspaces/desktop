@@ -3,7 +3,7 @@
 // the members list, Settings' agents page, what an agent may do in a
 // channel, and what agents did there.
 import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type Profile, type ToolInfo } from '@/lib/core'
+import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type ModelInfo, type Profile, type ProviderInfo, type ToolInfo } from '@/lib/core'
 import { Avatar } from './Profile'
 
 /** Tell every agents list in the window that the agents changed. */
@@ -124,6 +124,58 @@ export function MembersGroup({ profile, channels, current, onOpenAgent }: { prof
   )
 }
 
+/** Running an agent on a cloud provider: the provider, then its model. */
+function CloudSetup({ agent, onAgents, onSaved }: { agent: Agent; onAgents: (a: Agent[]) => void; onSaved: () => void }) {
+  const [providers, setProviders] = useState<ProviderInfo[] | null>(null)
+  const [provider, setProvider] = useState(agent.runner?.provider ?? 'workers-ai')
+  const [models, setModels] = useState<ModelInfo[] | null>(null)
+  const [model, setModel] = useState(agent.runner?.model ?? '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { core.providers().then(setProviders, e => setError(errorText(e))) }, [])
+  const chosen = providers?.find(p => p.id === provider)
+  const ready = !!chosen?.account_id && !!chosen?.has_token
+  useEffect(() => {
+    if (!ready) return
+    setModels(null)
+    core.providerModels(provider).then(ms => { setModels(ms); if (!model) setModel(ms.find(m => m.tools)?.id ?? '') }, e => setError(errorText(e)))
+  }, [ready, provider]) // eslint-disable-line react-hooks/exhaustive-deps
+  const picked = models?.find(m => m.id === model)
+  async function save() {
+    setBusy(true)
+    setError('')
+    try { onAgents(await core.setRunner(agent.id, { provider, model })); onSaved() } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+  }
+  return (
+    <div className="stepform">
+      <p className="soft">gild calls the provider’s model when {agent.name} is mentioned, and runs the tools it asks for here, with the same switches and Activity as any agent. The provider never connects to this computer.</p>
+      <label htmlFor="provider" className="flabel">Provider</label>
+      <select id="provider" className="field" value={provider} onChange={e => { setProvider(e.target.value); setModel('') }}>
+        {providers?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+      </select>
+      {providers && !ready && <p className="faint hint">{chosen?.name ?? 'This provider'} isn’t set up yet: add your account ID and API token in Settings › Providers.</p>}
+      {ready && (
+        <>
+          <label htmlFor="model" className="flabel">Model</label>
+          {!models && !error && <p className="faint">Loading the models…</p>}
+          {models && (
+            <select id="model" className="field" value={model} onChange={e => setModel(e.target.value)}>
+              <optgroup label="Can use tools">{models.filter(m => m.tools).map(m => <option key={m.id} value={m.id}>{m.id}</option>)}</optgroup>
+              <optgroup label="Can only answer (no tools)">{models.filter(m => !m.tools).map(m => <option key={m.id} value={m.id}>{m.id}</option>)}</optgroup>
+            </select>
+          )}
+          {picked && <p className="faint hint">{picked.description}{picked.tools ? '' : ' It can’t use gild’s tools: it can only answer, and gild posts its answer.'}</p>}
+          <div className="row">
+            <button className="primary" onClick={save} disabled={busy || !model}>{busy ? 'Saving…' : agent.runner ? 'Save' : 'Run in the cloud'}</button>
+            {agent.runner && <button className="ghost" onClick={async () => { setBusy(true); try { onAgents(await core.setRunner(agent.id, null)); onSaved() } catch (e) { setError(errorText(e)) } finally { setBusy(false) } }}>Run on this computer instead</button>}
+          </div>
+        </>
+      )}
+      {error && <p className="error">{error}</p>}
+    </div>
+  )
+}
+
 /** A labelled on/off switch. */
 export function Toggle({ id, label, hint, on, onChange, disabled }: { id: string; label: string; hint?: string; on: boolean; onChange: (on: boolean) => void; disabled?: boolean }) {
   return (
@@ -188,7 +240,7 @@ export function AgentsSettings({ channels, current, onOpenAgent }: { channels: C
             <div key={a.id} className="srow agentline">
               <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b>{a.coordinator && <span className="tag">coordinator</span>}</span>
               <span className="soft">{channels.length > 0 ? `${where[a.id] ?? 0} ${(where[a.id] ?? 0) === 1 ? 'channel' : 'channels'} here` : ''}</span>
-              <span className="soft">{a.wake ? 'wakes on @' : 'not woken'}</span>
+              <span className="soft">{a.runner ? `cloud · ${a.runner.model.split('/').pop()}` : a.wake ? 'wakes on @' : 'not woken'}</span>
               <button className="ghost" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>Settings</button>
             </div>
           ))}
@@ -234,6 +286,8 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
   page?: Exclude<Step, 'done'>
 }) {
   const [ownStep, setStep] = useState<Step>(page ?? 'connect')
+  // Where the agent's model runs: this computer (the default) or a cloud provider.
+  const [runsOn, setRunsOn] = useState<'here' | 'cloud'>(agent.runner ? 'cloud' : 'here')
   const step = page ?? ownStep
   const [clients, setClients] = useState<ClientStatus[] | null>(null)
   const [chosen, setChosen] = useState<Set<string>>(new Set())
@@ -332,6 +386,11 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
 
         {step === 'connect' && (
           <>
+            <div className="seg" role="radiogroup" aria-label="Where it runs">
+              <button role="radio" aria-checked={runsOn === 'here'} className={runsOn === 'here' ? 'on' : ''} onClick={() => setRunsOn('here')}>This computer</button>
+              <button role="radio" aria-checked={runsOn === 'cloud'} className={runsOn === 'cloud' ? 'on' : ''} onClick={() => setRunsOn('cloud')}>Cloud</button>
+            </div>
+            {runsOn === 'cloud' ? <CloudSetup agent={agent} onAgents={onAgents} onSaved={() => { if (fresh) go('channels'); else setSaved('Saved.') }} /> : <>
             <p className="soft">gild adds {agent.name} to the AI tools on this computer, so they can work in the channels you share. Nothing to copy or paste.</p>
             {!clients && <p className="faint">Looking for AI tools on this computer…</p>}
             {clients && (
@@ -380,6 +439,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
                 </>
               )}
             </details>
+          </>}
           </>
         )}
 

@@ -48,7 +48,7 @@ fn schema(v: Value) -> Arc<Map<String, Value>> {
     }
 }
 
-fn tools() -> Vec<Tool> {
+pub(crate) fn tools() -> Vec<Tool> {
     let channel = json!({ "type": "string", "description": "The channel's id, from list_channels." });
     let mut tools = vec![
         Tool::new(
@@ -470,56 +470,66 @@ impl ServerHandler for Gild {
 
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.clone().unwrap_or_default();
-        // A tool turned off for this agent is refused, and the refusal logged.
-        {
+        let agent = {
             let store = self.core.lock().map_err(|_| ErrorData::internal_error("the workspace database is unavailable", None))?;
-            if let Ok(Some(Some(agent))) = bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
-                if !store.tool_allowed(&agent.id, &request.name).map_err(|e| ErrorData::internal_error(e, None))? {
-                    let why = format!("{} isn't allowed to use {} (Settings › Agents › {} › Tools).", agent.name, request.name, agent.name);
-                    let channel = args.get("channel_id").and_then(Value::as_str).unwrap_or("");
-                    store.audit(&agent, &request.name, channel, &why, false).map_err(|e| ErrorData::internal_error(e, None))?;
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(why)]).into());
-                }
-            }
-        }
-        if request.name == "wait_for_mentions" {
-            return self.wait_for_mentions(&args, &context).await;
-        }
-        let outcome = {
-            let store = self.core.lock().map_err(|_| ErrorData::internal_error("the workspace database is unavailable", None))?;
-            let agent = match bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
+            match bearer(&context).map(|t| store.agent_for_token(&t)).transpose() {
                 Ok(Some(Some(agent))) => agent,
                 Ok(_) => return Ok(no_token()),
                 Err(e) => return Err(ErrorData::internal_error(e, None)),
-            };
-            let result = self.run(&store, &agent, &request.name, &args);
+            }
+        };
+        if request.name == "wait_for_mentions" {
+            if let Err(why) = self.allowed(&agent, &request.name, &args) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(why)]).into());
+            }
+            return self.wait_for_mentions(&args, &context).await;
+        }
+        match self.call_as(&agent, &request.name, &args).await {
+            Ok(answer) => Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&answer).unwrap_or_default())]).into()),
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into()),
+        }
+    }
+}
+
+impl Gild {
+    /// Whether an agent may use a tool; a refusal is logged.
+    fn allowed(&self, agent: &Agent, name: &str, args: &Map<String, Value>) -> Result<(), String> {
+        let store = self.core.lock().map_err(|_| "the workspace database is unavailable".to_string())?;
+        if store.tool_allowed(&agent.id, name)? {
+            return Ok(());
+        }
+        let why = format!("{} isn't allowed to use {name} (Settings › Agents › {} › Tools).", agent.name, agent.name);
+        store.audit(agent, name, args.get("channel_id").and_then(Value::as_str).unwrap_or(""), &why, false)?;
+        Err(why)
+    }
+
+    /// One tool call as an agent: refused if the tool is off for it, run
+    /// through the store, logged, paced when it moves the view, and the
+    /// window told. The MCP endpoint and cloud providers both go through
+    /// here, so an agent is the same agent wherever its model runs.
+    pub async fn call_as(&self, agent: &Agent, name: &str, args: &Map<String, Value>) -> Result<Value, String> {
+        self.allowed(agent, name, args)?;
+        let outcome = {
+            let store = self.core.lock().map_err(|_| "the workspace database is unavailable".to_string())?;
+            let result = self.run(&store, agent, name, args);
             let channel = args.get("channel_id").and_then(Value::as_str).unwrap_or("");
             let detail = match &result {
-                Ok(_) => ["summary", "query", "title", "path", "text"]
-                    .iter()
-                    .find_map(|k| args.get(*k).and_then(Value::as_str))
-                    .unwrap_or("")
-                    .to_string(),
+                Ok(_) => ["summary", "query", "title", "path", "text"].iter().find_map(|k| args.get(*k).and_then(Value::as_str)).unwrap_or("").to_string(),
                 Err(e) => e.clone(),
             };
-            store.audit(&agent, &request.name, channel, &detail, result.is_ok()).map_err(|e| ErrorData::internal_error(e, None))?;
+            store.audit(agent, name, channel, &detail, result.is_ok())?;
             result
         };
         // Moves in the shared view, and edits, go at a pace people can follow.
-        let paced = PACED.contains(&request.name.as_ref()) || Registry::built_in().tool(&request.name).is_some();
+        let paced = PACED.contains(&name) || Registry::built_in().tool(name).is_some();
         if outcome.is_ok() && paced {
             tokio::time::sleep(std::time::Duration::from_millis(PACE_MS)).await;
         }
-        match outcome {
-            Ok((changed, answer)) => {
-                if let (Some(app), Some(channel)) = (&self.app, changed) {
-                    let _ = app.emit("gild://changed", channel);
-                }
-                let text = serde_json::to_string_pretty(&answer).unwrap_or_default();
-                Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
-            }
-            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into()),
+        let (changed, answer) = outcome?;
+        if let (Some(app), Some(channel)) = (&self.app, changed) {
+            let _ = app.emit("gild://changed", channel);
         }
+        Ok(answer)
     }
 }
 

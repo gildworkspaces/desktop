@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::addons::{Manifest, Registry};
+use crate::providers;
 use crate::records::FileEntry;
 use crate::view::{Actor, Nav, ViewState};
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS agent_tools (agent_id TEXT NOT NULL, tool TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (agent_id, tool));
 CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, granted INTEGER NOT NULL, PRIMARY KEY (addon_id, kind, value));
+CREATE TABLE IF NOT EXISTS agent_runner (agent_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS held_mentions (mention_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, root TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
@@ -160,6 +162,8 @@ pub struct Store {
     /// Each channel's shared view (in memory: it's what's on screen now).
     views: std::sync::Mutex<HashMap<String, ViewState>>,
     addons: &'static Registry,
+    secrets: Box<dyn providers::Secrets>,
+    provider_base: String,
 }
 
 /// A channel's view: its state and the files it shows.
@@ -254,7 +258,10 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in() };
+        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in(),
+            // Tests never touch the real keychain.
+            secrets: if cfg!(test) { Box::new(providers::InMemory::default()) } else { Box::new(providers::Keychain) },
+            provider_base: providers::WORKERS_AI_BASE.into() };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
@@ -1065,6 +1072,7 @@ impl Store {
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_tools WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_runner WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM held_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
@@ -1328,6 +1336,32 @@ pub struct AgentInfo {
     /// person's (they reset the run of agent messages and reach agents in
     /// its threads untagged).
     pub coordinator: bool,
+    /// Runs on a cloud provider's model instead of a command on this computer.
+    pub runner: Option<Runner>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Runner {
+    pub provider: String,
+    pub model: String,
+}
+
+/// How an agent is woken.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Wake {
+    /// A command on this computer, with the prompt on stdin.
+    Command(String),
+    /// A provider's model, called by gild.
+    Provider(Runner),
+}
+
+/// A cloud provider as Settings shows it (never its token).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ProviderInfo {
+    pub id: String,
+    pub name: String,
+    pub account_id: Option<String>,
+    pub has_token: bool,
 }
 
 /// Recent messages sent with a mention, unless the agent's settings say
@@ -1852,20 +1886,97 @@ impl Store {
     }
 
     /// Agents with a command to run when mentioned, and mentions waiting.
-    pub fn agents_to_wake(&self) -> Result<Vec<(Agent, String)>, String> {
+    /// Agents with a way to be woken (a provider's model, else a command)
+    /// and mentions waiting.
+    pub fn agents_to_wake(&self) -> Result<Vec<(Agent, Wake)>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command FROM agents a JOIN agent_wake k ON k.agent_id = a.id
-             WHERE EXISTS (SELECT 1 FROM mentions n WHERE n.agent_id = a.id AND n.delivered_at = 0
+            "SELECT a.id, a.name, a.created_at, k.command, p.provider, p.model FROM agents a
+             LEFT JOIN agent_wake k ON k.agent_id = a.id LEFT JOIN agent_runner p ON p.agent_id = a.id
+             WHERE (k.command IS NOT NULL OR p.provider IS NOT NULL)
+               AND EXISTS (SELECT 1 FROM mentions n WHERE n.agent_id = a.id AND n.delivered_at = 0
                AND NOT EXISTS (SELECT 1 FROM held_mentions h WHERE h.mention_id = n.id)) ORDER BY a.created_at",
             &[],
         )?;
-        Ok(rows.iter().map(|r| (Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }, text(&r[3]))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let agent = Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) };
+                let how = match &r[4] {
+                    Value::Null => Wake::Command(text(&r[3])),
+                    p => Wake::Provider(Runner { provider: text(p), model: text(&r[5]) }),
+                };
+                (agent, how)
+            })
+            .collect())
+    }
+
+    /// Run an agent on a provider's model (None: back to this computer).
+    pub fn set_runner(&self, agent_id: &str, runner: Option<&Runner>) -> Result<(), String> {
+        self.agent(agent_id)?;
+        let id = Value::from_text(agent_id.to_string());
+        self.run("DELETE FROM agent_runner WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        if let Some(r) = runner {
+            if r.provider != providers::WORKERS_AI {
+                return Err("Unknown provider.".into());
+            }
+            if r.model.trim().is_empty() {
+                return Err("Pick a model.".into());
+            }
+            self.run("INSERT INTO agent_runner (agent_id, provider, model) VALUES (?1, ?2, ?3)", &[id, Value::from_text(r.provider.clone()), Value::from_text(r.model.trim().to_string())])?;
+            self.signals.runner.notify_one();
+        }
+        Ok(())
+    }
+
+    pub fn providers(&self) -> Result<Vec<ProviderInfo>, String> {
+        Ok(vec![ProviderInfo {
+            id: providers::WORKERS_AI.into(),
+            name: "Cloudflare Workers AI".into(),
+            account_id: self.setting("workers-ai.account")?,
+            has_token: self.secrets.get("workers-ai.token")?.is_some(),
+        }])
+    }
+
+    /// Save a provider's account, and its token (None: keep the one saved;
+    /// Some(""): forget it). The token goes to the keychain.
+    pub fn save_provider(&self, provider: &str, account_id: &str, token: Option<&str>) -> Result<Vec<ProviderInfo>, String> {
+        if provider != providers::WORKERS_AI {
+            return Err("Unknown provider.".into());
+        }
+        let account = account_id.trim();
+        if !account.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err("An account ID is letters and digits (Cloudflare dashboard › Workers AI).".into());
+        }
+        self.set_setting("workers-ai.account", (!account.is_empty()).then_some(account))?;
+        if let Some(t) = token {
+            let t = t.trim();
+            self.secrets.set("workers-ai.token", (!t.is_empty()).then_some(t))?;
+        }
+        self.providers()
+    }
+
+    /// What it takes to call a provider, or why it can't be called yet.
+    pub fn creds(&self, provider: &str) -> Result<providers::Creds, String> {
+        if provider != providers::WORKERS_AI {
+            return Err("Unknown provider.".into());
+        }
+        let missing = || "Cloudflare Workers AI isn't set up: add your account ID and token in Settings › Providers.".to_string();
+        let account = self.setting("workers-ai.account")?.ok_or_else(missing)?;
+        let token = self.secrets.get("workers-ai.token")?.ok_or_else(missing)?;
+        Ok(providers::Creds { base: self.provider_base.clone(), account, token })
+    }
+
+    /// Where provider calls go (tests point it at a stand-in).
+    #[cfg(test)]
+    pub fn set_provider_base(&mut self, base: &str) {
+        self.provider_base = base.to_string();
     }
 
     pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command, c.messages, r.agent_id FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
-             LEFT JOIN agent_context c ON c.agent_id = a.id LEFT JOIN coordinators r ON r.agent_id = a.id ORDER BY a.created_at",
+            "SELECT a.id, a.name, a.created_at, k.command, c.messages, r.agent_id, p.provider, p.model FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
+             LEFT JOIN agent_context c ON c.agent_id = a.id LEFT JOIN coordinators r ON r.agent_id = a.id LEFT JOIN agent_runner p ON p.agent_id = a.id
+             ORDER BY a.created_at",
             &[],
         )?;
         Ok(rows
@@ -1881,6 +1992,10 @@ impl Store {
                     v => int(v),
                 },
                 coordinator: !matches!(r[5], Value::Null),
+                runner: match &r[6] {
+                    Value::Null => None,
+                    v => Some(Runner { provider: text(v), model: text(&r[7]) }),
+                },
             })
             .collect())
     }
@@ -2246,8 +2361,15 @@ mod tests {
         store.post(&c.id, DEMO_NAME, "person", "@intake one more").unwrap();
         assert!(store.agents_to_wake().unwrap().is_empty(), "no command yet");
         store.set_wake(&intake.id, "  claude -p  ").unwrap();
-        let wake: Vec<(String, String)> = store.agents_to_wake().unwrap().into_iter().map(|(a, c)| (a.name, c)).collect();
-        assert_eq!(wake, [("intake".to_string(), "claude -p".to_string())]);
+        let wake: Vec<(String, Wake)> = store.agents_to_wake().unwrap().into_iter().map(|(a, c)| (a.name, c)).collect();
+        assert_eq!(wake, [("intake".to_string(), Wake::Command("claude -p".to_string()))]);
+        // A provider's model takes over from the command while it's set.
+        let cloud = Runner { provider: providers::WORKERS_AI.into(), model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast".into() };
+        store.set_runner(&intake.id, Some(&cloud)).unwrap();
+        assert_eq!(store.agents_to_wake().unwrap()[0].1, Wake::Provider(cloud.clone()));
+        assert_eq!(store.agent_infos().unwrap().iter().find(|a| a.agent.id == intake.id).unwrap().runner, Some(cloud));
+        assert!(store.set_runner(&intake.id, Some(&Runner { provider: "elsewhere".into(), model: "m".into() })).is_err());
+        store.set_runner(&intake.id, None).unwrap();
         assert_eq!(store.agent_infos().unwrap().iter().find(|a| a.agent.id == intake.id).unwrap().wake.as_deref(), Some("claude -p"));
         store.set_wake(&intake.id, "").unwrap();
         assert!(store.agent_infos().unwrap().iter().all(|a| a.wake.is_none()));
