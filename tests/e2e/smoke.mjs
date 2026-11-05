@@ -18,7 +18,7 @@ try {
   const card = await driver.wait(until.elementLocated(By.css('button.card')), 30000)
   assert.match(await card.getText(), /Demo workspace/)
   // You, in the top bar: the profile's name until you change it.
-  assert.match(await driver.findElement(By.css('.usercard .me')).getText(), /Demo/)
+  assert.match(await driver.findElement(By.css('.usercard .me')).getAttribute('aria-label'), /^Demo: profile and status$/)
 
   // Open it: #general holds the welcome message from the seed.
   await card.click()
