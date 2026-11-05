@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, Message, Profile, Store, Workspace};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, LoopRules, Message, Profile, Store, Workspace};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -197,6 +197,36 @@ fn endpoint() -> String {
     format!("http://127.0.0.1:{}/mcp", mcp::PORT)
 }
 
+#[tauri::command]
+fn loop_rules(core: State<Core>) -> Result<LoopRules, String> {
+    with(&core, |s| s.loop_rules())
+}
+
+#[tauri::command]
+fn set_loop_rules(core: State<Core>, rules: LoopRules) -> Result<LoopRules, String> {
+    with(&core, |s| s.set_loop_rules(&rules))
+}
+
+/// How many agents are held in a place after a long run of agent messages.
+#[tauri::command]
+fn held(core: State<Core>, channel_id: String, thread_id: Option<String>) -> Result<i64, String> {
+    with(&core, |s| s.held(&channel_id, thread_id.as_deref()))
+}
+
+#[tauri::command]
+fn let_agents_continue(core: State<Core>, channel_id: String, thread_id: Option<String>) -> Result<Message, String> {
+    with(&core, |s| s.let_agents_continue(&channel_id, thread_id.as_deref(), &s.me()?))
+}
+
+/// A coordinator's messages count like a person's for waking agents.
+#[tauri::command]
+fn set_coordinator(core: State<Core>, agent_id: String, on: bool) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.set_coordinator(&agent_id, on)?;
+        s.agent_infos()
+    })
+}
+
 /// How many recent messages come with a mention.
 #[tauri::command]
 fn set_context(core: State<Core>, agent_id: String, messages: i64) -> Result<Vec<AgentInfo>, String> {
@@ -326,11 +356,19 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let store = Store::open(&dir)?;
+            let mut store = Store::open(&dir)?;
             store.seed_if_empty()?;
+            // Agents held after a long run: a desktop notification, when
+            // Settings › Agents asks for one.
+            let handle = app.handle().clone();
+            store.on_hold(Box::new(move |note| {
+                use tauri_plugin_notification::NotificationExt;
+                let _ = handle.notification().builder().title("gild: agents are waiting").body(note).show();
+            }));
             let core = Arc::new(Mutex::new(store));
             mcp::serve(mcp::Gild { core: core.clone(), app: Some(app.handle().clone()) });
             tauri::async_runtime::spawn(wake::run(core.clone(), Some(app.handle().clone()), endpoint()));
@@ -366,6 +404,11 @@ pub fn run() {
             agents,
             set_wake,
             set_context,
+            set_coordinator,
+            held,
+            loop_rules,
+            set_loop_rules,
+            let_agents_continue,
             create_agent,
             agent_clients,
             connect_agent,

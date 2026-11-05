@@ -5,7 +5,7 @@ import { DocsPane } from './Docs'
 import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
 import { UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
-import { MessageRow, ThreadPanel } from './Thread'
+import { HeldBar, MessageRow, ThreadPanel } from './Thread'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
@@ -267,6 +267,7 @@ function ChannelView({ channel }: { channel: Channel }) {
             )
           })}
         </div>
+        <HeldBar channelId={channel.id} version={version + messages.length} onContinued={refresh} />
         <div className="composer">
           <form onSubmit={send}>
             <label htmlFor="composer" style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}>Message</label>

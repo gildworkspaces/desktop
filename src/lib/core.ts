@@ -32,7 +32,9 @@ export type ChannelDocs = { docs: Doc[]; proposals: Proposal[] }
 export type Access = 'read' | 'write'
 /** `wake`: the command gild runs when the agent is mentioned, if any. */
 /** `context`: how many recent messages come with a mention. */
-export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number }
+export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean }
+/** Settings › Agents › Runaway loops. */
+export type LoopRules = { limit: number; ask_coordinator: boolean; notify_me: boolean }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
 export type AgentAccess = { agent: Agent; access: Access | null }
 /** An MCP client on this computer that gild can set an agent up in. */
@@ -84,6 +86,11 @@ export const core = {
   connectAgent: (agentId: string, clients: string[]) => invoke<Connected>('connect_agent', { agentId, clients }),
   removeAgent: (agentId: string) => invoke<Agent[]>('remove_agent', { agentId }),
   setContext: (agentId: string, messages: number) => invoke<Agent[]>('set_context', { agentId, messages }),
+  setCoordinator: (agentId: string, on: boolean) => invoke<Agent[]>('set_coordinator', { agentId, on }),
+  loopRules: () => invoke<LoopRules>('loop_rules'),
+  setLoopRules: (rules: LoopRules) => invoke<LoopRules>('set_loop_rules', { rules }),
+  held: (channelId: string, threadId?: string) => invoke<number>('held', { channelId, threadId: threadId ?? null }),
+  letAgentsContinue: (channelId: string, threadId?: string) => invoke<Message>('let_agents_continue', { channelId, threadId: threadId ?? null }),
   setWake: (agentId: string, command: string) => invoke<Agent[]>('set_wake', { agentId, command }),
   channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
   setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),

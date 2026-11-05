@@ -10,6 +10,24 @@ function replyLine(m: Message): string {
   return `${n} ${n === 1 ? 'reply' : 'replies'}${last}`
 }
 
+/** Agents held after a long run in this place, and the way to let them go on. */
+export function HeldBar({ channelId, threadId, version, onContinued }: { channelId: string; threadId?: string; version: number; onContinued: () => void }) {
+  const [held, setHeld] = useState(0)
+  const [error, setError] = useState('')
+  useEffect(() => { core.held(channelId, threadId).then(setHeld, () => setHeld(0)) }, [channelId, threadId, version])
+  if (held === 0) return null
+  return (
+    <div className="heldbar" role="status">
+      <span>Agents paused after a long run of messages here, {held} {held === 1 ? 'mention' : 'mentions'} waiting.</span>
+      <button className="primary" onClick={async () => {
+        setError('')
+        try { await core.letAgentsContinue(channelId, threadId); setHeld(0); onContinued() } catch (e) { setError(errorText(e)) }
+      }}>Let them continue</button>
+      {error && <span className="error">{error}</span>}
+    </div>
+  )
+}
+
 export function MessageRow({ m, onThread }: { m: Message; onThread?: (m: Message) => void }) {
   return (
     <div className="msg">
@@ -68,6 +86,7 @@ export function ThreadPanel({ channelId, channelName, rootId, onReplied, onClose
         {root && <div className="threadrule"><span>{replies.length === 0 ? 'No replies yet' : `${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`}</span></div>}
         {replies.map(m => <MessageRow key={m.id} m={m} />)}
       </div>
+      <HeldBar channelId={channelId} threadId={rootId} version={version + (thread?.length ?? 0)} onContinued={() => setVersion(v => v + 1)} />
       <div className="composer">
         <form onSubmit={send}>
           <label htmlFor="thread-composer" className="sr">Reply</label>

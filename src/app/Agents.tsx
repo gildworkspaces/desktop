@@ -3,7 +3,7 @@
 // the members list, Settings' agents page, what an agent may do in a
 // channel, and what agents did there.
 import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type Profile } from '@/lib/core'
+import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type Profile } from '@/lib/core'
 import { Avatar } from './Profile'
 
 /** Tell every agents list in the window that the agents changed. */
@@ -114,12 +114,53 @@ export function MembersGroup({ profile, channels, current }: { profile: Profile;
       {agents.map(a => (
         <button key={a.id} className="member agentrow" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>
           <span className="aavatar" aria-hidden="true">{a.name[0]?.toUpperCase()}</span>{a.name}
-          <span className="tag">agent</span>
+          <span className="tag">{a.coordinator ? 'coordinator' : 'agent'}</span>
         </button>
       ))}
       {error && <p className="error" style={{ padding: '0 10px' }}>{error}</p>}
       {status && <p className="error" style={{ padding: '0 10px' }}>{status}</p>}
       {adding.ui}
+    </div>
+  )
+}
+
+/** A labelled on/off switch. */
+export function Toggle({ id, label, hint, on, onChange, disabled }: { id: string; label: string; hint?: string; on: boolean; onChange: (on: boolean) => void; disabled?: boolean }) {
+  return (
+    <div className="toggle">
+      <span className="col">
+        <label htmlFor={id}>{label}</label>
+        {hint && <span className="faint hint">{hint}</span>}
+      </span>
+      <button id={id} role="switch" aria-checked={on} className={on ? 'switch on' : 'switch'} disabled={disabled} onClick={() => onChange(!on)}><span /></button>
+    </div>
+  )
+}
+
+/** Settings › Agents › Runaway loops. */
+function LoopSettings() {
+  const [rules, setRules] = useState<LoopRules | null>(null)
+  const [limit, setLimit] = useState('')
+  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
+  useEffect(() => { core.loopRules().then(r => { setRules(r); setLimit(String(r.limit)) }, e => setNote({ ok: false, text: errorText(e) })) }, [])
+  async function save(next: LoopRules) {
+    setNote(null)
+    try { const r = await core.setLoopRules(next); setRules(r); setLimit(String(r.limit)); setNote({ ok: true, text: 'Saved.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) }
+  }
+  if (!rules) return note ? <p className="error">{note.text}</p> : null
+  return (
+    <div className="sfield ruled loops">
+      <span className="flabel">Runaway loops</span>
+      <form className="ctxrow" onSubmit={e => { e.preventDefault(); save({ ...rules, limit: Number(limit) }) }}>
+        <label htmlFor="agent-limit">Pause agents after</label>
+        <input id="agent-limit" className="field num" type="number" min={1} max={10000} value={limit} onChange={e => setLimit(e.target.value)} />
+        <span>agent messages in a row</span>
+        {limit !== String(rules.limit) && <button className="primary">Save</button>}
+      </form>
+      <span className="faint hint">Counted in each channel and thread since a person or a coordinator last wrote there. At the limit, gild holds the agents (nothing is lost) and says so in the channel; a reply from a person or a coordinator lets them continue.</span>
+      <Toggle id="ask-coordinator" label="Ask the coordinator" hint="When the channel has a coordinator agent, gild @mentions it so it can decide whether to continue." on={rules.ask_coordinator} onChange={v => save({ ...rules, ask_coordinator: v })} />
+      <Toggle id="notify-me" label="Notify me" hint="A notification on this computer when agents are held." on={rules.notify_me} onChange={v => save({ ...rules, notify_me: v })} />
+      {note && <span className={note.ok ? 'ok' : 'error'}>{note.text}</span>}
     </div>
   )
 }
@@ -145,7 +186,7 @@ export function AgentsSettings({ channels, current }: { channels: Channel[]; cur
         <div className="srows">
           {agents.map(a => (
             <div key={a.id} className="srow agentline">
-              <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b></span>
+              <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b>{a.coordinator && <span className="tag">coordinator</span>}</span>
               <span className="soft">{channels.length > 0 ? `${where[a.id] ?? 0} ${(where[a.id] ?? 0) === 1 ? 'channel' : 'channels'} here` : ''}</span>
               <span className="soft">{a.wake ? 'wakes on @' : 'not woken'}</span>
               <button className="ghost" onClick={() => adding.open(a)} aria-label={`${a.name}: settings`}>Settings</button>
@@ -156,6 +197,7 @@ export function AgentsSettings({ channels, current }: { channels: Channel[]; cur
       {agents.length === 0 && <p className="faint">No agents yet.</p>}
       <div><button className="primary" onClick={adding.add}>Add an agent</button></div>
       {error && <p className="error">{error}</p>}
+      <LoopSettings />
       {endpoint && (
         <div className="sfield ruled">
           <span className="flabel">Agent endpoint</span>
@@ -198,6 +240,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose 
   const [saved, setSaved] = useState('')
   // Open once if there's no command yet; never closed by typing into it.
   const [advancedOpen] = useState(!agent.wake)
+  const [coordinator, setCoordinator] = useState(!!agent.coordinator)
   const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
@@ -374,6 +417,14 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose 
               ))}
             </details>
             <div className="row"><button className="primary" disabled={busy}>Save</button>{saved && <span className="ok">{saved}</span>}</div>
+            <Toggle
+              id="coordinator"
+              label="Coordinator"
+              hint={`${agent.name} directs other agents: its messages count like a person’s, so they reset the runaway-loop count and reach agents in its threads without an @mention.`}
+              on={!!coordinator}
+              disabled={busy}
+              onChange={on => act(async () => { const list = await core.setCoordinator(agent.id, on); onAgents(list); setCoordinator(on) })}
+            />
           </form>
         )}
 
