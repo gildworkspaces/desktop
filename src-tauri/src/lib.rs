@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, LoopRules, Message, Profile, Store, Workspace};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, LoopRules, Message, Profile, Store, Workspace, Working};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -89,6 +89,12 @@ fn messages(core: State<Core>, channel_id: String) -> Result<Vec<Message>, Strin
 #[tauri::command]
 fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<Message, String> {
     with(&core, |s| s.post(&channel_id, &s.me()?, "person", &body))
+}
+
+/// Agents running right now, and where they were called.
+#[tauri::command]
+fn working(core: State<Core>) -> Result<Vec<Working>, String> {
+    with(&core, |s| Ok(s.working()))
 }
 
 /// A thread: the message it hangs off, then its replies.
@@ -389,6 +395,7 @@ pub fn run() {
             messages,
             send_message,
             thread,
+            working,
             send_reply,
             channel_data,
             set_view,

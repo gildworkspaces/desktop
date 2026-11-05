@@ -128,14 +128,31 @@ pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<
 
 /// Wake one agent for its mentions, and record how it went.
 async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, command: String, mentions: Vec<Mention>, endpoint: String) {
-    let context = core.lock().ok().and_then(|s| s.mention_context(&agent.id, &mentions).ok()).unwrap_or_default();
+    let started = crate::store::now();
+    let context = match core.lock() {
+        Ok(mut s) => {
+            s.set_working(&agent.name, &mentions, true);
+            s.mention_context(&agent.id, &mentions).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+    if let Some(app) = &app {
+        let _ = app.emit("gild://working", ());
+    }
     let outcome = run_command(&command, &prompt(&agent.name, &mentions, &context, &endpoint), LIMIT).await;
     let mut channels: Vec<String> = mentions.iter().map(|m| m.channel_id.clone()).collect();
     channels.dedup();
-    if let Ok(store) = core.lock() {
+    if let Ok(mut store) = core.lock() {
+        store.set_working(&agent.name, &mentions, false);
         for channel in &channels {
             let detail = match &outcome {
-                Ok(_) => format!("woken by {}", mentions.iter().filter(|m| &m.channel_id == channel).map(|m| m.from.as_str()).collect::<Vec<_>>().join(", ")),
+                Ok(_) => format!(
+                    "woken by {} · {}",
+                    mentions.iter().filter(|m| &m.channel_id == channel).map(|m| m.from.as_str()).collect::<Vec<_>>().join(", "),
+                    // An agent may decide there's nothing to add: say so, so
+                    // a quiet run doesn't look like a broken one.
+                    if store.posted_since(&agent.name, channel, started).unwrap_or(false) { "replied" } else { "stayed quiet" }
+                ),
                 Err(why) => why.clone(),
             };
             let _ = store.audit(&agent, "woken", channel, &detail, outcome.is_ok());
@@ -146,6 +163,7 @@ async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, com
         }
     }
     if let Some(app) = &app {
+        let _ = app.emit("gild://working", ());
         for channel in channels {
             let _ = app.emit("gild://changed", channel);
         }
@@ -212,17 +230,34 @@ mod tests {
         let heard = dir.join("heard.txt");
         store.set_wake(&agent.id, &format!("cat > '{}'", heard.display())).unwrap();
         store.set_wake(&broken.id, "echo 'no such model' >&2; exit 3").unwrap();
+        // talker takes a moment, and answers meanwhile (as an agent does
+        // through the MCP endpoint).
+        let (talker, _) = store.create_agent("talker").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &talker.id, Some(Access::Write)).unwrap();
+        store.set_wake(&talker.id, "sleep 1").unwrap();
         let core = Arc::new(Mutex::new(store));
         tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
 
         core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "Northside sent three more students.").unwrap();
-        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@intake where do the forms go? @broken you too").unwrap();
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@intake where do the forms go? @broken you too @talker").unwrap();
+        // While talker runs, the window can show it working, and it answers.
+        let mut seen_working = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let store = core.lock().unwrap();
+            if store.working().iter().any(|w| w.agent == "talker" && w.channel_id == c.id && w.thread.is_none()) {
+                seen_working = true;
+                store.post(&c.id, "talker", "agent", "On it.").unwrap();
+                break;
+            }
+        }
+        assert!(seen_working, "a running agent is listed as working");
         let mut said = String::new();
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let store = core.lock().unwrap();
             let woken = store.activity(&c.id).unwrap().iter().filter(|a| a.action == "woken").count();
-            if woken == 2 {
+            if woken == 3 {
                 said = std::fs::read_to_string(&heard).unwrap_or_default();
                 break;
             }
@@ -231,11 +266,19 @@ mod tests {
         assert!(said.contains(&format!("channel_id {}", c.id)));
         // The conversation comes with it, the mention marked.
         assert!(said.contains("  Demo at ") && said.contains(": Northside sent three more students.\n"), "{said}");
-        assert!(said.contains("→ Demo at ") && said.contains(": @intake where do the forms go? @broken you too\n"), "{said}");
+        assert!(said.contains("→ Demo at ") && said.contains(": @intake where do the forms go? @broken you too @talker\n"), "{said}");
         let store = core.lock().unwrap();
         let mut log: Vec<(String, bool, String)> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action == "woken").map(|a| (a.agent, a.ok, a.detail)).collect();
         log.sort();
-        assert_eq!(log, [("broken".into(), false, "exit 3: no such model".into()), ("intake".into(), true, "woken by Demo".into())]);
+        assert_eq!(
+            log,
+            [
+                ("broken".into(), false, "exit 3: no such model".into()),
+                ("intake".into(), true, "woken by Demo · stayed quiet".into()),
+                ("talker".into(), true, "woken by Demo · replied".into()),
+            ]
+        );
+        assert!(store.working().is_empty(), "done");
         assert!(store.messages(&c.id).unwrap().iter().any(|m| m.body == "Couldn't wake broken: exit 3: no such model"));
         assert!(store.pending_mentions(&agent.id).unwrap().is_empty(), "delivered");
         drop(store);

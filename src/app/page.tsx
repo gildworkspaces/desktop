@@ -3,9 +3,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
 import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
-import { UserCard, type SettingsSection } from './Profile'
+import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
-import { HeldBar, MessageRow, ThreadPanel } from './Thread'
+import { HeldBar, MessageRow, ThreadPanel, WorkingLine } from './Thread'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
@@ -39,7 +39,7 @@ export default function App() {
   if (!profile) return <main className="center" aria-busy="true" />
   const me: Me = { profile, setProfile, settings: setSettings }
   return (
-    <>
+    <MeContext.Provider value={profile}>
       {open
         ? <WorkspaceView key={open.id} me={me} workspace={open} onPlace={setPlace} onBack={() => { setOpen(null); setPlace({ channels: [], current: null }) }} />
         : <Home me={me} onOpen={setOpen} />}
@@ -55,7 +55,7 @@ export default function App() {
           onClose={() => setSettings(null)}
         />
       )}
-    </>
+    </MeContext.Provider>
   )
 }
 
@@ -267,6 +267,7 @@ function ChannelView({ channel }: { channel: Channel }) {
             )
           })}
         </div>
+        <WorkingLine channelId={channel.id} />
         <HeldBar channelId={channel.id} version={version + messages.length} onContinued={refresh} />
         <div className="composer">
           <form onSubmit={send}>

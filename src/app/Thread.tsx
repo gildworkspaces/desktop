@@ -2,12 +2,27 @@
 // A message as a channel shows it, and a thread: the message it hangs off,
 // its replies, and a composer for replying there.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { core, onChanged, mentionParts, initial, clock, day, errorText, type Message } from '@/lib/core'
+import { core, onChanged, onWorking, mentionParts, initial, clock, day, errorText, type Message, type Working } from '@/lib/core'
+import { useMe } from './Profile'
 
 function replyLine(m: Message): string {
   const n = m.replies ?? 0
   const last = m.last_reply_at ? ` · last ${day(m.last_reply_at) === 'Today' ? clock(m.last_reply_at) : `${day(m.last_reply_at)} ${clock(m.last_reply_at)}`}` : ''
   return `${n} ${n === 1 ? 'reply' : 'replies'}${last}`
+}
+
+/** "ava is working…" while an agent runs on a mention in this place. */
+export function WorkingLine({ channelId, threadId }: { channelId: string; threadId?: string }) {
+  const [all, setAll] = useState<Working[]>([])
+  useEffect(() => {
+    const load = () => core.working().then(setAll, () => setAll([]))
+    load()
+    return onWorking(load)
+  }, [])
+  const names = [...new Set(all.filter(w => w.channel_id === channelId && (w.thread ?? undefined) === threadId).map(w => w.agent))]
+  if (names.length === 0) return null
+  const who = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+  return <div className="workingline" role="status"><span className="dots" aria-hidden="true"><i /><i /><i /></span>{who} {names.length === 1 ? 'is' : 'are'} working…</div>
 }
 
 /** Agents held after a long run in this place, and the way to let them go on. */
@@ -29,9 +44,14 @@ export function HeldBar({ channelId, threadId, version, onContinued }: { channel
 }
 
 export function MessageRow({ m, onThread }: { m: Message; onThread?: (m: Message) => void }) {
+  const me = useMe()
+  // Your own messages carry your picture (by name: messages keep the name they were sent with).
+  const mine = m.kind === 'person' && !!me && m.author === me.name
   return (
     <div className="msg">
-      <div className={`avatar ${m.kind}`} aria-hidden="true">{initial(m.author)}</div>
+      {mine && me?.picture
+        ? <img className="avatar pic" src={me.picture} alt="" aria-hidden="true" />
+        : <div className={`avatar ${m.kind}`} aria-hidden="true">{initial(m.author)}</div>}
       <div className="body">
         <div className="meta">
           <span className="author">{m.author}</span>
@@ -86,6 +106,7 @@ export function ThreadPanel({ channelId, channelName, rootId, onReplied, onClose
         {root && <div className="threadrule"><span>{replies.length === 0 ? 'No replies yet' : `${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}`}</span></div>}
         {replies.map(m => <MessageRow key={m.id} m={m} />)}
       </div>
+      <WorkingLine channelId={channelId} threadId={rootId} />
       <HeldBar channelId={channelId} threadId={rootId} version={version + (thread?.length ?? 0)} onContinued={() => setVersion(v => v + 1)} />
       <div className="composer">
         <form onSubmit={send}>

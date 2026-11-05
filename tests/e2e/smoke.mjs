@@ -221,7 +221,7 @@ try {
     const done = arguments[arguments.length - 1]
     window.__TAURI_INTERNALS__.invoke('activity', { channelId: ${JSON.stringify(intakeId)} }).then(a => done(a.filter(x => x.action === 'woken').map(x => x.agent + ': ' + x.detail + ' ' + x.ok)), e => done({ error: String(e) }))
   `)
-  assert.deepEqual(woken, ['intake: woken by Demo true'])
+  assert.deepEqual(woken, ['intake: woken by Demo · replied true'])
 
   // Threads: reply to a message in its thread. A mention there wakes the
   // agent, which answers in the thread; then a reply with no mention reaches

@@ -1,8 +1,12 @@
 'use client'
 // You, as the app shows you: your picture, your card at the bottom of the
 // sidebar, and the menu it opens (profile, status, settings).
-import { useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { core, errorText, initial, type Profile, type Status } from '@/lib/core'
+
+/** You, for anything deep in the window that needs you (your messages' picture). */
+export const MeContext = createContext<Profile | null>(null)
+export const useMe = () => useContext(MeContext)
 
 export const STATUS: { value: Status; label: string; hint?: string }[] = [
   { value: 'online', label: 'Online' },
