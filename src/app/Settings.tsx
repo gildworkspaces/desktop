@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { core, errorText, BANNERS, MAX_BIO, type Channel, type Profile, type Theme, type Workspace } from '@/lib/core'
+import { core, errorText, BANNERS, MAX_BIO, type Channel, type Manifest, type Profile, type Theme, type Workspace } from '@/lib/core'
 import { Avatar, type SettingsSection } from './Profile'
 import { AgentsSettings } from './Agents'
 
@@ -27,7 +27,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
 
   const groups: Group[] = [
     { label: 'Personal', items: [{ key: 'profile', label: 'My Profile' }] },
-    { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }] },
+    { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }, { key: 'addons', label: 'Add-ons' }] },
     { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'data', label: 'Export and import' }] },
   ]
   const title = groups.flatMap(g => g.items).find(i => i.key === at)?.label ?? ''
@@ -60,6 +60,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
           {at === 'profile' && <ProfilePage profile={profile} onProfile={onProfile} />}
           {at === 'appearance' && <AppearancePage profile={profile} onProfile={onProfile} />}
           {at === 'agents' && <AgentsSettings channels={channels} current={current} />}
+          {at === 'addons' && <AddonsPage />}
           {at === 'data' && <DataPage workspace={workspace} onImported={onImported} />}
         </section>
       </div>
@@ -183,6 +184,36 @@ function AppearancePage({ profile, onProfile }: { profile: Profile; onProfile: (
         <span className="faint hint">System follows your computer’s light or dark setting.</span>
       </div>
       {error && <p className="error">{error}</p>}
+    </div>
+  )
+}
+
+/** Settings › Add-ons: what each add-on adds and what it may touch. */
+function AddonsPage() {
+  const [list, setList] = useState<Manifest[] | null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => { core.addons().then(setList, e => setError(errorText(e))) }, [])
+  const none = (xs: string[]) => (xs.length === 0 ? 'none' : xs.join(', '))
+  return (
+    <div className="spage">
+      <p className="soft lead">Add-ons give gild new kinds of files. Each file type’s operations are what you and agents edit it with: every one is an agent tool, a commit and an Activity entry.</p>
+      {error && <p className="error">{error}</p>}
+      {list?.map(m => (
+        <div key={m.id} className="addon">
+          <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span><span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span></div>
+          <p className="soft" style={{ margin: 0, fontSize: 13 }}>{m.description}</p>
+          {m.contributes.fileTypes.map(t => (
+            <div key={t.id} className="addonpart">
+              <span className="flabel">{t.name} files ({t.extensions.join(', ')})</span>
+              <ul>{t.operations.map(o => <li key={o.name}><span className="mono">{t.id}_{o.name}</span> <span className="faint">{o.description}</span></li>)}</ul>
+            </div>
+          ))}
+          <div className="addonpart">
+            <span className="flabel">May touch</span>
+            <span className="faint" style={{ fontSize: 12 }}>Files: {none(m.permissions.files)} · Network: {none(m.permissions.network)} · Secrets: {none(m.permissions.secrets)}</span>
+          </div>
+        </div>
+      ))}
     </div>
   )
 }

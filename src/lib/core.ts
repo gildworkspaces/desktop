@@ -4,6 +4,20 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 export type Account = { name: string; demo: boolean }
+/** The channel's view: one shared screen, one controller. */
+export type FileEntry = { path: string; size: number }
+export type Controller = { kind: 'none' } | { kind: 'person'; name: string; at: number } | { kind: 'agent'; name: string; at: number }
+export type ViewState = { expanded: string[]; selected: string | null; open: string | null; controller: Controller }
+export type ChannelView = { state: ViewState; files: FileEntry[]; text: string | null; file_type: string | null; operations: string[] }
+export type Nav = { op: 'expand' | 'collapse' | 'select' | 'open'; path: string } | { op: 'close' }
+/** An add-on's manifest (gild-addon.json). */
+export type AddonOperation = { name: string; description: string; params: unknown }
+export type Manifest = {
+  id: string; name: string; version: string; publisher: string; description: string
+  contributes: { fileTypes: { id: string; name: string; extensions: string[]; operations: AddonOperation[] }[] }
+  permissions: { network: string[]; secrets: string[]; files: string[] }
+}
+
 /** An agent running right now, and where it was called (thread: a thread in that channel). */
 export type Working = { agent: string; channel_id: string; thread: string | null }
 export type Status = 'online' | 'idle' | 'dnd' | 'invisible'
@@ -46,6 +60,14 @@ export type AuditEntry = { agent: string; action: string; detail: string; ok: bo
 
 export const inApp = () => isTauri()
 
+/** Call `f` with a channel id whenever its view changes from the window. */
+export function onView(f: (channelId: string) => void): () => void {
+  let stop: (() => void) | null = null
+  let gone = false
+  listen<string>('gild://view', e => f(e.payload)).then(u => { if (gone) u(); else stop = u })
+  return () => { gone = true; stop?.() }
+}
+
 /** Call `f` whenever an agent starts or finishes a run. */
 export function onWorking(f: () => void): () => void {
   let stop: (() => void) | null = null
@@ -76,6 +98,11 @@ export const core = {
   messages: (channelId: string) => invoke<Message[]>('messages', { channelId }),
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
   working: () => invoke<Working[]>('working'),
+  addons: () => invoke<Manifest[]>('addons'),
+  channelView: (channelId: string) => invoke<ChannelView>('channel_view', { channelId }),
+  driveView: (channelId: string, nav: Nav) => invoke<ChannelView>('drive_view', { channelId, nav }),
+  editFile: (channelId: string, path: string, op: string, args: Record<string, unknown>) => invoke<ChannelView>('edit_file', { channelId, path, op, args }),
+  takeOverView: (channelId: string) => invoke<ChannelView>('take_over_view', { channelId }),
   thread: (channelId: string, threadId: string) => invoke<Message[]>('thread', { channelId, threadId }),
   reply: (channelId: string, threadId: string, body: string) => invoke<Message>('send_reply', { channelId, threadId, body }),
   channelData: (channelId: string) => invoke<ChannelData>('channel_data', { channelId }),

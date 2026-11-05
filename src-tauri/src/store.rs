@@ -13,6 +13,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::addons::{Manifest, Registry};
+use crate::records::FileEntry;
+use crate::view::{Actor, Nav, ViewState};
 use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 
 use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
@@ -151,7 +155,25 @@ pub struct Store {
     on_hold: Option<HoldHook>,
     /// Agents running right now, and where they were called.
     working: Vec<Working>,
+    /// Each channel's shared view (in memory: it's what's on screen now).
+    views: std::sync::Mutex<HashMap<String, ViewState>>,
+    addons: Registry,
 }
+
+/// A channel's view: its state and the files it shows.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ChannelView {
+    pub state: ViewState,
+    pub files: Vec<FileEntry>,
+    /// The open file's text (None: not text), and its file type.
+    pub text: Option<String>,
+    pub file_type: Option<String>,
+    /// The open file's operations, by name (empty: it can't be edited).
+    pub operations: Vec<String>,
+}
+
+/// The largest text file the view opens.
+pub const MAX_OPEN: usize = 1_000_000;
 
 /// An agent at work on a mention in a place (a channel, or a thread in it).
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -230,7 +252,7 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new() };
+        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in() };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
             Some(row) if int(&row[0]) == FORMAT => {}
@@ -1401,6 +1423,107 @@ impl Store {
         self.profile()
     }
 
+    pub fn addons(&self) -> Vec<Manifest> {
+        self.addons.manifests().into_iter().cloned().collect()
+    }
+
+    pub fn addon_registry(&self) -> &Registry {
+        &self.addons
+    }
+
+    pub fn files(&self, channel_id: &str) -> Result<Vec<FileEntry>, String> {
+        self.require_channel(channel_id)?;
+        records::files(&self.data, channel_id)
+    }
+
+    /// A file's text (None: it isn't text, or is too big to open).
+    pub fn file_text(&self, channel_id: &str, path: &str) -> Result<Option<String>, String> {
+        self.require_channel(channel_id)?;
+        let bytes = records::read_file(&self.data, channel_id, path)?.ok_or_else(|| format!("There's no file {path} in this channel."))?;
+        Ok((bytes.len() <= MAX_OPEN).then(|| String::from_utf8(bytes).ok()).flatten())
+    }
+
+    fn with_view<T>(&self, channel_id: &str, f: impl FnOnce(&mut ViewState) -> Result<T, String>) -> Result<T, String> {
+        let mut views = self.views.lock().map_err(|_| "the view is unavailable; restart gild".to_string())?;
+        f(views.entry(channel_id.to_string()).or_default())
+    }
+
+    /// The channel's view as it is now, with its files and the open file.
+    pub fn view(&self, channel_id: &str) -> Result<ChannelView, String> {
+        let files = self.files(channel_id)?;
+        let state = self.with_view(channel_id, |v| {
+            v.prune(&files);
+            Ok(v.clone())
+        })?;
+        let (text, file_type, operations) = match &state.open {
+            Some(path) => {
+                let t = self.addons.file_type(path);
+                (self.file_text(channel_id, path)?, t.map(|t| t.id.clone()), t.map(|t| t.operations.iter().map(|o| o.name.clone()).collect()).unwrap_or_default())
+            }
+            None => (None, None, Vec::new()),
+        };
+        Ok(ChannelView { state, files, text, file_type, operations })
+    }
+
+    /// An agent asks for the view (needs write access).
+    pub fn take_view(&self, channel_id: &str, agent: &Agent) -> Result<ChannelView, String> {
+        self.require(agent, channel_id, Access::Write)?;
+        self.with_view(channel_id, |v| v.take(&agent.name, now_ms()))?;
+        self.view(channel_id)
+    }
+
+    pub fn release_view(&self, channel_id: &str, agent: &Agent) -> Result<ChannelView, String> {
+        self.with_view(channel_id, |v| {
+            v.release(&agent.name);
+            Ok(())
+        })?;
+        self.view(channel_id)
+    }
+
+    /// Move around the view, as a person or as the agent holding it.
+    pub fn drive(&self, channel_id: &str, actor: &Actor, nav: &Nav) -> Result<ChannelView, String> {
+        let files = self.files(channel_id)?;
+        self.with_view(channel_id, |v| {
+            v.claim(actor, now_ms())?;
+            v.apply(&files, nav)
+        })?;
+        self.view(channel_id)
+    }
+
+    /// Edit a file through its add-on's operation: one commit by the actor.
+    /// An agent edits only the file it has open in the view, so people see
+    /// the change where it happens.
+    pub fn edit_file(&self, channel_id: &str, actor: &Actor, path: &str, op: &str, args: &serde_json::Value) -> Result<ChannelView, String> {
+        let open = self.with_view(channel_id, |v| {
+            v.claim(actor, now_ms())?;
+            Ok(v.open.clone())
+        })?;
+        let author = match actor {
+            Actor::Person(name) => name.clone(),
+            Actor::Agent(name) => {
+                if open.as_deref() != Some(path) {
+                    return Err(format!("Open {path} in the view first (open_file), so people can see the change."));
+                }
+                name.clone()
+            }
+        };
+        let text = self.file_text(channel_id, path)?.ok_or_else(|| format!("{path} isn't a text file gild can edit."))?;
+        let new = self.addons.apply(path, &text, op, args)?;
+        if new.chars().count() > MAX_OPEN {
+            return Err("That would make the file too big to open.".into());
+        }
+        if new != text {
+            self.write(channel_id, &author, &format!("Edit {path}: {}", op.replace('_', " ")), &[(path.to_string(), new.into_bytes())])?;
+        }
+        self.view(channel_id)
+    }
+
+    /// A person takes the view (the Take over button).
+    pub fn take_over(&self, channel_id: &str, person: &str) -> Result<ChannelView, String> {
+        self.with_view(channel_id, |v| v.claim(&Actor::Person(person.to_string()), now_ms()))?;
+        self.view(channel_id)
+    }
+
     /// Agents running right now, for the window's "… is working" line.
     pub fn working(&self) -> Vec<Working> {
         self.working.clone()
@@ -1764,6 +1887,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::Controller;
 
     const MAX_AGENT_RUN: usize = DEFAULT_AGENT_LIMIT as usize;
 
@@ -2413,6 +2537,55 @@ mod tests {
         let m = store.take_mentions(&ava).unwrap();
         // Replying under ava's message is talking to ava: as if tagged.
         assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("im just testing out our threads feature", true)]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_view_is_shared_and_agents_edit_only_what_they_have_open() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (bob, _) = store.create_agent("bob").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &ava.id, Some(Access::Write)).unwrap();
+        store.set_access(&c.id, DEMO_NAME, &bob.id, Some(Access::Read)).unwrap();
+        let sop = store.create_doc(&c.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&c.id, DEMO_NAME, &sop.path, "# Intake SOP\n\n## Forms\n\nBlue folder.\n").unwrap();
+
+        let v = store.view(&c.id).unwrap();
+        assert_eq!(v.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), [sop.path.as_str()], "gild's own .gild/ folder isn't shown");
+        assert_eq!(v.state.controller, Controller::None);
+
+        // Read-only agents may look, not drive.
+        assert!(store.take_view(&c.id, &bob).unwrap_err().contains("not change"));
+        let a = Actor::Agent("ava".into());
+        assert!(store.drive(&c.id, &a, &Nav::Expand("docs".into())).unwrap_err().contains("take_view"));
+        store.take_view(&c.id, &ava).unwrap();
+        let v = store.drive(&c.id, &a, &Nav::Open(sop.path.clone())).unwrap();
+        assert_eq!((v.file_type.as_deref(), v.operations.len()), (Some("markdown"), 5));
+        assert!(v.text.as_deref().unwrap().contains("Blue folder."));
+
+        // Edits go through the add-on, as one commit by the agent, and the docs index follows.
+        let args = serde_json::json!({ "heading": "Forms", "text": "Red folder." });
+        let v = store.edit_file(&c.id, &a, &sop.path, "replace_section", &args).unwrap();
+        assert_eq!(v.text.as_deref(), Some("# Intake SOP\n\n## Forms\n\nRed folder.\n"));
+        assert_eq!(store.doc(&c.id, &sop.path).unwrap().body, "# Intake SOP\n\n## Forms\n\nRed folder.\n");
+        let log = store.doc_history(&c.id, &sop.path).unwrap();
+        assert_eq!((log[0].author.as_str(), log[0].message.as_str()), ("ava", "Edit docs/intake-sop.md: replace section"));
+
+        // Only the file it has open.
+        store.drive(&c.id, &a, &Nav::Close).unwrap();
+        assert!(store.edit_file(&c.id, &a, &sop.path, "append", &serde_json::json!({ "text": "x" })).unwrap_err().contains("Open docs/intake-sop.md in the view first"));
+
+        // A person takes over: the agent is refused, and the person's edit is theirs.
+        store.drive(&c.id, &a, &Nav::Open(sop.path.clone())).unwrap();
+        let v = store.take_over(&c.id, DEMO_NAME).unwrap();
+        assert!(matches!(&v.state.controller, Controller::Person { name, .. } if name == DEMO_NAME));
+        assert!(store.edit_file(&c.id, &a, &sop.path, "append", &serde_json::json!({ "text": "x" })).unwrap_err().contains("took over"));
+        store.edit_file(&c.id, &Actor::Person(DEMO_NAME.into()), &sop.path, "append", &serde_json::json!({ "text": "Thanks." })).unwrap();
+        assert_eq!(store.doc_history(&c.id, &sop.path).unwrap()[0].author, DEMO_NAME);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
+import { FilesPane } from './Files'
 import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
 import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
@@ -196,7 +197,7 @@ function ChannelView({ channel }: { channel: Channel }) {
   const [messages, setMessages] = useState<Message[]>([])
   const [draft, setDraft] = useState('')
   const [expanded, setExpanded] = useState(false)
-  const [mode, setMode] = useState<'table' | 'board' | 'docs'>('table')
+  const [mode, setMode] = useState<'table' | 'board' | 'docs' | 'files'>('table')
   const [chosen, setChosen] = useState(false)
   // undefined: not loaded yet; null: the channel has no table.
   const [count, setCount] = useState<number | null | undefined>(undefined)
@@ -213,7 +214,7 @@ function ChannelView({ channel }: { channel: Channel }) {
   useEffect(() => { core.channelDocs(channel.id).then(setDocs, e => setError(errorText(e))) }, [channel.id, version])
   // A channel with docs and no table opens on its docs.
   useEffect(() => { if (!chosen && count === null && docs && (docs.docs.length > 0 || docs.proposals.length > 0)) setMode('docs') }, [chosen, count, docs])
-  const show = (m: 'table' | 'board' | 'docs') => { setChosen(true); setMode(m) }
+  const show = (m: 'table' | 'board' | 'docs' | 'files') => { setChosen(true); setMode(m) }
   const waiting = docs?.proposals.length ?? 0
   // An agent changed this channel: show it.
   useEffect(() => onChanged(id => { if (id === channel.id) setVersion(v => v + 1) }), [channel.id])
@@ -244,13 +245,16 @@ function ChannelView({ channel }: { channel: Channel }) {
           <button className={mode === 'docs' ? 'tab on' : 'tab'} aria-pressed={mode === 'docs'} onClick={() => show('docs')}>
             Docs{waiting > 0 && <span className="count" aria-label={`${waiting} waiting for approval`}>{waiting}</span>}
           </button>
+          <button className={mode === 'files' ? 'tab on' : 'tab'} aria-pressed={mode === 'files'} onClick={() => show('files')}>Files</button>
         </div>
         <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'access' ? null : 'access')) }}>Access</button>
         <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'activity' ? null : 'activity')) }}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
-        {mode === 'docs'
+        {mode === 'files'
+          ? <FilesPane channelId={channel.id} onEditing={() => setExpanded(true)} />
+          : mode === 'docs'
           ? docs && <DocsPane channelId={channel.id} data={docs} onChanged={refresh} onEditing={() => setExpanded(true)} />
           : <ViewPane key={version} channelId={channel.id} mode={mode} onCount={setCount} />}
       </section>

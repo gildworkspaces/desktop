@@ -301,6 +301,61 @@ fn doc_blobs(repo: &gix::Repository, tree: &gix::Tree<'_>) -> Result<std::collec
     Ok(out)
 }
 
+/// A file in a channel's repository, as the view lists it.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct FileEntry {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Every file at the repository's current commit, by path, except gild's own
+/// `.gild/` folder (the table's records, access, the view's settings).
+pub fn files(data: &Path, channel_id: &str) -> Result<Vec<FileEntry>, String> {
+    let path = repo_path(data, channel_id);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+    let Some(id) = head(&repo) else { return Ok(Vec::new()) };
+    let tree = tree_of(&repo, id)?;
+    let mut out = Vec::new();
+    walk(&repo, &tree, "", &mut out)?;
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn walk(repo: &gix::Repository, tree: &gix::Tree<'_>, prefix: &str, out: &mut Vec<FileEntry>) -> Result<(), String> {
+    for entry in tree.iter() {
+        let entry = entry.map_err(|e| err("reading the files", e))?;
+        let name = entry.filename().to_string();
+        if prefix.is_empty() && name == ".gild" {
+            continue;
+        }
+        let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        let object = repo.find_object(entry.object_id()).map_err(|e| err("reading the files", e))?;
+        if entry.mode().is_tree() {
+            let sub = object.try_into_tree().map_err(|e| err("reading the files", e))?;
+            walk(repo, &sub, &path, out)?;
+        } else if entry.mode().is_blob() {
+            out.push(FileEntry { path, size: object.data.len() as u64 });
+        }
+    }
+    Ok(())
+}
+
+/// A file's bytes at the repository's current commit (None: no such file).
+pub fn read_file(data: &Path, channel_id: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+    let repo_dir = repo_path(data, channel_id);
+    if !repo_dir.exists() {
+        return Ok(None);
+    }
+    let repo = gix::open(&repo_dir).map_err(|e| err("opening the channel's history", e))?;
+    let Some(id) = head(&repo) else { return Ok(None) };
+    let tree = tree_of(&repo, id)?;
+    let bytes = blob_text(&repo, &tree, path)?;
+    Ok(bytes)
+}
+
 fn tree_of(repo: &gix::Repository, commit: ObjectId) -> Result<gix::Tree<'_>, String> {
     repo.find_commit(commit).and_then(|c| c.tree()).map_err(|e| err("reading history", e))
 }

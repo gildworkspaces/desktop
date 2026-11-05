@@ -197,6 +197,27 @@ try {
   assert.deepEqual(docLog, ["Demo: Approve intake's change to Intake SOP: The folder is red now", 'Demo: Edit Intake SOP', 'Demo: Add doc Intake SOP'])
   console.log('doc history:', JSON.stringify(docLog))
 
+  // The shared view: the agent takes it, opens the doc and edits a section
+  // through the Markdown add-on; the window shows it in control, with the
+  // change; Take over gives the view back to the person, and the agent's
+  // next step is refused.
+  await tool(20, 'take_view', { channel_id: intakeId })
+  await tool(21, 'open_folder', { channel_id: intakeId, path: 'docs' })
+  const opened = await tool(22, 'open_file', { channel_id: intakeId, path: doc.path })
+  assert.ok(opened.operations.includes('replace_section'), JSON.stringify(opened.operations))
+  await tool(23, 'markdown_replace_section', { channel_id: intakeId, path: doc.path, heading: 'Step 2: Forms', text: 'Signed intake forms go in the red folder, top drawer.' })
+  await driver.findElement(By.xpath("//button[contains(@class,'tab') and normalize-space(.)='Files']")).click()
+  const bar = await driver.wait(until.elementLocated(By.css('.controlbar')), 10000)
+  assert.match(await bar.getAttribute('textContent'), /Controlled by @intake/)
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'fbody')]//p[contains(., 'top drawer')]")), 10000)
+  await driver.findElement(By.xpath("//div[contains(@class,'controlbar')]//button[.='Take over']")).click()
+  await driver.wait(async () => (await driver.findElements(By.css('.controlbar'))).length === 0, 10000)
+  const refusedEdit = await mcp({ jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'markdown_append', arguments: { channel_id: intakeId, path: doc.path, text: 'x' } } }, init.session)
+  assert.equal(refusedEdit.json.result.isError, true)
+  assert.match(refusedEdit.json.result.content[0].text, /took over the view/)
+  console.log('view: the agent edited in the shared view; Take over gave it back')
+  await driver.findElement(By.xpath("//button[contains(@class,'tab') and normalize-space(.)='Docs']")).click()
+
   // @mentions wake the agent: the command from setup runs with the mention
   // on stdin, and it answers in the channel through the MCP endpoint.
   await driver.findElement(By.css('#composer')).sendKeys('@intake where do the forms go?', Key.ENTER)
