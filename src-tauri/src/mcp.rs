@@ -19,8 +19,16 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::addons::Registry;
 use crate::records::Access;
-use crate::store::{Agent, Store};
+use crate::store::{Agent, ChannelView, Store};
+use crate::view::{Actor, Nav};
+
+/// The pause after each move in the view, so a person watching can follow.
+#[cfg(not(test))]
+pub const PACE_MS: u64 = 300;
+#[cfg(test)]
+pub const PACE_MS: u64 = 1;
 
 pub const PORT: u16 = 4747;
 
@@ -42,7 +50,7 @@ fn schema(v: Value) -> Arc<Map<String, Value>> {
 
 fn tools() -> Vec<Tool> {
     let channel = json!({ "type": "string", "description": "The channel's id, from list_channels." });
-    vec![
+    let mut tools = vec![
         Tool::new(
             "list_channels",
             "The channels shared with you, with the workspace each is in and whether you may only read it or also change it.",
@@ -132,8 +140,67 @@ fn tools() -> Vec<Tool> {
                 "channel_id": channel, "record_id": { "type": "string" }
             }, "required": ["channel_id", "record_id"] })),
         ),
-    ]
+    ];
+    // The channel's view: one shared screen, one controller at a time.
+    let path = json!({ "type": "string", "description": "A path in the channel's files, e.g. docs/intake-sop.md." });
+    let on_path = |name: &str, about: &str| {
+        Tool::new(
+            name.to_string(),
+            about.to_string(),
+            schema(json!({ "type": "object", "properties": { "channel_id": channel, "path": path }, "required": ["channel_id", "path"] })),
+        )
+    };
+    let on_channel = |name: &str, about: &str| {
+        Tool::new(name.to_string(), about.to_string(), schema(json!({ "type": "object", "properties": { "channel_id": channel }, "required": ["channel_id"] })))
+    };
+    tools.extend([
+        on_channel("view_state", "What the channel's view shows now: its files, which folders are open, what's selected, the open file and its text, the operations it can be edited with, and who controls the view."),
+        on_path("read_file", "A file's text, without touching the view."),
+        on_channel("take_view", "Take control of the channel's view, so you can move around it and edit files where people can watch. One controller at a time; a person always wins. Needs write access. Give it back with release_view when you're done."),
+        on_channel("release_view", "Give the view back."),
+        on_path("open_folder", "Open a folder in the view (you must hold the view)."),
+        on_path("close_folder", "Close a folder in the view."),
+        on_path("select", "Select a file or folder in the view."),
+        on_path("open_file", "Open a file in the view. Edit it with its file type's operations (view_state lists them)."),
+        on_channel("close_file", "Close the open file."),
+    ]);
+    // Every add-on operation is a tool.
+    let registry = Registry::built_in();
+    for t in registry.tools() {
+        let mut params = t.op.params.clone();
+        let props = params["properties"].as_object_mut().map(std::mem::take).unwrap_or_default();
+        let mut properties = Map::new();
+        properties.insert("channel_id".into(), channel.clone());
+        properties.insert("path".into(), path.clone());
+        properties.extend(props);
+        let mut required = vec![json!("channel_id"), json!("path")];
+        required.extend(params["required"].as_array().cloned().unwrap_or_default());
+        params = json!({ "type": "object", "properties": properties, "required": required });
+        tools.push(Tool::new(
+            t.tool.clone(),
+            format!("{} files: {} The file must be open in the view (open_file) while you hold it. One commit by you.", t.file_type.name, t.op.description),
+            schema(params),
+        ));
+    }
+    tools
 }
+
+/// The view as an agent reads it.
+fn view_json(v: &ChannelView) -> Value {
+    json!({
+        "controller": v.state.controller,
+        "files": v.files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+        "open_folders": v.state.expanded,
+        "selected": v.state.selected,
+        "open_file": v.state.open,
+        "file_type": v.file_type,
+        "operations": v.operations,
+        "text": v.text,
+    })
+}
+
+/// Tools that move or change the view: paced so people can follow.
+pub const PACED: [&str; 6] = ["open_folder", "close_folder", "select", "open_file", "close_file", "take_view"];
 
 fn arg<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| format!("`{key}` is required."))
@@ -246,6 +313,46 @@ impl Gild {
                 store.require(agent, id, Access::Read)?;
                 Ok((None, json!(store.record_history(id, arg(args, "record_id")?)?)))
             }
+            "view_state" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                Ok((None, view_json(&store.view(id)?)))
+            }
+            "read_file" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                let path = arg(args, "path")?;
+                let text = store.file_text(id, path)?;
+                Ok((None, json!({ "path": path, "text": text, "note": if text.is_none() { "not a text file gild can open" } else { "" } })))
+            }
+            "take_view" => {
+                let id = arg(args, "channel_id")?;
+                Ok((Some(id.to_string()), view_json(&store.take_view(id, agent)?)))
+            }
+            "release_view" => {
+                let id = arg(args, "channel_id")?;
+                Ok((Some(id.to_string()), view_json(&store.release_view(id, agent)?)))
+            }
+            "open_folder" | "close_folder" | "select" | "open_file" | "close_file" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let nav = match name {
+                    "open_folder" => Nav::Expand(arg(args, "path")?.to_string()),
+                    "close_folder" => Nav::Collapse(arg(args, "path")?.to_string()),
+                    "select" => Nav::Select(arg(args, "path")?.to_string()),
+                    "open_file" => Nav::Open(arg(args, "path")?.to_string()),
+                    _ => Nav::Close,
+                };
+                Ok((Some(id.to_string()), view_json(&store.drive(id, &Actor::Agent(agent.name.clone()), &nav)?)))
+            }
+            tool if store.addon_registry().tool(tool).is_some() => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let op = store.addon_registry().tool(tool).map(|t| t.op.name.clone()).unwrap_or_default();
+                let path = arg(args, "path")?;
+                let v = store.edit_file(id, &Actor::Agent(agent.name.clone()), path, &op, &Value::Object(args.clone()))?;
+                Ok((Some(id.to_string()), json!({ "edited": path, "text": v.text })))
+            }
             other => Err(format!("There is no tool called {other}.")),
         }
     }
@@ -348,6 +455,11 @@ impl ServerHandler for Gild {
             store.audit(&agent, &request.name, channel, &detail, result.is_ok()).map_err(|e| ErrorData::internal_error(e, None))?;
             result
         };
+        // Moves in the shared view, and edits, go at a pace people can follow.
+        let paced = PACED.contains(&request.name.as_ref()) || Registry::built_in().tool(&request.name).is_some();
+        if outcome.is_ok() && paced {
+            tokio::time::sleep(std::time::Duration::from_millis(PACE_MS)).await;
+        }
         match outcome {
             Ok((changed, answer)) => {
                 if let (Some(app), Some(channel)) = (&self.app, changed) {
@@ -550,6 +662,75 @@ mod tests {
         assert_eq!(refused, [false, false], "refusals are in the log too");
         let waiting = store.proposals(&intake.id).unwrap();
         assert_eq!((waiting.len(), waiting[0].agent.as_str(), waiting[0].summary.as_str()), (1, "intake", "The folder is red now"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_add_on_operation_is_a_tool_with_its_own_arguments() {
+        let all = tools();
+        let t = all.iter().find(|t| t.name == "markdown_replace_section").expect("generated from the markdown add-on");
+        let props: Vec<&String> = t.input_schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(props, ["channel_id", "heading", "path", "text"]);
+        assert_eq!(t.input_schema["required"], json!(["channel_id", "path", "heading", "text"]));
+        for name in ["view_state", "read_file", "take_view", "release_view", "open_folder", "close_folder", "select", "open_file", "close_file"] {
+            assert!(all.iter().any(|t| t.name == name), "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agents_drive_the_shared_view_and_a_person_takes_it_back() {
+        let dir = std::env::temp_dir().join(format!("gild-mcp-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let intake = store.channels(&ws.id).unwrap()[0].clone();
+        let (agent, token) = store.create_agent("intake").unwrap();
+        store.set_access(&intake.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+        let sop = store.create_doc(&intake.id, DEMO_NAME, "Intake SOP").unwrap();
+        store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# Intake SOP\n\n## Step 2: Forms\n\nIntake forms go in the blue folder.\n").unwrap();
+        let core = Arc::new(Mutex::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = router(Gild { core: core.clone(), app: None });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut c = Client::connect(url, Some(token)).await;
+        let ch = intake.id.as_str();
+
+        let (err, text) = c.call("view_state", json!({ "channel_id": ch })).await;
+        assert!(!err && text.contains("\"kind\": \"none\"") && text.contains(&sop.path), "{text}");
+        let (err, text) = c.call("open_folder", json!({ "channel_id": ch, "path": "docs" })).await;
+        assert!(err && text.contains("take_view"), "{text}");
+        assert!(!c.call("take_view", json!({ "channel_id": ch })).await.0);
+        assert!(!c.call("open_folder", json!({ "channel_id": ch, "path": "docs" })).await.0);
+        let (err, text) = c.call("open_file", json!({ "channel_id": ch, "path": sop.path })).await;
+        assert!(!err && text.contains("replace_section") && text.contains("blue folder"), "{text}");
+        let (err, text) = c
+            .call("markdown_replace_section", json!({ "channel_id": ch, "path": sop.path, "heading": "Step 2: Forms", "text": "Intake forms go in the red folder." }))
+            .await;
+        assert!(!err && text.contains("red folder"), "{text}");
+        // The window sees the same view: the agent in control, the file open, the edit in it.
+        {
+            let store = core.lock().unwrap();
+            let v = store.view(ch).unwrap();
+            assert!(matches!(&v.state.controller, crate::view::Controller::Agent { name, .. } if name == "intake"));
+            assert_eq!(v.state.open.as_deref(), Some(sop.path.as_str()));
+            assert!(v.text.unwrap().contains("red folder"));
+            // A person takes over.
+            store.take_over(ch, DEMO_NAME).unwrap();
+        }
+        let (err, text) = c.call("markdown_append", json!({ "channel_id": ch, "path": sop.path, "text": "More." })).await;
+        assert!(err && text.contains("Demo took over"), "{text}");
+        let (err, text) = c.call("take_view", json!({ "channel_id": ch })).await;
+        assert!(err && text.contains("Demo is using the view"), "{text}");
+        let store = core.lock().unwrap();
+        let log: Vec<(String, bool)> = store.activity(ch).unwrap().into_iter().map(|a| (a.action, a.ok)).collect();
+        assert_eq!(
+            log,
+            [("take_view", false), ("markdown_append", false), ("markdown_replace_section", true), ("open_file", true), ("open_folder", true), ("take_view", true), ("open_folder", false), ("view_state", true)]
+                .map(|(a, ok)| (a.to_string(), ok))
+        );
+        assert_eq!(store.doc_history(ch, &sop.path).unwrap()[0].author, "intake");
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

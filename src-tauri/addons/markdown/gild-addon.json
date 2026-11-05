@@ -1,0 +1,77 @@
+{
+  "id": "gild.markdown",
+  "name": "Markdown",
+  "version": "0.1.0",
+  "publisher": "gild",
+  "description": "Markdown files in a channel: read, write, and edit section by section.",
+  "contributes": {
+    "fileTypes": [
+      {
+        "id": "markdown",
+        "name": "Markdown",
+        "extensions": [".md"],
+        "operations": [
+          {
+            "name": "replace_section",
+            "description": "Replace the text under a heading. The heading itself stays; the section ends at the next heading of the same or a higher level.",
+            "params": {
+              "type": "object",
+              "properties": {
+                "heading": { "type": "string", "description": "The heading's text, without the #s." },
+                "text": { "type": "string", "description": "The section's new text, in markdown." }
+              },
+              "required": ["heading", "text"]
+            }
+          },
+          {
+            "name": "insert_after",
+            "description": "Add text at the end of a heading's section.",
+            "params": {
+              "type": "object",
+              "properties": {
+                "heading": { "type": "string", "description": "The heading's text, without the #s." },
+                "text": { "type": "string", "description": "The text to add, in markdown." }
+              },
+              "required": ["heading", "text"]
+            }
+          },
+          {
+            "name": "replace_text",
+            "description": "Replace a piece of text that appears exactly once in the file.",
+            "params": {
+              "type": "object",
+              "properties": {
+                "find": { "type": "string", "description": "The text as it is now; it must appear exactly once." },
+                "replace": { "type": "string", "description": "What it becomes." }
+              },
+              "required": ["find", "replace"]
+            }
+          },
+          {
+            "name": "append",
+            "description": "Add text at the end of the file.",
+            "params": {
+              "type": "object",
+              "properties": { "text": { "type": "string", "description": "The text to add, in markdown." } },
+              "required": ["text"]
+            }
+          },
+          {
+            "name": "set_text",
+            "description": "Replace the whole file.",
+            "params": {
+              "type": "object",
+              "properties": { "text": { "type": "string", "description": "The file's new text." } },
+              "required": ["text"]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "network": [],
+    "secrets": [],
+    "files": ["*.md"]
+  }
+}

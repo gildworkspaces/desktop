@@ -1,8 +1,10 @@
+mod addons;
 mod clients;
 mod export;
 mod mcp;
 mod records;
 mod store;
+mod view;
 mod wake;
 
 use std::sync::{Arc, Mutex};
@@ -12,7 +14,7 @@ use std::collections::BTreeMap;
 
 use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, LoopRules, Message, Profile, Store, Workspace, Working};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, ChannelView, LoopRules, Message, Profile, Store, Workspace, Working};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -89,6 +91,42 @@ fn messages(core: State<Core>, channel_id: String) -> Result<Vec<Message>, Strin
 #[tauri::command]
 fn send_message(core: State<Core>, channel_id: String, body: String) -> Result<Message, String> {
     with(&core, |s| s.post(&channel_id, &s.me()?, "person", &body))
+}
+
+/// The add-ons gild has, with what they contribute and may touch.
+#[tauri::command]
+fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
+    with(&core, |s| Ok(s.addons()))
+}
+
+/// A channel's shared view: its files, what's open, who controls it.
+#[tauri::command]
+fn channel_view(core: State<Core>, channel_id: String) -> Result<ChannelView, String> {
+    with(&core, |s| s.view(&channel_id))
+}
+
+/// You move around the view (and so take it).
+#[tauri::command]
+fn drive_view(app: tauri::AppHandle, core: State<Core>, channel_id: String, nav: view::Nav) -> Result<ChannelView, String> {
+    let v = with(&core, |s| s.drive(&channel_id, &view::Actor::Person(s.me()?), &nav))?;
+    let _ = tauri::Emitter::emit(&app, "gild://view", &channel_id);
+    Ok(v)
+}
+
+/// You edit the open file through its add-on's operation.
+#[tauri::command]
+fn edit_file(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String, op: String, args: serde_json::Value) -> Result<ChannelView, String> {
+    let v = with(&core, |s| s.edit_file(&channel_id, &view::Actor::Person(s.me()?), &path, &op, &args))?;
+    let _ = tauri::Emitter::emit(&app, "gild://view", &channel_id);
+    Ok(v)
+}
+
+/// You take the view from an agent.
+#[tauri::command]
+fn take_over_view(app: tauri::AppHandle, core: State<Core>, channel_id: String) -> Result<ChannelView, String> {
+    let v = with(&core, |s| s.take_over(&channel_id, &s.me()?))?;
+    let _ = tauri::Emitter::emit(&app, "gild://view", &channel_id);
+    Ok(v)
 }
 
 /// Agents running right now, and where they were called.
@@ -396,6 +434,11 @@ pub fn run() {
             send_message,
             thread,
             working,
+            addons,
+            channel_view,
+            drive_view,
+            edit_file,
+            take_over_view,
             send_reply,
             channel_data,
             set_view,

@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.13.0)
+## What works (0.14.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -75,6 +75,24 @@ everything after that is the design doc.
   *Let them continue* bar, or any reply there) or a coordinator (gild
   @mentions it unless *Ask the coordinator* is off) lets them continue.
   *Notify me* adds a notification on this computer.
+- **Files: the view as a shared computer.** A channel's **Files** tab shows
+  every file in its repository (gild's own `.gild/` folder aside) as a tree,
+  and the open file. The view's state (open folders, selection, the open
+  file) lives in the core, so a person and an agent see and move the same
+  screen. One controller at a time: an agent with write access calls
+  `take_view`, and while it drives the view shows **Controlled by @agent**
+  with **Take over**; a person always wins, and an idle controller gives the
+  view up after a minute. Agents navigate with `open_folder`, `select`,
+  `open_file`, paced so people can follow, and edit only the file they have
+  open.
+- **Add-ons.** A file type comes from an add-on: a manifest
+  (`gild-addon.json`) with its extensions, its operations (typed, described)
+  and what it may touch. Every operation is an agent tool
+  (`markdown_replace_section`, …), and the window's own edits go through the
+  same operations; each is a commit and an Activity entry. Markdown is the
+  first add-on (Settings › Add-ons). Add-on logic is to run as WebAssembly
+  components behind the same editor interface; today Markdown's runs in the
+  core.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
@@ -117,6 +135,9 @@ The first run creates a "Demo workspace" with #general.
   branch, `proposals/<id>`; approving it is a merge commit by the person who
   approved, and rejecting it moves the branch to `refs/gild/rejected/<id>`,
   so what was proposed is never lost.
+- `src-tauri/src/view.rs`: the shared view and its one controller.
+- `src-tauri/src/addons.rs` and `src-tauri/addons/`: add-on manifests, the
+  registry, and the Markdown add-on.
 - `src-tauri/src/clients.rs`: finding Claude Code and Codex on this
   computer and adding or removing an agent's server in them.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
