@@ -5,9 +5,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { core, errorText, BANNERS, MAX_BIO, type Channel, type Manifest, type Profile, type Theme, type Workspace } from '@/lib/core'
+import { core, errorText, BANNERS, MAX_BIO, type Agent, type Channel, type Grant, type Manifest, type Profile, type Theme, type Workspace } from '@/lib/core'
 import { Avatar, type SettingsSection } from './Profile'
-import { AgentsSettings } from './Agents'
+import { AgentPage, AgentsSettings, Toggle } from './Agents'
 
 type Group = { label: string; items: { key: SettingsSection; label: string }[] }
 
@@ -30,7 +30,9 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
     { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }, { key: 'addons', label: 'Add-ons' }] },
     { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'data', label: 'Export and import' }] },
   ]
-  const title = groups.flatMap(g => g.items).find(i => i.key === at)?.label ?? ''
+  // An agent's or add-on's own page sits under its section.
+  const parent: SettingsSection = at.startsWith('agent:') ? 'agents' : at.startsWith('addon:') ? 'addons' : at
+  const title = groups.flatMap(g => g.items).find(i => i.key === parent)?.label ?? ''
 
   return (
     <div className="modalback settingsback" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -44,7 +46,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
             <div key={g.label} className="sgroup">
               <span className="label">{g.label}</span>
               {g.items.map(i => (
-                <button key={i.key} className={at === i.key ? 'sitem on' : 'sitem'} aria-current={at === i.key ? 'page' : undefined} onClick={() => setAt(i.key)}>{i.label}</button>
+                <button key={i.key} className={parent === i.key ? 'sitem on' : 'sitem'} aria-current={parent === i.key ? 'page' : undefined} onClick={() => setAt(i.key)}>{i.label}</button>
               ))}
             </div>
           ))}
@@ -59,8 +61,10 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
           </header>
           {at === 'profile' && <ProfilePage profile={profile} onProfile={onProfile} />}
           {at === 'appearance' && <AppearancePage profile={profile} onProfile={onProfile} />}
-          {at === 'agents' && <AgentsSettings channels={channels} current={current} />}
-          {at === 'addons' && <AddonsPage />}
+          {at === 'agents' && <AgentsSettings channels={channels} current={current} onOpenAgent={a => setAt(`agent:${a.id}`)} />}
+          {at.startsWith('agent:') && <AgentPage key={at} agentId={at.slice(6)} channels={channels} current={current} onBack={() => setAt('agents')} />}
+          {at === 'addons' && <AddonsPage onPermissions={id => setAt(`addon:${id}`)} />}
+          {at.startsWith('addon:') && <AddonPermissions key={at} addonId={at.slice(6)} onBack={() => setAt('addons')} />}
           {at === 'data' && <DataPage workspace={workspace} onImported={onImported} />}
         </section>
       </div>
@@ -189,7 +193,7 @@ function AppearancePage({ profile, onProfile }: { profile: Profile; onProfile: (
 }
 
 /** Settings › Add-ons: what each add-on adds and what it may touch. */
-function AddonsPage() {
+function AddonsPage({ onPermissions }: { onPermissions: (id: string) => void }) {
   const [list, setList] = useState<Manifest[] | null>(null)
   const [error, setError] = useState('')
   useEffect(() => { core.addons().then(setList, e => setError(errorText(e))) }, [])
@@ -200,7 +204,7 @@ function AddonsPage() {
       {error && <p className="error">{error}</p>}
       {list?.map(m => (
         <div key={m.id} className="addon">
-          <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span><span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span></div>
+          <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span><span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span><span className="spacer" /><button className="ghost" onClick={() => onPermissions(m.id)}>Permissions</button></div>
           <p className="soft" style={{ margin: 0, fontSize: 13 }}>{m.description}</p>
           {m.contributes.fileTypes.map(t => (
             <div key={t.id} className="addonpart">
@@ -214,6 +218,75 @@ function AddonsPage() {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+const KIND: Record<string, string> = { files: 'Edit files matching', network: 'Reach', secrets: 'Use the secret' }
+
+/** Settings › Add-ons › an add-on › Permissions: what it may touch, and which agents may use its tools. */
+function AddonPermissions({ addonId, onBack }: { addonId: string; onBack: () => void }) {
+  const [manifest, setManifest] = useState<Manifest | null>(null)
+  const [grants, setGrants] = useState<Grant[]>([])
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [off, setOff] = useState<Record<string, string[]>>({})
+  const [error, setError] = useState('')
+  useEffect(() => {
+    core.addons().then(ms => setManifest(ms.find(m => m.id === addonId) ?? null), e => setError(errorText(e)))
+    core.addonGrants(addonId).then(setGrants, e => setError(errorText(e)))
+    core.agents().then(async list => {
+      setAgents(list)
+      const entries = await Promise.all(list.map(a => core.agentToolsOff(a.id).then(o => [a.id, o] as const)))
+      setOff(Object.fromEntries(entries))
+    }, e => setError(errorText(e)))
+  }, [addonId])
+  if (!manifest) return <div className="spage"><button className="link back" onClick={onBack}>← Add-ons</button>{error && <p className="error">{error}</p>}</div>
+  const tools = manifest.contributes.fileTypes.flatMap(t => t.operations.map(o => `${t.id}_${o.name}`))
+  async function grant(g: Grant, v: boolean) {
+    setError('')
+    try { setGrants(await core.setAddonGrant(addonId, g.kind, g.value, v)) } catch (e) { setError(errorText(e)) }
+  }
+  async function allow(agentId: string, names: string[], v: boolean) {
+    setError('')
+    try { let last: string[] = off[agentId] ?? []; for (const n of names) last = await core.setAgentTool(agentId, n, v); setOff(o => ({ ...o, [agentId]: last })) } catch (e) { setError(errorText(e)) }
+  }
+  return (
+    <div className="spage">
+      <button className="link back" onClick={onBack}>← Add-ons</button>
+      <h2 style={{ fontSize: 20 }}>{manifest.name} permissions</h2>
+      <section className="toolgroup" aria-label={`What ${manifest.name} may touch`}>
+        <span className="flabel">What {manifest.name} may touch</span>
+        {grants.length === 0 && <p className="faint">It asks for nothing.</p>}
+        {grants.map(g => (
+          <Toggle key={g.kind + g.value} id={`grant-${g.kind}-${g.value}`} label={`${KIND[g.kind]} ${g.value}`}
+            hint={g.kind === 'files' ? `Off: ${manifest.name} edits nothing that matches, for everyone.` : undefined} on={g.granted} onChange={v => grant(g, v)} />
+        ))}
+        {(['network', 'secrets'] as const).filter(k => !grants.some(g => g.kind === k)).map(k => <p key={k} className="faint hint">{k === 'network' ? 'It reaches no network.' : 'It uses no secrets.'}</p>)}
+      </section>
+      <section className="toolgroup" aria-label="Which agents can use its tools">
+        <span className="flabel">Which agents can use its tools</span>
+        {agents.length === 0 && <p className="faint">No agents yet.</p>}
+        {agents.length > 0 && (
+          <div className="matrix" role="table" aria-label={`${manifest.name} tools by agent`} style={{ '--cols': tools.length + 1 } as React.CSSProperties}>
+            <div className="mrow head" role="row"><span role="columnheader">Agent</span>{tools.map(t => <span key={t} role="columnheader" className="mono">{t.replace(/^[^_]+_/, '').replace(/_/g, '_\u200b')}</span>)}<span role="columnheader">All</span></div>
+            {agents.map(a => {
+              const mine = off[a.id] ?? []
+              const allOn = tools.every(t => !mine.includes(t))
+              return (
+                <div key={a.id} className="mrow" role="row">
+                  <span role="rowheader"><b>{a.name}</b></span>
+                  {tools.map(t => (
+                    <span key={t} role="cell"><button role="switch" aria-checked={!mine.includes(t)} aria-label={`${a.name}: ${t}`} className={mine.includes(t) ? 'switch' : 'switch on'} onClick={() => allow(a.id, [t], mine.includes(t))}><span /></button></span>
+                  ))}
+                  <span role="cell"><button className="link" onClick={() => allow(a.id, tools, !allOn)}>{allOn ? 'All off' : 'All on'}</button></span>
+                </div>
+              )
+            })}
+          </div>
+        )}
+        <span className="faint hint">The same switches are on each agent’s Tools tab.</span>
+      </section>
+      {error && <p className="error">{error}</p>}
     </div>
   )
 }

@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.14.0)
+## What works (0.15.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -93,6 +93,13 @@ everything after that is the design doc.
   first add-on (Settings › Add-ons). Add-on logic is to run as WebAssembly
   components behind the same editor interface; today Markdown's runs in the
   core.
+- **Permissions.** Every agent tool, gild's own and each add-on
+  operation, can be turned on or off per agent: Settings › Agents › an
+  agent › **Tools**. A tool that's off isn't offered to that agent, and a
+  call to it is refused and logged. Settings › Add-ons › **Permissions**
+  grants what an add-on asks to touch (Markdown: files matching `*.md`;
+  off, it edits nothing) and shows which agents may use its tools. An
+  agent's settings are a page in Settings, opened from the sidebar too.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,

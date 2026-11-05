@@ -18,6 +18,10 @@ export type Manifest = {
   permissions: { network: string[]; secrets: string[]; files: string[] }
 }
 
+/** An agent tool, as Settings lists it. */
+export type ToolInfo = { name: string; description: string; group: string; addon: string | null }
+export type Grant = { kind: 'files' | 'network' | 'secrets'; value: string; granted: boolean }
+
 /** An agent running right now, and where it was called (thread: a thread in that channel). */
 export type Working = { agent: string; channel_id: string; thread: string | null }
 export type Status = 'online' | 'idle' | 'dnd' | 'invisible'
@@ -99,6 +103,11 @@ export const core = {
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
   working: () => invoke<Working[]>('working'),
   addons: () => invoke<Manifest[]>('addons'),
+  toolCatalog: () => invoke<ToolInfo[]>('tool_catalog'),
+  agentToolsOff: (agentId: string) => invoke<string[]>('agent_tools_off', { agentId }),
+  setAgentTool: (agentId: string, tool: string, allowed: boolean) => invoke<string[]>('set_agent_tool', { agentId, tool, allowed }),
+  addonGrants: (addonId: string) => invoke<Grant[]>('addon_grants', { addonId }),
+  setAddonGrant: (addonId: string, kind: string, value: string, granted: boolean) => invoke<Grant[]>('set_addon_grant', { addonId, kind, value, granted }),
   channelView: (channelId: string) => invoke<ChannelView>('channel_view', { channelId }),
   driveView: (channelId: string, nav: Nav) => invoke<ChannelView>('drive_view', { channelId, nav }),
   editFile: (channelId: string, path: string, op: string, args: Record<string, unknown>) => invoke<ChannelView>('edit_file', { channelId, path, op, args }),

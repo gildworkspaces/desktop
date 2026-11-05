@@ -446,3 +446,17 @@ tbody tr:hover { background: var(--chip); }
 .addonpart { display: flex; flex-direction: column; gap: 2px; }
 .addonpart ul { margin: 4px 0 0; padding-left: 18px; font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
 .addonpart .mono { font-size: 12px; }
+
+/* Agent page, tool switches, add-on permissions */
+.link.back { align-self: flex-start; font-size: 13px; }
+.setup.page { display: flex; flex-direction: column; gap: 12px; }
+.toolgroups { display: flex; flex-direction: column; gap: 18px; }
+.toolgroup { display: flex; flex-direction: column; gap: 2px; padding: 12px 16px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
+.toolgroup .toggle label { font-family: var(--mono); font-size: 13px; font-weight: 500; }
+.matrix { display: flex; flex-direction: column; border: 1px solid var(--rule); border-radius: 10px; overflow-x: auto; }
+.mrow { display: grid; grid-template-columns: minmax(110px, 1.2fr) repeat(var(--cols, 6), minmax(76px, 1fr)); align-items: center; gap: 8px; padding: 8px 12px; font-size: 13px; }
+.mrow + .mrow { border-top: 1px solid var(--rule); }
+.mrow.head { font-size: 11px; color: var(--faint); }
+.mrow.head .mono { font-size: 11px; }
+.toolgroup > p { margin: 4px 0 0; }
+.mrow.head span { overflow-wrap: anywhere; line-height: 1.3; }
