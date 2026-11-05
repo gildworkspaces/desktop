@@ -8,9 +8,10 @@
 //! `tool_calls` as OpenAI shapes them) and its model search, which marks the
 //! models that can call tools.
 //!
-//! A provider's token lives in the system keychain (macOS Keychain, Windows
-//! Credential Manager), never in gild's database, where an agent on this
-//! computer could read it.
+//! A provider's token lives in harar (Addis's vault) when it's installed,
+//! else in the system keychain (macOS Keychain, Windows Credential
+//! Manager), never in gild's database, where an agent on this computer could
+//! read it.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -48,6 +49,142 @@ impl Secrets for Keychain {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(e) => Err(format!("removing from the keychain: {e}")),
             },
+        }
+    }
+}
+
+/// harar, Addis's vault: a per-user agent holding an encrypted vault, the
+/// master key sealed to the Secure Enclave on a Mac. gild talks to it
+/// through its CLI, its stable interface: `harar get <key>` answers JSON
+/// `{"ok":true,"value":…}`, and `harar put <key> --secret-stdin` takes the
+/// value on stdin, never on the command line.
+pub struct Harar {
+    pub bin: std::path::PathBuf,
+}
+
+impl Harar {
+    /// harar where its installer (or cargo, or a package manager) puts it.
+    pub fn find() -> Option<Harar> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mut places: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(h) = &home {
+            places.push(h.join(".harar/bin/harar"));
+            places.push(h.join(".cargo/bin/harar"));
+        }
+        places.push("/opt/homebrew/bin/harar".into());
+        places.push("/usr/local/bin/harar".into());
+        places.push("/usr/bin/harar".into());
+        places.into_iter().find(|p| p.is_file()).map(|bin| Harar { bin })
+    }
+
+    fn run(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = std::process::Command::new(&self.bin)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("couldn't run harar: {e}"))?;
+        if let (Some(v), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(v.as_bytes()).map_err(|e| format!("talking to harar: {e}"))?;
+        }
+        let out = child.wait_with_output().map_err(|e| format!("talking to harar: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    fn explain(err: String) -> String {
+        if err.contains("no harar agent") {
+            "harar isn't running. Start it with `harar agent` (it keeps gild's provider tokens), then try again.".into()
+        } else if err.contains("not_approved") {
+            "harar didn't approve gild's request. Unlock harar (`harar unlock`) and try again.".into()
+        } else {
+            format!("harar: {err}")
+        }
+    }
+}
+
+impl Secrets for Harar {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        match self.run(&["get", key], None) {
+            Ok(out) => {
+                let v: Value = serde_json::from_str(out.trim()).map_err(|e| format!("harar answered something gild can't read: {e}"))?;
+                Ok(v["value"].as_str().map(str::to_string).filter(|s| !s.is_empty()))
+            }
+            Err(e) if e.contains("not_found") => Ok(None),
+            Err(e) => Err(Self::explain(e)),
+        }
+    }
+
+    fn set(&self, key: &str, value: Option<&str>) -> Result<(), String> {
+        // harar's CLI has no delete: an empty value is no token.
+        self.run(&["put", key, "--secret-stdin"], Some(value.unwrap_or(""))).map(drop).map_err(Self::explain)
+    }
+}
+
+/// Where gild keeps provider tokens: harar when it's installed (on every
+/// platform), else the system keychain on macOS and Windows. A token saved
+/// in the keychain before harar was installed moves into harar the first
+/// time it's read. On Linux without harar there's nowhere safe, so saving
+/// asks for harar.
+pub struct Vault {
+    pub harar: Option<Box<dyn Secrets>>,
+    pub keychain: Option<Box<dyn Secrets>>,
+}
+
+impl Vault {
+    pub fn for_this_computer() -> Vault {
+        Vault {
+            harar: Harar::find().map(|h| Box::new(h) as Box<dyn Secrets>),
+            keychain: if cfg!(any(target_os = "macos", target_os = "windows")) { Some(Box::new(Keychain)) } else { None },
+        }
+    }
+
+    /// Which one holds the tokens: "harar", "keychain" or "none".
+    pub fn kind(&self) -> &'static str {
+        if self.harar.is_some() { "harar" } else if self.keychain.is_some() { "keychain" } else { "none" }
+    }
+}
+
+const NOWHERE: &str = "gild keeps provider tokens in harar, and harar isn't installed. Install it: curl -fsSL https://harar.addis.gg/install.sh | sh";
+
+impl Secrets for Vault {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        match (&self.harar, &self.keychain) {
+            (Some(h), k) => match h.get(key)? {
+                Some(v) => Ok(Some(v)),
+                None => match k.as_ref().map(|k| k.get(key)).transpose()?.flatten() {
+                    Some(v) => {
+                        h.set(key, Some(&v))?;
+                        if let Some(k) = k {
+                            k.set(key, None)?;
+                        }
+                        Ok(Some(v))
+                    }
+                    None => Ok(None),
+                },
+            },
+            (None, Some(k)) => k.get(key),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn set(&self, key: &str, value: Option<&str>) -> Result<(), String> {
+        match (&self.harar, &self.keychain) {
+            (Some(h), k) => {
+                h.set(key, value)?;
+                if let Some(k) = k {
+                    k.set(key, None)?;
+                }
+                Ok(())
+            }
+            (None, Some(k)) => k.set(key, value),
+            (None, None) if value.is_none() => Ok(()),
+            (None, None) => Err(NOWHERE.into()),
         }
     }
 }
@@ -136,48 +273,146 @@ pub struct ToolCall {
 }
 
 /// One answer from the model: the assistant message to keep in the
-/// conversation, what it said, and the tools it wants to call.
+/// conversation, and the tools it wants to call.
 pub struct Turn {
     pub message: Value,
-    pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// One round of chat completions.
-pub async fn chat(c: &Creds, model: &str, messages: &[Value], tools: &[Value]) -> Result<Turn, String> {
+/// One round of chat completions, streamed: `on_text` gets the answer's
+/// text as it arrives; tool calls are put together from their pieces.
+pub async fn chat_stream(c: &Creds, model: &str, messages: &[Value], tools: &[Value], mut on_text: impl FnMut(&str)) -> Result<Turn, String> {
     let url = format!("{}/accounts/{}/ai/v1/chat/completions", c.base, c.account);
-    let mut body = json!({ "model": model, "messages": messages });
+    let mut body = json!({ "model": model, "messages": messages, "stream": true });
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
-    let res = client()?.post(url).bearer_auth(&c.token).json(&body).send().await.map_err(|e| format!("Couldn't reach Workers AI: {e}"))?;
+    let mut res = client()?.post(url).bearer_auth(&c.token).json(&body).send().await.map_err(|e| format!("Couldn't reach Workers AI: {e}"))?;
     let status = res.status();
-    let answer: Value = res.json().await.map_err(|e| format!("Workers AI answered something gild can't read: {e}"))?;
     if !status.is_success() {
+        let answer: Value = res.json().await.unwrap_or(Value::Null);
         return Err(format!("Workers AI said no ({status}): {}", errors(&answer)));
     }
-    let message = answer["choices"][0]["message"].clone();
-    if message.is_null() {
-        return Err(format!("Workers AI sent no answer: {}", errors(&answer)));
+    let mut text = String::new();
+    // Tool calls by their index: id, name, and the arguments' pieces.
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut pending = String::new();
+    let mut done = false;
+    while !done {
+        let Some(chunk) = res.chunk().await.map_err(|e| format!("Workers AI's answer broke off: {e}"))? else { break };
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = pending.find('\n') {
+            let line: String = pending.drain(..=end).collect();
+            let Some(data) = line.trim().strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" {
+                done = true;
+                break;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+            let delta = &event["choices"][0]["delta"];
+            if let Some(piece) = delta["content"].as_str().filter(|p| !p.is_empty()) {
+                text.push_str(piece);
+                on_text(piece);
+            }
+            for t in delta["tool_calls"].as_array().into_iter().flatten() {
+                let i = t["index"].as_u64().unwrap_or(calls.len() as u64) as usize;
+                while calls.len() <= i {
+                    calls.push(Default::default());
+                }
+                if let Some(id) = t["id"].as_str() {
+                    calls[i].0 = id.to_string();
+                }
+                if let Some(name) = t["function"]["name"].as_str() {
+                    calls[i].1.push_str(name);
+                }
+                match &t["function"]["arguments"] {
+                    Value::String(piece) => calls[i].2.push_str(piece),
+                    Value::Object(_) => calls[i].2 = t["function"]["arguments"].to_string(),
+                    _ => {}
+                }
+            }
+        }
     }
-    let tool_calls = message["tool_calls"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| {
-            let f = &t["function"];
-            let arguments = match &f["arguments"] {
-                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Object(Default::default())),
-                Value::Object(_) => f["arguments"].clone(),
-                _ => Value::Object(Default::default()),
-            };
-            Some(ToolCall { id: t["id"].as_str().unwrap_or("").to_string(), name: f["name"].as_str()?.to_string(), arguments })
-        })
+    let tool_calls: Vec<ToolCall> = calls
+        .iter()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, args)| ToolCall { id: id.clone(), name: name.clone(), arguments: serde_json::from_str(args).unwrap_or(Value::Object(Default::default())) })
         .collect();
-    let content = message["content"].as_str().map(str::to_string).filter(|s| !s.trim().is_empty());
     // What goes back into the conversation: Workers AI wants `content` as a
-    // string even when the model only called tools (it answers with null).
-    let mut message = message;
-    message["content"] = json!(content.clone().unwrap_or_default());
-    Ok(Turn { message, content, tool_calls })
+    // string even when the model only called tools.
+    let mut message = json!({ "role": "assistant", "content": text });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(calls
+            .iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, args)| json!({ "id": id, "type": "function", "function": { "name": name, "arguments": if args.is_empty() { "{}" } else { args } } }))
+            .collect::<Vec<_>>());
+    }
+    Ok(Turn { message, tool_calls })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for the harar CLI: `get`/`put --secret-stdin` over one
+    /// file per key, answering as harar does; `down` answers as harar does
+    /// when its agent isn't running.
+    fn fake_harar(dir: &std::path::Path, down: bool) -> Harar {
+        let bin = dir.join("harar");
+        let body = if down {
+            "#!/bin/sh\necho \"Error: no harar agent at /x/agent.sock; start one with \\`harar agent\\`\" >&2; exit 1\n".to_string()
+        } else {
+            format!(
+                "#!/bin/sh\nD='{}'\nk=$(printf %s \"$2\" | tr / _)\ncase $1 in\n get) [ -s \"$D/$k\" ] || {{ echo 'Error: harar refused: not_found' >&2; exit 1; }}; printf '{{\"ok\":true,\"value\":\"%s\"}}\\n' \"$(cat \"$D/$k\")\" ;;\n put) cat > \"$D/$k\"; echo '{{\"ok\":true}}' ;;\nesac\n",
+                dir.display()
+            )
+        };
+        std::fs::write(&bin, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Harar { bin }
+    }
+
+    fn temp() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("gild-vault-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn tokens_live_in_harar_and_move_there_from_the_keychain() {
+        let dir = temp();
+        let keychain = InMemory::default();
+        keychain.set("gild/workers-ai/token", Some("old-token")).unwrap();
+        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, false))), keychain: Some(Box::new(keychain)) };
+        assert_eq!(vault.kind(), "harar");
+        // The keychain's token moves into harar on first read…
+        assert_eq!(vault.get("gild/workers-ai/token").unwrap().as_deref(), Some("old-token"));
+        assert_eq!(std::fs::read_to_string(dir.join("gild_workers-ai_token")).unwrap(), "old-token");
+        assert_eq!(vault.keychain.as_ref().unwrap().get("gild/workers-ai/token").unwrap(), None, "and leaves the keychain");
+        // …and new ones go straight to harar.
+        vault.set("gild/workers-ai/token", Some("new-token")).unwrap();
+        assert_eq!(vault.get("gild/workers-ai/token").unwrap().as_deref(), Some("new-token"));
+        vault.set("gild/workers-ai/token", None).unwrap();
+        assert_eq!(vault.get("gild/workers-ai/token").unwrap(), None, "removed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn harar_down_or_missing_is_said_plainly() {
+        let dir = temp();
+        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, true))), keychain: None };
+        assert!(vault.get("gild/workers-ai/token").unwrap_err().contains("Start it with `harar agent`"));
+        // Linux without harar: nowhere safe to keep it.
+        let nowhere = Vault { harar: None, keychain: None };
+        assert_eq!(nowhere.kind(), "none");
+        assert!(nowhere.set("k", Some("v")).unwrap_err().contains("harar.addis.gg/install.sh"));
+        assert_eq!(nowhere.get("k").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

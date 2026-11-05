@@ -163,6 +163,8 @@ pub struct Store {
     views: std::sync::Mutex<HashMap<String, ViewState>>,
     addons: &'static Registry,
     secrets: Box<dyn providers::Secrets>,
+    /// Where those secrets are: "harar", "keychain" or "none".
+    vault: &'static str,
     provider_base: String,
 }
 
@@ -260,7 +262,8 @@ impl Store {
             .map_err(|e| err("preparing the workspace database", e))?;
         let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in(),
             // Tests never touch the real keychain.
-            secrets: if cfg!(test) { Box::new(providers::InMemory::default()) } else { Box::new(providers::Keychain) },
+            secrets: if cfg!(test) { Box::new(providers::InMemory::default()) } else { Box::new(providers::Vault::for_this_computer()) },
+            vault: if cfg!(test) { "harar" } else { providers::Vault::for_this_computer().kind() },
             provider_base: providers::WORKERS_AI_BASE.into() };
         match store.query("SELECT value FROM gild_meta WHERE key = 'format'", &[])?.first() {
             None => store.run("INSERT INTO gild_meta (key, value) VALUES ('format', ?1)", &[Value::from_i64(FORMAT)])?,
@@ -443,6 +446,54 @@ impl Store {
         if body.is_empty() {
             return Err("A message needs some text.".into());
         }
+        let message = self.insert_message(channel_id, thread, author, kind, body)?;
+        self.record_mentions(&message)?;
+        Ok(message)
+    }
+
+    /// A message an agent is still writing: it grows as its words arrive
+    /// (`update_draft`) and counts as said only once finished
+    /// (`finish_draft`), when the mentions in it are acted on.
+    pub fn start_draft(&self, channel_id: &str, thread: Option<&str>, author: &str) -> Result<Message, String> {
+        self.insert_message(channel_id, thread, author, "agent", "")
+    }
+
+    pub fn update_draft(&self, id: &str, body: &str) -> Result<(), String> {
+        self.run("UPDATE messages SET body = ?1 WHERE id = ?2", &[Value::from_text(body.to_string()), Value::from_text(id.to_string())])
+    }
+
+    /// The draft as said; a draft left empty is taken away.
+    pub fn finish_draft(&self, id: &str, body: &str) -> Result<Option<Message>, String> {
+        let body = body.trim();
+        let rows = self.query(
+            "SELECT m.channel_id, m.author, m.kind, m.created_at, t.root_id FROM messages m LEFT JOIN thread_replies t ON t.message_id = m.id WHERE m.id = ?1",
+            &[Value::from_text(id.to_string())],
+        )?;
+        let r = rows.first().ok_or("That message is gone.")?;
+        if body.is_empty() {
+            self.run("DELETE FROM thread_replies WHERE message_id = ?1", &[Value::from_text(id.to_string())])?;
+            self.run("DELETE FROM messages WHERE id = ?1", &[Value::from_text(id.to_string())])?;
+            return Ok(None);
+        }
+        self.update_draft(id, body)?;
+        let message = Message {
+            id: id.to_string(),
+            channel_id: text(&r[0]),
+            author: text(&r[1]),
+            kind: text(&r[2]),
+            body: body.to_string(),
+            created_at: int(&r[3]),
+            thread: match &r[4] {
+                Value::Null => None,
+                v => Some(text(v)),
+            },
+            ..Message::default()
+        };
+        self.record_mentions(&message)?;
+        Ok(Some(message))
+    }
+
+    fn insert_message(&self, channel_id: &str, thread: Option<&str>, author: &str, kind: &str, body: &str) -> Result<Message, String> {
         if self.query("SELECT 1 FROM channels WHERE id = ?1", &[Value::from_text(channel_id.to_string())])?.is_empty() {
             return Err("That channel no longer exists.".into());
         }
@@ -487,7 +538,6 @@ impl Store {
                 &[Value::from_text(message.id.clone()), Value::from_text(root.clone())],
             )?;
         }
-        self.record_mentions(&message)?;
         Ok(message)
     }
 }
@@ -1355,6 +1405,9 @@ pub enum Wake {
     Provider(Runner),
 }
 
+/// The Workers AI token's name in the vault.
+const TOKEN_KEY: &str = "gild/workers-ai/token";
+
 /// A cloud provider as Settings shows it (never its token).
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct ProviderInfo {
@@ -1362,6 +1415,9 @@ pub struct ProviderInfo {
     pub name: String,
     pub account_id: Option<String>,
     pub has_token: bool,
+    /// Where the token is kept: "harar", "keychain", or "none" (Linux
+    /// without harar: it can't be saved).
+    pub vault: String,
 }
 
 /// Recent messages sent with a mention, unless the agent's settings say
@@ -1933,7 +1989,8 @@ impl Store {
             id: providers::WORKERS_AI.into(),
             name: "Cloudflare Workers AI".into(),
             account_id: self.setting("workers-ai.account")?,
-            has_token: self.secrets.get("workers-ai.token")?.is_some(),
+            has_token: self.secrets.get(TOKEN_KEY)?.is_some(),
+            vault: self.vault.to_string(),
         }])
     }
 
@@ -1950,7 +2007,7 @@ impl Store {
         self.set_setting("workers-ai.account", (!account.is_empty()).then_some(account))?;
         if let Some(t) = token {
             let t = t.trim();
-            self.secrets.set("workers-ai.token", (!t.is_empty()).then_some(t))?;
+            self.secrets.set(TOKEN_KEY, (!t.is_empty()).then_some(t))?;
         }
         self.providers()
     }
@@ -1962,7 +2019,7 @@ impl Store {
         }
         let missing = || "Cloudflare Workers AI isn't set up: add your account ID and token in Settings › Providers.".to_string();
         let account = self.setting("workers-ai.account")?.ok_or_else(missing)?;
-        let token = self.secrets.get("workers-ai.token")?.ok_or_else(missing)?;
+        let token = self.secrets.get(TOKEN_KEY)?.ok_or_else(missing)?;
         Ok(providers::Creds { base: self.provider_base.clone(), account, token })
     }
 

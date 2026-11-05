@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.17.0)
+## What works (0.18.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -100,11 +100,14 @@ everything after that is the design doc.
   in the cloud: its Connect tab, *Cloud*, then a provider and a model (the
   provider's live list, those that can use tools first). The first provider
   is Cloudflare Workers AI (Settings › Providers: account ID and an API
-  token, kept in the system keychain). When a cloud agent is mentioned, gild
-  calls the model (OpenAI-compatible chat completions), runs the tool calls
-  it asks for through the same path as the MCP endpoint (same switches,
-  Activity, limits), for up to 12 rounds, and posts its closing answer if it
-  didn't post one. The provider never connects to this computer.
+  token, kept in harar, Addis's vault, when it's installed, else the system
+  keychain on macOS and Windows). When a cloud agent is mentioned, gild
+  calls the model (OpenAI-compatible chat completions, streamed), and its
+  reply grows in the channel as it's written; tool calls run through the
+  same path as the MCP endpoint (same switches, Activity, limits). A run
+  ends when the model answers, posts where it was asked, or repeats itself,
+  and after 12 rounds at most. The provider never connects to this
+  computer.
 - **Permissions.** Every agent tool, gild's own and each add-on
   operation, can be turned on or off per agent: Settings › Agents › an
   agent › **Tools**. A tool that's off isn't offered to that agent, and a

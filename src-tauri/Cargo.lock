@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "gild-desktop"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -1938,6 +1938,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "turso_core",
  "wasmtime",
