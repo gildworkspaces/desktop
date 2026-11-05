@@ -295,7 +295,7 @@ try {
       const intake = chans.find(c => c.name === 'student-intake')
       const docs = await call('channel_docs', { channelId: intake.id })
       const again = await call('export_workspace', { workspaceId: ws.id })
-      return { ws, channels: chans.map(c => c.name), doc: docs.docs[0].body, messages: (await call('messages', { channelId: intake.id })).length, again }
+      return { ws, channels: chans.map(c => c.name), doc: docs.docs[0].body, messages: (await call('messages', { channelId: intake.id })).reduce((n, m) => n + 1 + (m.replies ?? 0), 0), again }
     })().then(done, e => done({ error: String(e) }))
   `)
   assert.equal(imported.error, undefined, imported.error)
