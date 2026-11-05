@@ -134,12 +134,16 @@ pub async fn run_command(command: &str, input: &str, limit: Duration) -> Result<
 /// The most model rounds a cloud agent gets per wake.
 pub const MAX_STEPS: usize = 12;
 
-const SYSTEM: &str = "You are an agent in gild, a workspace where people and agents work together in channels. You act only through the tools you are given; everything you do is recorded under your name. To answer, use post_message where you were mentioned (with thread_id for a thread). Be brief.";
+const SYSTEM: &str = "You are an agent in gild, a workspace where people and agents work together in channels. What you write in reply is posted, as you write it, where you were mentioned (in the thread, if it was a thread), so answer in your reply; use post_message only to post somewhere else. Use the other tools to look things up or to act; everything you do is recorded under your name. Be brief.";
 
-/// A cloud agent's run: gild calls the provider's model, runs the tool calls
-/// it asks for (as the MCP endpoint would, through the same `call_as`), and
-/// returns what the model says at the end.
-async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: &Agent, runner: &Runner, prompt: &str) -> Result<String, String> {
+/// How often a reply being written is shown again in the window.
+const STREAM_EVERY: Duration = Duration::from_millis(120);
+
+/// A cloud agent's run: gild calls the provider's model, streams what it
+/// writes into a reply where it was mentioned (`place`: channel and thread),
+/// and runs the tool calls it asks for, as the MCP endpoint would, through
+/// the same `call_as`.
+async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: &Agent, runner: &Runner, prompt: &str, place: (&str, Option<&str>)) -> Result<(), String> {
     let (creds, off) = {
         let store = core.lock().map_err(|_| "the workspace database is unavailable".to_string())?;
         (store.creds(&runner.provider)?, store.tools_off(&agent.id)?)
@@ -152,20 +156,71 @@ async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: 
         .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.input_schema.as_ref() } }))
         .collect();
     let gild = Gild { core: core.clone(), app: app.clone() };
+    // Calls already made this run: a model asking for the same thing again
+    // isn't run twice.
+    let mut done: Vec<(String, String)> = Vec::new();
     let mut messages = vec![json!({ "role": "system", "content": SYSTEM }), json!({ "role": "user", "content": prompt })];
+    let tell = |channel: &str| {
+        if let Some(app) = app {
+            let _ = app.emit("gild://changed", channel);
+        }
+    };
     for _ in 0..MAX_STEPS {
-        let turn = providers::chat(&creds, &runner.model, &messages, &tools).await?;
+        // The reply grows in the channel as the model writes it.
+        let (mut draft, mut written, mut shown) = (None::<String>, String::new(), std::time::Instant::now() - STREAM_EVERY);
+        let turn = providers::chat_stream(&creds, &runner.model, &messages, &tools, |piece| {
+            written.push_str(piece);
+            let Ok(store) = core.lock() else { return };
+            if draft.is_none() {
+                draft = store.start_draft(place.0, place.1, &agent.name).ok().map(|m| m.id);
+            }
+            if shown.elapsed() >= STREAM_EVERY {
+                if let Some(id) = &draft {
+                    let _ = store.update_draft(id, &written);
+                }
+                shown = std::time::Instant::now();
+                drop(store);
+                tell(place.0);
+            }
+        })
+        .await;
+        if let Some(id) = draft {
+            if let Ok(store) = core.lock() {
+                let _ = store.finish_draft(&id, &written);
+            }
+            tell(place.0);
+        }
+        let turn = turn?;
         messages.push(turn.message.clone());
         if turn.tool_calls.is_empty() {
-            return Ok(turn.content.unwrap_or_default());
+            return Ok(());
         }
+        let mut fresh = false;
+        let mut answered = false;
         for call in &turn.tool_calls {
             let args = call.arguments.as_object().cloned().unwrap_or_default();
-            let result = match gild.call_as(agent, &call.name, &args).await {
-                Ok(v) => v.to_string(),
-                Err(e) => format!("error: {e}"),
+            let key = (call.name.clone(), Value::Object(args.clone()).to_string());
+            let result = if done.contains(&key) {
+                "error: you already did exactly this; don't repeat it. If you've answered, stop.".to_string()
+            } else {
+                fresh = true;
+                done.push(key);
+                match gild.call_as(agent, &call.name, &args).await {
+                    Ok(v) => {
+                        // Posting where it was mentioned is its answer.
+                        let here = args.get("channel_id").and_then(Value::as_str) == Some(place.0)
+                            && args.get("thread_id").and_then(Value::as_str).filter(|t| !t.is_empty()) == place.1;
+                        answered |= call.name == "post_message" && here;
+                        v.to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
             };
             messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": result }));
+        }
+        // It answered where it was asked, or it's only repeating itself: done.
+        if answered || !fresh {
+            return Ok(());
         }
     }
     Err(format!("it was still working after {MAX_STEPS} rounds, so gild stopped it"))
@@ -186,22 +241,18 @@ async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, how
     let said = prompt(&agent.name, &mentions, &context, &endpoint);
     let outcome = match &how {
         Wake::Command(command) => run_command(command, &said, LIMIT).await,
-        Wake::Provider(runner) => match tokio::time::timeout(LIMIT, run_provider(&core, &app, &agent, runner, &said)).await {
-            Ok(r) => r,
-            Err(_) => Err(format!("it was still running after {} minutes, so it was stopped", LIMIT.as_secs() / 60)),
+        Wake::Provider(runner) => match mentions.first() {
+            None => Ok(String::new()),
+            Some(first) => match tokio::time::timeout(LIMIT, run_provider(&core, &app, &agent, runner, &said, (&first.channel_id, first.thread.as_deref()))).await {
+                Ok(r) => r.map(|()| String::new()),
+                Err(_) => Err(format!("it was still running after {} minutes, so it was stopped", LIMIT.as_secs() / 60)),
+            },
         },
     };
     let mut channels: Vec<String> = mentions.iter().map(|m| m.channel_id.clone()).collect();
     channels.dedup();
     if let Ok(mut store) = core.lock() {
         store.set_working(&agent.name, &mentions, false);
-        // A cloud model that ends with an answer but didn't post it: gild
-        // posts it where the agent was mentioned.
-        if let (Wake::Provider(_), Ok(text), Some(first)) = (&how, &outcome, mentions.first()) {
-            if !text.trim().is_empty() && !store.posted_since(&agent.name, &first.channel_id, started).unwrap_or(true) {
-                let _ = store.post_in(&first.channel_id, first.thread.as_deref(), &agent.name, "agent", text.trim());
-            }
-        }
         for channel in &channels {
             let detail = match &outcome {
                 Ok(_) => format!(
@@ -349,10 +400,12 @@ mod tests {
         assert!(err.contains("still running"), "{err}");
     }
 
-    /// A stand-in for Cloudflare's API, answering as the real one does
-    /// (OpenAI-shaped chat completions with tool_calls; model search with
-    /// properties): first a post_message call, then "Done." — or, when the
-    /// prompt says "plain", only text.
+    /// A stand-in for Cloudflare's API, answering as the real one does:
+    /// streamed chat completions (`data:` events with `delta.content` and
+    /// `delta.tool_calls` in pieces, then `[DONE]`), every message's content
+    /// a string, and model search with properties. First it asks for
+    /// read_channel; then it writes its answer, a piece at a time — or, when
+    /// the prompt says "plain", only writes.
     async fn workers_ai() -> (String, Arc<Mutex<Vec<Value>>>) {
         use axum::{routing::{get, post}, Json, Router};
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
@@ -363,25 +416,50 @@ mod tests {
                 post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
                     let log = log.clone();
                     async move {
+                        use axum::response::IntoResponse;
                         assert_eq!(headers["authorization"], "Bearer test-token");
                         log.lock().unwrap().push(body.clone());
-                        let messages = body["messages"].as_array().unwrap();
-                        // As the real one does: every message's content is a string.
+                        let messages = body["messages"].as_array().unwrap().clone();
                         if let Some(bad) = messages.iter().position(|m| !m["content"].is_string()) {
-                            return (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "message": format!("Type mismatch of '/messages/{bad}/content'") }] })));
+                            return (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "message": format!("Type mismatch of '/messages/{bad}/content'") }] }))).into_response();
                         }
-                        let prompt = messages[1]["content"].as_str().unwrap();
-                        let message = if prompt.contains("plain") {
-                            json!({ "role": "assistant", "content": "Plain answer." })
+                        let prompt = messages[1]["content"].as_str().unwrap().to_string();
+                        let delta = |d: Value| format!("data: {}\n\n", json!({ "object": "chat.completion.chunk", "choices": [{ "index": 0, "delta": d }] }));
+                        let at = prompt.find("channel_id ").unwrap() + 11;
+                        let channel: String = prompt[at..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                        let call = |name: &str, args: Value| delta(json!({ "tool_calls": [{ "index": 0, "id": format!("call_{}", messages.len()), "type": "function", "function": { "name": name, "arguments": args.to_string() } }] }));
+                        // What it was asked: the newest marked line.
+                        let latest = prompt.lines().rev().find(|l| l.starts_with("→ ")).unwrap_or("").to_string();
+                        let events: Vec<String> = if latest.contains("post it") {
+                            vec![call("post_message", json!({ "channel_id": channel, "text": "Posted with the tool." }))]
+                        } else if latest.contains("repeat") {
+                            vec![call("read_channel", json!({ "channel_id": channel }))]
+                        } else if prompt.contains("plain") {
+                            ["Plain ", "answer."].iter().map(|w| delta(json!({ "content": w }))).collect()
                         } else if messages.last().unwrap()["role"] == "tool" {
-                            json!({ "role": "assistant", "content": "Done." })
+                            ["The forms ", "go in ", "the red ", "folder."].iter().map(|w| delta(json!({ "content": w }))).collect()
                         } else {
                             let at = prompt.find("channel_id ").unwrap() + 11;
                             let channel: String = prompt[at..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-                            json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function",
-                                "function": { "name": "post_message", "arguments": json!({ "channel_id": channel, "text": "The forms go in the red folder." }).to_string() } }] })
+                            let args = json!({ "channel_id": channel }).to_string();
+                            let (one, two) = args.split_at(args.len() / 2);
+                            vec![
+                                delta(json!({ "role": "assistant", "content": "" })),
+                                delta(json!({ "tool_calls": [{ "index": 0, "id": "call_1", "type": "function", "function": { "name": "read_channel" } }] })),
+                                delta(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": one } }] })),
+                                delta(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": two } }] })),
+                            ]
                         };
-                        (axum::http::StatusCode::OK, Json(json!({ "id": "x", "object": "chat.completion", "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }] })))
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::convert::Infallible>>(8);
+                        tokio::spawn(async move {
+                            for e in events {
+                                let _ = tx.send(Ok(e)).await;
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                            let _ = tx.send(Ok("data: [DONE]\n\n".into())).await;
+                        });
+                        let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+                        ([("content-type", "text/event-stream")], body).into_response()
                     }
                 }),
             )
@@ -422,18 +500,31 @@ mod tests {
         tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
 
         core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@cloud where do the forms go?").unwrap();
+        // The answer shows while it's being written: part of it, then all.
+        let full = "The forms go in the red folder.";
+        let mut partial = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now: Option<String> = core.lock().unwrap().messages(&c.id).unwrap().into_iter().find(|m| m.author == "cloud").map(|m| m.body);
+            if let Some(b) = now.filter(|b| !b.is_empty() && b.len() < full.len()) {
+                partial = Some(b);
+                break;
+            }
+        }
+        let partial = partial.expect("the reply was seen part-written");
+        assert!(full.starts_with(&partial), "{partial:?}");
         let woken = wait_woken(&core, &c.id, 1).await;
         assert_eq!(woken, ["cloud: woken by Demo · replied (ok)"]);
         let store = core.lock().unwrap();
         let said: Vec<(String, String)> = store.messages(&c.id).unwrap().into_iter().map(|m| (m.author, m.body)).collect();
-        assert_eq!(said.last().unwrap(), &("cloud".to_string(), "The forms go in the red folder.".to_string()), "its post_message went through gild");
-        assert!(!said.iter().any(|(_, b)| b == "Done."), "its closing words aren't posted when it already answered");
+        assert_eq!(said.last().unwrap(), &("cloud".to_string(), full.to_string()), "the whole reply, once");
+        assert_eq!(said.iter().filter(|(a, _)| a == "cloud").count(), 1, "the tool round wrote nothing, so left nothing");
         let calls: Vec<(String, bool)> = store.activity(&c.id).unwrap().into_iter().filter(|a| a.action != "woken").map(|a| (a.action, a.ok)).collect();
-        assert_eq!(calls, [("post_message".to_string(), true)], "logged like any agent's call");
+        assert_eq!(calls, [("read_channel".to_string(), true)], "its tool call, put together from pieces, ran and was logged like any agent's");
         drop(store);
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "one round with the tool call, one to finish");
-        assert_eq!(seen[0]["model"], "@cf/b/tools");
+        assert_eq!(seen.len(), 2, "one round with the tool call, one to answer");
+        assert_eq!((seen[0]["model"].as_str(), seen[0]["stream"].as_bool()), (Some("@cf/b/tools"), Some(true)));
         let offered: Vec<&str> = seen[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
         assert!(offered.contains(&"post_message") && offered.contains(&"markdown_replace_section"));
         assert!(!offered.contains(&"read_doc"), "a tool turned off isn't offered");
@@ -530,5 +621,38 @@ mod tests {
             }
         }
         panic!("no answer within a minute");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cloud_model_that_posts_its_answer_or_repeats_itself_is_done() {
+        let dir = std::env::temp_dir().join(format!("gild-wake-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, seen) = workers_ai().await;
+        let mut store = Store::open(&dir).unwrap();
+        store.set_provider_base(&base);
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (cloud, _) = store.create_agent("cloud").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &cloud.id, Some(Access::Write)).unwrap();
+        store.save_provider(providers::WORKERS_AI, "acct1", Some("test-token")).unwrap();
+        store.set_runner(&cloud.id, Some(&Runner { provider: providers::WORKERS_AI.into(), model: "@cf/b/tools".into() })).unwrap();
+        let core = Arc::new(Mutex::new(store));
+        tokio::spawn(run(core.clone(), None, "http://127.0.0.1:4747/mcp".into()));
+
+        // post_message where it was mentioned is its answer: no second round.
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@cloud post it").unwrap();
+        wait_woken(&core, &c.id, 1).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let posted: Vec<String> = core.lock().unwrap().messages(&c.id).unwrap().into_iter().filter(|m| m.author == "cloud").map(|m| m.body).collect();
+        assert_eq!(posted, ["Posted with the tool."]);
+
+        // The same call again isn't run again, and ends the run.
+        core.lock().unwrap().post(&c.id, DEMO_NAME, "person", "@cloud repeat").unwrap();
+        let woken = wait_woken(&core, &c.id, 2).await;
+        assert!(woken.iter().all(|w| w.ends_with("(ok)")), "{woken:?}");
+        assert_eq!(seen.lock().unwrap().len(), 3, "one more round, then it stopped");
+        let reads = core.lock().unwrap().activity(&c.id).unwrap().into_iter().filter(|a| a.action == "read_channel").count();
+        assert_eq!(reads, 1, "read once, not twice");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

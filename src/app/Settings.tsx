@@ -205,7 +205,7 @@ function ProvidersPage() {
   if (!p) return note ? <p className="error" style={{ padding: 32 }}>{note.text}</p> : null
   async function save() {
     setBusy(true); setNote(null)
-    try { setList(await core.saveProvider(p!.id, account, token || null)); setToken(''); setNote({ ok: true, text: 'Saved. The token is in your keychain.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) }
+    try { setList(await core.saveProvider(p!.id, account, token || null)); setToken(''); setNote({ ok: true, text: `Saved. The token is in ${p!.vault === 'harar' ? 'harar' : 'your keychain'}.` }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) }
   }
   async function check() {
     setBusy(true); setNote(null)
@@ -223,13 +223,17 @@ function ProvidersPage() {
         <div className="sfield">
           <label htmlFor="cf-token" className="flabel">API token</label>
           <input id="cf-token" className="field mono" type="password" value={token} onChange={e => setToken(e.target.value)} spellCheck={false} autoComplete="off"
-            placeholder={p.has_token ? 'Saved in your keychain. Paste a new one to replace it.' : 'A token with Workers AI access'} />
-          <span className="faint hint">Kept in your system keychain, not in gild’s database, so agents on this computer can’t read it.</span>
+            placeholder={p.has_token ? `Saved in ${p.vault === 'harar' ? 'harar' : 'your keychain'}. Paste a new one to replace it.` : 'A token with Workers AI access'} disabled={p.vault === 'none'} />
+          <span className="faint hint">
+            {p.vault === 'harar' && 'Kept in harar, your vault, not in gild’s database, so agents on this computer can’t read it.'}
+            {p.vault === 'keychain' && 'Kept in your system keychain, not in gild’s database. Install harar (harar.addis.gg) and gild keeps it there instead.'}
+            {p.vault === 'none' && 'gild keeps provider tokens in harar, your vault. Install it first: curl -fsSL https://harar.addis.gg/install.sh | sh'}
+          </span>
         </div>
         <div className="row">
           <button className="primary" onClick={save} disabled={busy}>Save</button>
           <button className="ghost" onClick={check} disabled={busy || !p.account_id || !p.has_token}>Check</button>
-          {p.has_token && <button className="ghost" onClick={async () => { setBusy(true); try { setList(await core.saveProvider(p.id, account, '')); setNote({ ok: true, text: 'The token was removed from your keychain.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) } }} disabled={busy}>Remove token</button>}
+          {p.has_token && <button className="ghost" onClick={async () => { setBusy(true); try { setList(await core.saveProvider(p.id, account, '')); setNote({ ok: true, text: `The token was removed from ${p.vault === 'harar' ? 'harar' : 'your keychain'}.` }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) } }} disabled={busy}>Remove token</button>}
         </div>
         {note && <span className={note.ok ? 'ok' : 'error'}>{note.text}</span>}
       </div>
