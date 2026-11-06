@@ -7,24 +7,38 @@ import { core, onChanged, onWorking, mentionParts, initial, clock, day, errorTex
 
 /** Who a mention reaches in this channel: agent names, and whether each can
  *  see it. A name that isn't an agent's (a person's) isn't in it. */
-export type Reach = { channel: string; agents: Record<string, boolean> }
+export type Reach = { channelId: string; channel: string; agents: Record<string, { id: string; in: boolean }> }
 export const ReachContext = createContext<Reach | null>(null)
 
-/** An @mention, coloured by whether it reaches anyone here. */
-export function Mention({ text }: { text: string }) {
+/** An @mention, coloured by whether it reaches anyone here. One that
+ *  doesn't is struck through; hovering it offers to add the agent to the
+ *  channel, which passes this message on. */
+export function Mention({ text, messageId }: { text: string; messageId?: string }) {
   const reach = useContext(ReachContext)
+  const [error, setError] = useState('')
   const name = text.slice(1).toLowerCase()
-  const outside = reach && name in reach.agents && !reach.agents[name]
-  return outside
-    ? <span className="mention off" title={`${text} can’t see #${reach.channel}, so it wasn’t told`}>{text}</span>
-    : <span className="mention">{text}</span>
+  const agent = reach?.agents[name]
+  if (!reach || !agent || agent.in) return <span className="mention">{text}</span>
+  return (
+    <span className="mention off" tabIndex={0}>
+      {text}
+      <span className="mcard" role="tooltip">
+        <span>{text} isn’t in #{reach.channel}, so it wasn’t told.</span>
+        <button type="button" className="primary" onClick={async () => {
+          setError('')
+          try { await core.addToChannel(reach.channelId, agent.id, messageId ?? null); window.dispatchEvent(new Event('gild:reach')) } catch (e) { setError(errorText(e)) }
+        }}>Add to channel</button>
+        {error && <span className="error">{error}</span>}
+      </span>
+    </span>
+  )
 }
 
 /** Agents a draft mentions that can't see the channel. */
 export function unreached(text: string, reach: Reach | null): string[] {
   if (!reach) return []
   const names = mentionParts(text).filter(p => p.mention).map(p => p.text.slice(1).toLowerCase())
-  return [...new Set(names)].filter(n => n in reach.agents && !reach.agents[n])
+  return [...new Set(names)].filter(n => n in reach.agents && !reach.agents[n].in)
 }
 import { useMe } from './Profile'
 
@@ -47,40 +61,13 @@ export function ReachWarning({ text, channelId, onShared }: { text: string; chan
       <button type="button" className="link" onClick={async () => {
         setError('')
         try {
-          const agents = await core.agents()
-          for (const n of out) {
-            const a = agents.find(x => x.name === n)
-            if (a) await core.setAccess(channelId, a.id, 'write')
-          }
+          for (const n of out) await core.addToChannel(channelId, reach.agents[n].id, null)
           onShared?.()
           window.dispatchEvent(new Event('gild:reach'))
         } catch (e) { setError(errorText(e)) }
-      }}>Share #{reach.channel} with {out.length === 1 ? out[0] : 'them'} now</button>
+      }}>Add {out.length === 1 ? out[0] : 'them'} to #{reach.channel}</button>
       {error && <span className="error">{error}</span>}
     </p>
-  )
-}
-
-/** Agents mentioned here that can't see the channel: share it in one click. */
-export function AccessAsks({ channelId, channelName, version, onShared }: { channelId: string; channelName: string; version: number; onShared: () => void }) {
-  const [asks, setAsks] = useState<{ agent: { id: string; name: string } }[]>([])
-  const [error, setError] = useState('')
-  useEffect(() => { core.accessAsks(channelId).then(setAsks, () => setAsks([])) }, [channelId, version])
-  if (asks.length === 0) return null
-  return (
-    <>
-      {asks.map(({ agent }) => (
-        <div key={agent.id} className="heldbar askbar" role="status">
-          <span><b>@{agent.name}</b> was mentioned here but can’t see #{channelName}.</span>
-          <button className="primary" onClick={async () => {
-            setError('')
-            try { await core.shareAndPassOn(channelId, agent.id); setAsks(a => a.filter(x => x.agent.id !== agent.id)); window.dispatchEvent(new Event('gild:reach')); onShared() } catch (e) { setError(errorText(e)) }
-          }}>Share #{channelName} with {agent.name}</button>
-          <button className="ghost" onClick={async () => { await core.dropAccessAsk(channelId, agent.id).catch(() => {}); setAsks(a => a.filter(x => x.agent.id !== agent.id)) }}>Not now</button>
-          {error && <span className="error">{error}</span>}
-        </div>
-      ))}
-    </>
   )
 }
 
@@ -131,7 +118,7 @@ export function MessageRow({ m, onThread }: { m: Message; onThread?: (m: Message
           {m.kind !== 'person' && <span className="badge">{m.kind}</span>}
           <span className="time">{clock(m.created_at)}</span>
         </div>
-        <span className="text">{mentionParts(m.body).map((p, j) => (p.mention ? <Mention key={j} text={p.text} /> : p.text))}</span>
+        <span className="text">{mentionParts(m.body).map((p, j) => (p.mention ? <Mention key={j} text={p.text} messageId={m.id} /> : p.text))}</span>
         {onThread && (m.replies ?? 0) > 0 && (
           <button className="threadlink" onClick={() => onThread(m)}>{replyLine(m)}</button>
         )}

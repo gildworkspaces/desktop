@@ -100,27 +100,10 @@ fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
     with(&core, |s| Ok(s.addons()))
 }
 
-#[derive(Serialize)]
-struct AccessAsk {
-    agent: Agent,
-    message_id: String,
-}
-
-/// Agents mentioned here that can't see the channel.
+/// Add an agent to the channel, and pass on the message that mentioned it.
 #[tauri::command]
-fn access_asks(core: State<Core>, channel_id: String) -> Result<Vec<AccessAsk>, String> {
-    with(&core, |s| Ok(s.access_asks(&channel_id)?.into_iter().map(|(agent, message_id)| AccessAsk { agent, message_id }).collect()))
-}
-
-/// Share the channel with the agent and pass on the message that asked.
-#[tauri::command]
-fn share_and_pass_on(core: State<Core>, channel_id: String, agent_id: String) -> Result<(), String> {
-    with(&core, |s| s.share_and_pass_on(&channel_id, &agent_id, &s.me()?))
-}
-
-#[tauri::command]
-fn drop_access_ask(core: State<Core>, channel_id: String, agent_id: String) -> Result<(), String> {
-    with(&core, |s| s.drop_access_ask(&channel_id, &agent_id))
+fn add_to_channel(core: State<Core>, channel_id: String, agent_id: String, message_id: Option<String>) -> Result<(), String> {
+    with(&core, |s| s.add_to_channel(&channel_id, &agent_id, message_id.as_deref(), &s.me()?))
 }
 
 /// The cloud providers, set up or not (never their tokens).
@@ -528,9 +511,7 @@ pub fn run() {
             thread,
             working,
             addons,
-            access_asks,
-            share_and_pass_on,
-            drop_access_ask,
+            add_to_channel,
             providers,
             save_provider,
             provider_models,
