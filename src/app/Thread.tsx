@@ -7,7 +7,7 @@ import { core, onChanged, onWorking, mentionParts, initial, clock, day, errorTex
 
 /** Who a mention reaches in this channel: agent names, and whether each can
  *  see it. A name that isn't an agent's (a person's) isn't in it. */
-export type Reach = { channelId: string; channel: string; agents: Record<string, { id: string; in: boolean }> }
+export type Reach = { channelId: string; channel: string; agents: Record<string, { id: string; in: boolean; picture?: string | null }> }
 export const ReachContext = createContext<Reach | null>(null)
 
 /** An @mention, coloured by whether it reaches anyone here. One that
@@ -108,10 +108,13 @@ export function MessageRow({ m, onThread }: { m: Message; onThread?: (m: Message
   const me = useMe()
   // Your own messages carry your picture (by name: messages keep the name they were sent with).
   const mine = m.kind === 'person' && !!me && m.author === me.name
+  const reach = useContext(ReachContext)
+  // An agent's messages carry the picture from its profile.
+  const picture = mine ? me?.picture : m.kind === 'agent' ? reach?.agents[m.author]?.picture : null
   return (
     <div className="msg">
-      {mine && me?.picture
-        ? <img className="avatar pic" src={me.picture} alt="" aria-hidden="true" />
+      {picture
+        ? <img className="avatar pic" src={picture} alt="" aria-hidden="true" />
         : <div className={`avatar ${m.kind}`} aria-hidden="true">{initial(m.author)}</div>}
       <div className="body">
         <div className="meta">

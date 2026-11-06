@@ -198,7 +198,11 @@ function ChannelView({ channel }: { channel: Channel }) {
   const [reach, setReach] = useState<Reach | null>(null)
   const [reachVersion, setReachVersion] = useState(0)
   useEffect(() => {
-    core.channelAccess(channel.id).then(rows => setReach({ channelId: channel.id, channel: channel.name, agents: Object.fromEntries(rows.map(r => [r.agent.name, { id: r.agent.id, in: !!r.access }])) }), () => setReach(null))
+    Promise.all([core.channelAccess(channel.id), core.agents()]).then(([rows, agents]) => setReach({
+      channelId: channel.id,
+      channel: channel.name,
+      agents: Object.fromEntries(rows.map(r => [r.agent.name, { id: r.agent.id, in: !!r.access, picture: agents.find(a => a.id === r.agent.id)?.picture }])),
+    }), () => setReach(null))
   }, [channel.id, channel.name, reachVersion])
   useEffect(() => {
     const again = () => setReachVersion(v => v + 1)

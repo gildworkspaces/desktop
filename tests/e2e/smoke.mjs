@@ -78,8 +78,9 @@ try {
   // the token for another MCP client, then the wake command, then a channel.
   const work = mkdtempSync(join(tmpdir(), 'gild-e2e-'))
   writeFileSync(join(work, 'agent.mjs'), `
-    import { readFileSync } from 'node:fs'
+    import { readFileSync, writeFileSync } from 'node:fs'
     const prompt = readFileSync(0, 'utf8')
+    writeFileSync(process.argv[2] + '.prompt', prompt)
     const channel = /channel_id ([^,)\\s]+)/.exec(prompt)[1]
     // Only from a place's header: "(channel_id …, thread_id …)".
     const thread = /\\(channel_id [^,)]+, thread_id ([^)\\s]+)\\)/.exec(prompt)?.[1]
@@ -110,10 +111,17 @@ try {
   assert.match(token, /^gild_[0-9a-f]{64}$/)
   writeFileSync(join(work, 'token'), token)
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Next']")).click()
-  const intakeBox = await driver.wait(until.elementLocated(By.xpath("//label[contains(@class,'clientrow') and contains(., '#student-intake')]/input")), 10000)
-  assert.ok(await intakeBox.isSelected(), 'the channel you are in is ticked')
-  assert.ok(!(await driver.findElement(By.xpath("//label[contains(@class,'clientrow') and contains(., '#general')]/input")).isSelected()))
-  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Save']")).click()
+  // Channels are switches; the channel you're in is turned on for it.
+  const channelSwitch = name => By.xpath(`//div[contains(@class,'toggle') and .//label[.='#${name}']]//button[@role='switch']`)
+  const intakeSwitch = await driver.wait(until.elementLocated(channelSwitch('student-intake')), 10000)
+  await driver.wait(async () => (await intakeSwitch.getAttribute('aria-checked')) === 'true', 10000, 'the channel you are in is on')
+  assert.equal(await driver.findElement(channelSwitch('general')).getAttribute('aria-checked'), 'false')
+  // A switch saves at once: on, then off again, general is never shared.
+  await driver.findElement(channelSwitch('general')).click()
+  await driver.wait(async () => (await driver.findElement(channelSwitch('general')).getAttribute('aria-checked')) === 'true', 10000)
+  await driver.findElement(channelSwitch('general')).click()
+  await driver.wait(async () => (await driver.findElement(channelSwitch('general')).getAttribute('aria-checked')) === 'false', 10000)
+  await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Next']")).click()
   // No AI tool here, so nothing can wake it yet, and the last step says so.
   const doneText = await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//p[contains(., 'can’t wake it yet')]")), 10000)
   assert.match(await doneText.getText(), /under Mentions/)
@@ -134,12 +142,24 @@ try {
   await driver.findElement(By.css('#wake-command')).sendKeys(`${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`)
   await driver.findElement(By.xpath("//form[contains(@class,'stepform')]//button[normalize-space(.)='Save']")).click()
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'setup')]//span[@class='ok' and .='Saved.']")), 10000)
+  // Under Coordinator: whether it may call @everyone.
+  const everyoneSwitch = await driver.findElement(By.css('#everyone'))
+  assert.equal(await everyoneSwitch.getAttribute('aria-checked'), 'false')
+  await everyoneSwitch.click()
+  await driver.wait(async () => (await driver.findElement(By.css('#everyone')).getAttribute('aria-checked')) === 'true', 10000)
+  // Its profile, beside Settings in the agents list: the instructions it
+  // gets on every wake.
+  await driver.findElement(By.xpath("//button[contains(@class,'back') and contains(., 'Agents')]")).click()
+  await driver.wait(until.elementLocated(By.css("button[aria-label='intake: profile']")), 10000).click()
+  await driver.wait(until.elementLocated(By.css('#agent-prompt')), 10000).sendKeys('You run student intake. Sign every answer with your desk.')
+  await driver.findElement(By.xpath("//footer[contains(@class,'sfoot')]//button[.='Save changes']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//footer[contains(@class,'sfoot')]//span[@class='ok' and .='Saved.']")), 10000)
   await driver.findElement(By.css("button[aria-label='Close settings']")).click()
   const agentsNow = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
-    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => x.name + ':' + x.context + ':' + x.wake)), e => done({ error: String(e) }))
+    window.__TAURI_INTERNALS__.invoke('agents').then(a => done(a.map(x => [x.name, x.context, x.wake, x.everyone, x.prompt].join(':'))), e => done({ error: String(e) }))
   `)
-  assert.deepEqual(agentsNow, [`intake:50:${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}`], 'the whole command was saved')
+  assert.deepEqual(agentsNow, [`intake:50:${process.execPath} ${join(work, 'agent.mjs')} ${join(work, 'token')}:true:You run student intake. Sign every answer with your desk.`], 'the whole command, @everyone and the prompt were saved')
   const mcp = async (body, session) => {
     const res = await fetch('http://127.0.0.1:4747/mcp', {
       method: 'POST',
@@ -240,6 +260,8 @@ try {
     console.log('no answer; the channel and activity:', JSON.stringify(seen, null, 2))
     throw e
   })
+  // It was woken with the instructions from its profile.
+  assert.match(readFileSync(join(work, 'token.prompt'), 'utf8'), /Your instructions, from your profile in gild:\nYou run student intake\. Sign every answer with your desk\.\n/)
   assert.match(await reply.getText(), /I saw Northside sent three more\./, 'the conversation came with the mention')
   console.log('agent answered:', await reply.getText())
   // The run is logged when the agent's process ends, a moment after its answer.

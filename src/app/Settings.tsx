@@ -7,7 +7,7 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, errorText, BANNERS, MAX_BIO, type Agent, type Channel, type Grant, type Manifest, type Profile, type ProviderInfo, type Theme, type Workspace } from '@/lib/core'
 import { Avatar, type SettingsSection } from './Profile'
-import { AgentPage, AgentsSettings, Toggle } from './Agents'
+import { AgentPage, AgentProfilePage, AgentsSettings, Toggle } from './Agents'
 
 type Group = { label: string; items: { key: SettingsSection; label: string }[] }
 
@@ -31,7 +31,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
     { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'data', label: 'Export and import' }] },
   ]
   // An agent's or add-on's own page sits under its section.
-  const parent: SettingsSection = at.startsWith('agent:') ? 'agents' : at.startsWith('addon:') ? 'addons' : at
+  const parent: SettingsSection = at.startsWith('agent:') || at.startsWith('agentprofile:') ? 'agents' : at.startsWith('addon:') ? 'addons' : at
   const title = groups.flatMap(g => g.items).find(i => i.key === parent)?.label ?? ''
 
   return (
@@ -61,7 +61,8 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
           </header>
           {at === 'profile' && <ProfilePage profile={profile} onProfile={onProfile} />}
           {at === 'appearance' && <AppearancePage profile={profile} onProfile={onProfile} />}
-          {at === 'agents' && <AgentsSettings channels={channels} current={current} onOpenAgent={a => setAt(`agent:${a.id}`)} />}
+          {at === 'agents' && <AgentsSettings channels={channels} current={current} onOpenAgent={a => setAt(`agent:${a.id}`)} onOpenProfile={a => setAt(`agentprofile:${a.id}`)} />}
+          {at.startsWith('agentprofile:') && <AgentProfilePage key={at} agentId={at.slice('agentprofile:'.length)} onBack={() => setAt('agents')} pickPicture={smallPicture} />}
           {at.startsWith('agent:') && <AgentPage key={at} agentId={at.slice(6)} channels={channels} current={current} onBack={() => setAt('agents')} />}
           {at === 'providers' && <ProvidersPage />}
           {at === 'addons' && <AddonsPage onPermissions={id => setAt(`addon:${id}`)} />}

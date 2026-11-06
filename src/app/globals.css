@@ -334,6 +334,12 @@ tbody tr:hover { background: var(--chip); }
 .member.agentrow:focus-visible { outline: 2px solid var(--accent); }
 .aavatar { width: 20px; height: 20px; border-radius: 50%; background: var(--mark); color: #17181b; display: grid; place-items: center; font-size: 11px; font-weight: 700; flex: none; }
 .aavatar.big { width: 32px; height: 32px; font-size: 14px; }
+.aavatar.pic { object-fit: cover; }
+.spage .two { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 32px; align-items: start; }
+.pagent .aavatar { width: 76px; height: 76px; font-size: 30px; box-shadow: 0 0 0 5px var(--sunk); }
+.pname .tag { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--faint); margin-left: 6px; }
+.toggles { display: flex; flex-direction: column; border-top: 1px solid var(--rule); }
+.toggles .toggle { border-bottom: 1px solid var(--rule); padding: 8px 0; }
 .member .tag { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--faint); }
 .modal.small { width: min(440px, 100%); }
 .modal .flabel, .flabel { font-size: 12px; font-weight: 600; color: var(--soft); }

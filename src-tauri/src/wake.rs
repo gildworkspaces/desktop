@@ -31,12 +31,16 @@ fn utc(ms: i64) -> String {
 /// What the agent is told: where it was mentioned (or, untagged, where a
 /// person wrote in a thread it's in), the conversation there, and how to
 /// answer.
-pub fn prompt(agent: &str, mentions: &[Mention], places: &[Place], endpoint: &str) -> String {
+pub fn prompt(agent: &str, role: &str, mentions: &[Mention], places: &[Place], endpoint: &str) -> String {
     let tagged = mentions.iter().any(|m| m.tagged);
     let mut out = format!(
         "You are {agent}, an agent in gild: a workspace where people and agents work together in channels. {}\n",
         if tagged { "You were mentioned." } else { "Someone wrote in a thread you're part of." }
     );
+    // What the agent's profile says it is and how it works.
+    if !role.is_empty() {
+        out.push_str(&format!("\nYour instructions, from your profile in gild:\n{role}\n"));
+    }
     let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
     for m in mentions {
         let key = (m.channel_id.as_str(), m.thread.as_deref());
@@ -228,17 +232,17 @@ async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: 
 
 async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, how: Wake, mentions: Vec<Mention>, endpoint: String) {
     let started = crate::store::now();
-    let context = match core.lock() {
+    let (context, role) = match core.lock() {
         Ok(mut s) => {
             s.set_working(&agent.name, &mentions, true);
-            s.mention_context(&agent.id, &mentions).unwrap_or_default()
+            (s.mention_context(&agent.id, &mentions).unwrap_or_default(), s.agent_prompt(&agent.id).unwrap_or_default())
         }
-        Err(_) => Vec::new(),
+        Err(_) => (Vec::new(), String::new()),
     };
     if let Some(app) = &app {
         let _ = app.emit("gild://working", ());
     }
-    let said = prompt(&agent.name, &mentions, &context, &endpoint);
+    let said = prompt(&agent.name, &role, &mentions, &context, &endpoint);
     let outcome = match &how {
         Wake::Command(command) => run_command(command, &said, LIMIT).await,
         Wake::Provider(runner) => match mentions.first() {
@@ -338,6 +342,7 @@ mod tests {
         store.set_access(&c.id, DEMO_NAME, &broken.id, Some(Access::Read)).unwrap();
         let heard = dir.join("heard.txt");
         store.set_wake(&agent.id, &format!("cat > '{}'", heard.display())).unwrap();
+        store.save_agent_profile(&agent.id, None, "You run student intake. Answer from the Intake SOP.").unwrap();
         store.set_wake(&broken.id, "echo 'no such model' >&2; exit 3").unwrap();
         // talker takes a moment, and answers meanwhile (as an agent does
         // through the MCP endpoint).
@@ -373,6 +378,8 @@ mod tests {
         }
         assert!(said.contains("You are intake") && said.contains("Demo at ") && said.contains("@intake where do the forms go?"), "{said}");
         assert!(said.contains(&format!("channel_id {}", c.id)));
+        // Its profile's instructions come with every wake.
+        assert!(said.contains("Your instructions, from your profile in gild:\nYou run student intake. Answer from the Intake SOP.\n"), "{said}");
         // The conversation comes with it, the mention marked.
         assert!(said.contains("  Demo at ") && said.contains(": Northside sent three more students.\n"), "{said}");
         assert!(said.contains("→ Demo at ") && said.contains(": @intake where do the forms go? @broken you too @talker\n"), "{said}");

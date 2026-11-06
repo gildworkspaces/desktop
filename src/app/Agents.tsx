@@ -2,8 +2,8 @@
 // Agents: adding one (gild sets it up in the AI tools on this computer),
 // the members list, Settings' agents page, what an agent may do in a
 // channel, and what agents did there.
-import { useEffect, useState } from 'react'
-import { core, clock, day, errorText, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type ModelInfo, type Profile, type ProviderInfo, type ToolInfo } from '@/lib/core'
+import { useEffect, useRef, useState } from 'react'
+import { core, clock, day, errorText, MAX_AGENT_PROMPT, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type ModelInfo, type Profile, type ProviderInfo, type ToolInfo } from '@/lib/core'
 import { Avatar } from './Profile'
 
 /** Tell every agents list in the window that the agents changed. */
@@ -113,7 +113,7 @@ export function MembersGroup({ profile, channels, current, onOpenAgent }: { prof
       <div className="member"><Avatar profile={profile} size={20} />{profile.name} <span className="faint">(you)</span></div>
       {agents.map(a => (
         <button key={a.id} className="member agentrow" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>
-          <span className="aavatar" aria-hidden="true">{a.name[0]?.toUpperCase()}</span>{a.name}
+          <AgentAvatar agent={a} />{a.name}
           <span className="tag">{a.coordinator ? 'coordinator' : 'agent'}</span>
         </button>
       ))}
@@ -178,6 +178,14 @@ function CloudSetup({ agent, onAgents, onSaved }: { agent: Agent; onAgents: (a: 
 }
 
 /** A labelled on/off switch. */
+/** An agent's picture, or its initial. */
+export function AgentAvatar({ agent, big }: { agent: Pick<Agent, 'name' | 'picture'>; big?: boolean }) {
+  const cls = big ? 'aavatar big' : 'aavatar'
+  return agent.picture
+    ? <img className={`${cls} pic`} src={agent.picture} alt="" aria-hidden="true" />
+    : <span className={cls} aria-hidden="true">{agent.name[0]?.toUpperCase()}</span>
+}
+
 export function Toggle({ id, label, hint, on, onChange, disabled }: { id: string; label: string; hint?: string; on: boolean; onChange: (on: boolean) => void; disabled?: boolean }) {
   return (
     <div className="toggle">
@@ -219,7 +227,7 @@ function LoopSettings() {
 }
 
 /** Settings › Agents. */
-export function AgentsSettings({ channels, current, onOpenAgent }: { channels: Channel[]; current: Channel | null; onOpenAgent: (a: Agent) => void }) {
+export function AgentsSettings({ channels, current, onOpenAgent, onOpenProfile }: { channels: Channel[]; current: Channel | null; onOpenAgent: (a: Agent) => void; onOpenProfile: (a: Agent) => void }) {
   const [agents, setAgents, error] = useAgents()
   const [endpoint, setEndpoint] = useState<{ ok: boolean; text: string } | null>(null)
   const [where, setWhere] = useState<Record<string, number>>({})
@@ -239,10 +247,13 @@ export function AgentsSettings({ channels, current, onOpenAgent }: { channels: C
         <div className="srows">
           {agents.map(a => (
             <div key={a.id} className="srow agentline">
-              <span className="aname"><span className="aavatar big" aria-hidden="true">{a.name[0]?.toUpperCase()}</span><b>{a.name}</b>{a.coordinator && <span className="tag">coordinator</span>}</span>
+              <span className="aname"><AgentAvatar agent={a} big /><b>{a.name}</b>{a.coordinator && <span className="tag">coordinator</span>}</span>
               <span className="soft">{channels.length > 0 ? `${where[a.id] ?? 0} ${(where[a.id] ?? 0) === 1 ? 'channel' : 'channels'} here` : ''}</span>
               <span className="soft">{a.runner ? `cloud · ${a.runner.model.split('/').pop()}` : a.wake ? 'wakes on @' : 'not woken'}</span>
-              <button className="ghost" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>Settings</button>
+              <span className="row">
+                <button className="ghost" onClick={() => onOpenProfile(a)} aria-label={`${a.name}: profile`}>Profile</button>
+                <button className="ghost" onClick={() => onOpenAgent(a)} aria-label={`${a.name}: settings`}>Settings</button>
+              </span>
             </div>
           ))}
         </div>
@@ -299,6 +310,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
   // Open once if there's no command yet; never closed by typing into it.
   const [advancedOpen] = useState(!agent.wake)
   const [coordinator, setCoordinator] = useState(!!agent.coordinator)
+  const [everyone, setEveryone] = useState(!!agent.everyone)
   const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
@@ -314,11 +326,9 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
       .then(pairs => {
         const m = new Map(pairs)
         setShared(m)
-        const on = new Set(pairs.filter(([, a]) => a).map(([id]) => id))
-        if (fresh && current) on.add(current.id)
-        setPicked(on)
+        setPicked(new Set(pairs.filter(([, a]) => a).map(([id]) => id)))
       }, e => setError(errorText(e)))
-  }, [agent.id, channels, current, fresh])
+  }, [agent.id, channels])
 
   const usable = (cs: ClientStatus[] | null) => cs?.filter(c => c.connected) ?? []
 
@@ -346,19 +356,23 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
     setSaved('Saved.')
   })
 
-  const share = () => act(async () => {
-    for (const c of channels) {
-      const had = shared?.get(c.id) ?? null
-      const want = picked.has(c.id)
-      // Checked means it can answer there, which takes write access; a
-      // channel already shared read-only stays read-only.
-      if (want && !had) await core.setAccess(c.id, agent.id, 'write')
-      if (!want && had) await core.setAccess(c.id, agent.id, null)
-    }
-    setShared(new Map(channels.map(c => [c.id, picked.has(c.id) ? (shared?.get(c.id) ?? 'write') : null])))
-    if (fresh) setStep('done')
-    else setSaved('Saved.')
+  // A channel turned on lets it answer there, which takes write access; one
+  // already shared read-only stays read-only. Each switch saves at once.
+  const shareOne = (channelId: string, on: boolean) => act(async () => {
+    const had = shared?.get(channelId) ?? null
+    if (on && !had) await core.setAccess(channelId, agent.id, 'write')
+    if (!on && had) await core.setAccess(channelId, agent.id, null)
+    setShared(m => new Map(m ?? []).set(channelId, on ? (had ?? 'write') : null))
+    setPicked(s => { const n = new Set(s); if (on) n.add(channelId); else n.delete(channelId); return n })
+    window.dispatchEvent(new Event('gild:reach'))
   })
+  // A new agent starts in the channel you're in.
+  const startedHere = useRef(false)
+  useEffect(() => {
+    if (!fresh || !current || !shared || startedHere.current || step !== 'channels') return
+    startedHere.current = true
+    if (!shared.get(current.id)) shareOne(current.id, true)
+  }, [fresh, current, shared, step])
 
   const remove = () => act(async () => {
     onAgents(await core.removeAgent(agent.id))
@@ -447,18 +461,15 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
         {step === 'channels' && (
           <>
             <p className="soft">Which channels can {agent.name} work in? It sees nothing else, and every change here is saved in the channel’s history.</p>
-            <div className="clients">
+            <div className="toggles">
               {channels.map(c => (
-                <label key={c.id} className="clientrow">
-                  <input type="checkbox" checked={picked.has(c.id)} disabled={!shared || busy}
-                    onChange={e => setPicked(s => { const n = new Set(s); if (e.target.checked) n.add(c.id); else n.delete(c.id); return n })} />
-                  <span className="clientname">#{c.name}</span>
-                  {shared?.get(c.id) === 'read' && <span className="faint">can read only</span>}
-                </label>
+                <Toggle key={c.id} id={`channel-${c.id}`} label={`#${c.name}`}
+                  hint={shared?.get(c.id) === 'read' ? 'Can read only (set in the channel’s Access).' : undefined}
+                  on={picked.has(c.id)} disabled={!shared || busy} onChange={on => shareOne(c.id, on)} />
               ))}
             </div>
-            <p className="faint" style={{ fontSize: 12 }}>A checked channel lets {agent.name} read, answer and change it. For read-only, use the channel’s Access button.</p>
-            <div className="row"><button className="primary" onClick={share} disabled={busy || !shared}>Save</button>{saved && <span className="ok">{saved}</span>}</div>
+            <p className="faint" style={{ fontSize: 12 }}>A channel that’s on lets {agent.name} read, answer and change it. For read-only, use the channel’s Access button.</p>
+            {fresh && <div className="row"><button className="primary" onClick={() => setStep('done')} disabled={busy || !shared}>Next</button></div>}
           </>
         )}
 
@@ -487,6 +498,14 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
               on={!!coordinator}
               disabled={busy}
               onChange={on => act(async () => { const list = await core.setCoordinator(agent.id, on); onAgents(list); setCoordinator(on) })}
+            />
+            <Toggle
+              id="everyone"
+              label="Can call @everyone"
+              hint={`${agent.name} can write @everyone to call every agent in a channel at once. People always can.`}
+              on={everyone}
+              disabled={busy}
+              onChange={on => act(async () => { onAgents(await core.setEveryone(agent.id, on)); setEveryone(on) })}
             />
           </form>
         )}
@@ -551,7 +570,7 @@ export function AgentPage({ agentId, channels, current, onBack }: { agentId: str
   return (
     <div className="spage">
       <button className="link back" onClick={onBack}>← Agents</button>
-      <div className="row"><span className="aavatar big" aria-hidden="true">{agent.name[0]?.toUpperCase()}</span><h2 style={{ fontSize: 20 }}>{agent.name}</h2>{agent.coordinator && <span className="tag">coordinator</span>}</div>
+      <div className="row"><AgentAvatar agent={agent} big /><h2 style={{ fontSize: 20 }}>{agent.name}</h2>{agent.coordinator && <span className="tag">coordinator</span>}</div>
       <div className="seg" role="tablist" aria-label={`${agent.name} settings`}>
         {AGENT_TABS.map(t => <button key={t.key} role="tab" aria-selected={tab === t.key} className={tab === t.key ? 'on' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}
       </div>
@@ -559,6 +578,78 @@ export function AgentPage({ agentId, channels, current, onBack }: { agentId: str
         ? <ToolsTab agent={agent} />
         : <AgentSetup key={tab} agent={agent} fresh={false} page={tab} channels={channels} current={current} onAgents={setAgents} onClose={onBack} />}
     </div>
+  )
+}
+
+/** Settings › Agents › an agent's profile: its picture, and the prompt it
+ *  gets on every wake. Laid out like your own profile. */
+export function AgentProfilePage({ agentId, onBack, pickPicture }: { agentId: string; onBack: () => void; pickPicture: (f: File) => Promise<string> }) {
+  const [agents, setAgents] = useAgents()
+  const agent = agents.find(a => a.id === agentId)
+  if (!agent) return <div className="spage"><button className="link back" onClick={onBack}>← Agents</button><p className="faint">Loading…</p></div>
+  return <AgentProfileForm key={agent.id} agent={agent} onAgents={setAgents} onBack={onBack} pickPicture={pickPicture} />
+}
+
+function AgentProfileForm({ agent, onAgents, onBack, pickPicture }: { agent: Agent; onAgents: (a: Agent[]) => void; onBack: () => void; pickPicture: (f: File) => Promise<string> }) {
+  const [picture, setPicture] = useState<string | null>(agent.picture ?? null)
+  const [prompt, setPrompt] = useState(agent.prompt ?? '')
+  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const file = useRef<HTMLInputElement>(null)
+  const dirty = picture !== (agent.picture ?? null) || prompt !== (agent.prompt ?? '')
+
+  async function save() {
+    setNote(null)
+    try { onAgents(await core.saveAgentProfile(agent.id, picture, prompt)); setNote({ ok: true, text: 'Saved.' }) } catch (e) { setNote({ ok: false, text: errorText(e) }) }
+  }
+  async function choose(f: File | undefined) {
+    if (!f) return
+    try { setPicture(await pickPicture(f)); setNote(null) } catch (e) { setNote({ ok: false, text: errorText(e) }) }
+  }
+
+  return (
+    <>
+      <div className="spage">
+        <button className="link back" onClick={onBack}>← Agents</button>
+        <div className="two">
+          <div className="sform">
+            <div className="sfield">
+              <span className="flabel">Picture</span>
+              <div className="row">
+                <button type="button" className="primary" onClick={() => file.current?.click()}>Choose a picture</button>
+                {picture && <button type="button" className="ghost" onClick={() => setPicture(null)}>Remove</button>}
+                <input ref={file} type="file" accept="image/*" hidden onChange={e => { choose(e.target.files?.[0]); e.target.value = '' }} />
+              </div>
+            </div>
+            <div className="sfield">
+              <label htmlFor="agent-prompt" className="flabel">Instructions</label>
+              <textarea id="agent-prompt" className="field" rows={9} maxLength={MAX_AGENT_PROMPT} value={prompt} onChange={e => setPrompt(e.target.value)}
+                placeholder={`Who ${agent.name} is and how it works. For example: You run student intake. Answer from the Intake SOP, and ask before changing a record.`} />
+              <span className="faint hint">{agent.name} gets this every time it’s woken, before the conversation.</span>
+              <span className="faint hint mono" style={{ textAlign: 'right' }}>{prompt.length} / {MAX_AGENT_PROMPT}</span>
+            </div>
+          </div>
+          <div className="sfield">
+            <span className="label">Preview</span>
+            <div className="pcard">
+              <div className="pbanner" style={{ background: 'var(--mark)' }} />
+              <div className="pbody">
+                <div className="pbig">
+                  <span className="pagent"><AgentAvatar agent={{ name: agent.name, picture }} /></span>
+                </div>
+                <div className="pname">{agent.name} <span className="tag">{agent.coordinator ? 'coordinator' : 'agent'}</span></div>
+                {prompt.trim() && <p className="pbio">{prompt.trim().split('\n')[0]}</p>}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <footer className="sfoot">
+        {note && <span className={note.ok ? 'ok' : 'error'}>{note.text}</span>}
+        <span className="spacer" />
+        <button className="ghost" disabled={!dirty} onClick={() => { setPicture(agent.picture ?? null); setPrompt(agent.prompt ?? ''); setNote(null) }}>Reset</button>
+        <button className="primary" disabled={!dirty} onClick={save}>Save changes</button>
+      </footer>
+    </>
   )
 }
 
