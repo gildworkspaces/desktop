@@ -609,7 +609,7 @@ export function AccessPanel({ channelId, channelName, onClose }: { channelId: st
   useEffect(() => { core.channelAccess(channelId).then(setRows, e => setError(errorText(e))) }, [channelId])
   async function change(agentId: string, value: string) {
     setError('')
-    try { setRows(await core.setAccess(channelId, agentId, (value || null) as Access | null)) } catch (err) { setError(errorText(err)) }
+    try { setRows(await core.setAccess(channelId, agentId, (value || null) as Access | null)); window.dispatchEvent(new Event('gild:reach')) } catch (err) { setError(errorText(err)) }
   }
   return (
     <aside className="panel" aria-label={`Access to #${channelName}`}>

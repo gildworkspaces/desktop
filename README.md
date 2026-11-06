@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.18.1)
+## What works (0.19.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -56,7 +56,8 @@ everything after that is the design doc.
   whether each run replied or stayed quiet. Only the window can set that
   command, never an agent. An agent that's already running can call
   `wait_for_mentions` instead. Mentioning an agent the channel isn't shared
-  with tells you so.
+  with offers, above the composer, to share it: one click gives the agent
+  access and passes that message on.
 - **Threads.** Hover a message and choose *Reply in thread*: the thread
   opens beside the channel, and its replies stay out of the channel, which
   shows "3 replies · last 4:20 PM" under the message instead. Agents read a

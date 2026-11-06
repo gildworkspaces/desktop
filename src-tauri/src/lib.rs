@@ -100,6 +100,12 @@ fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
     with(&core, |s| Ok(s.addons()))
 }
 
+/// Add an agent to the channel, and pass on the message that mentioned it.
+#[tauri::command]
+fn add_to_channel(core: State<Core>, channel_id: String, agent_id: String, message_id: Option<String>) -> Result<(), String> {
+    with(&core, |s| s.add_to_channel(&channel_id, &agent_id, message_id.as_deref(), &s.me()?))
+}
+
 /// The cloud providers, set up or not (never their tokens).
 #[tauri::command]
 fn providers(core: State<Core>) -> Result<Vec<store::ProviderInfo>, String> {
@@ -505,6 +511,7 @@ pub fn run() {
             thread,
             working,
             addons,
+            add_to_channel,
             providers,
             save_provider,
             provider_models,

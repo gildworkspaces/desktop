@@ -107,6 +107,7 @@ export const core = {
   send: (channelId: string, body: string) => invoke<Message>('send_message', { channelId, body }),
   working: () => invoke<Working[]>('working'),
   addons: () => invoke<Manifest[]>('addons'),
+  addToChannel: (channelId: string, agentId: string, messageId: string | null) => invoke<null>('add_to_channel', { channelId, agentId, messageId }),
   providers: () => invoke<ProviderInfo[]>('providers'),
   saveProvider: (provider: string, accountId: string, token: string | null) => invoke<ProviderInfo[]>('save_provider', { provider, accountId, token }),
   providerModels: (provider: string) => invoke<ModelInfo[]>('provider_models', { provider }),

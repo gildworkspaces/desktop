@@ -6,7 +6,7 @@ import { FilesPane } from './Files'
 import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
 import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
-import { HeldBar, MessageRow, ThreadPanel, WorkingLine } from './Thread'
+import { HeldBar, MessageRow, ReachContext, ReachWarning, ThreadPanel, WorkingLine, type Reach } from './Thread'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
@@ -194,6 +194,18 @@ function WorkspaceView({ me, workspace, onPlace, onBack }: {
 }
 
 function ChannelView({ channel }: { channel: Channel }) {
+  // Which agents a mention here reaches, for colouring and warnings.
+  const [reach, setReach] = useState<Reach | null>(null)
+  const [reachVersion, setReachVersion] = useState(0)
+  useEffect(() => {
+    core.channelAccess(channel.id).then(rows => setReach({ channelId: channel.id, channel: channel.name, agents: Object.fromEntries(rows.map(r => [r.agent.name, { id: r.agent.id, in: !!r.access }])) }), () => setReach(null))
+  }, [channel.id, channel.name, reachVersion])
+  useEffect(() => {
+    const again = () => setReachVersion(v => v + 1)
+    window.addEventListener('gild:reach', again)
+    window.addEventListener('gild:agents', again)
+    return () => { window.removeEventListener('gild:reach', again); window.removeEventListener('gild:agents', again) }
+  }, [])
   const [messages, setMessages] = useState<Message[]>([])
   const [draft, setDraft] = useState('')
   const [expanded, setExpanded] = useState(false)
@@ -233,6 +245,7 @@ function ChannelView({ channel }: { channel: Channel }) {
   }
 
   return (
+    <ReachContext.Provider value={reach}>
     <main className="channel">
       <header className="chead">
         <h2># {channel.name}</h2>
@@ -279,6 +292,7 @@ function ChannelView({ channel }: { channel: Channel }) {
             <input id="composer" autoFocus value={draft} onChange={e => setDraft(e.target.value)} placeholder={`Message #${channel.name}`} />
             <button className="primary" disabled={!draft.trim()}>Send</button>
           </form>
+          <ReachWarning text={draft} channelId={channel.id} />
           {error && <p className="error">{error}</p>}
         </div>
       </section>
@@ -286,5 +300,6 @@ function ChannelView({ channel }: { channel: Channel }) {
       {threadId && <ThreadPanel key={threadId} channelId={channel.id} channelName={channel.name} rootId={threadId} onReplied={refresh} onClose={() => setThreadId(null)} />}
       {panel === 'activity' && <ActivityPanel key={version} channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
     </main>
+    </ReachContext.Provider>
   )
 }

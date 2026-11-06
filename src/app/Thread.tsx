@@ -2,13 +2,73 @@
 // A message as a channel shows it, and a thread: the message it hangs off,
 // its replies, and a composer for replying there.
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { createContext, useContext } from 'react'
 import { core, onChanged, onWorking, mentionParts, initial, clock, day, errorText, type Message, type Working } from '@/lib/core'
+
+/** Who a mention reaches in this channel: agent names, and whether each can
+ *  see it. A name that isn't an agent's (a person's) isn't in it. */
+export type Reach = { channelId: string; channel: string; agents: Record<string, { id: string; in: boolean }> }
+export const ReachContext = createContext<Reach | null>(null)
+
+/** An @mention, coloured by whether it reaches anyone here. One that
+ *  doesn't is struck through; hovering it offers to add the agent to the
+ *  channel, which passes this message on. */
+export function Mention({ text, messageId }: { text: string; messageId?: string }) {
+  const reach = useContext(ReachContext)
+  const [error, setError] = useState('')
+  const name = text.slice(1).toLowerCase()
+  const agent = reach?.agents[name]
+  if (!reach || !agent || agent.in) return <span className="mention">{text}</span>
+  return (
+    <span className="mention off" tabIndex={0}>
+      {text}
+      <span className="mcard" role="tooltip">
+        <span>{text} isn’t in #{reach.channel}, so it wasn’t told.</span>
+        <button type="button" className="primary" onClick={async () => {
+          setError('')
+          try { await core.addToChannel(reach.channelId, agent.id, messageId ?? null); window.dispatchEvent(new Event('gild:reach')) } catch (e) { setError(errorText(e)) }
+        }}>Add to channel</button>
+        {error && <span className="error">{error}</span>}
+      </span>
+    </span>
+  )
+}
+
+/** Agents a draft mentions that can't see the channel. */
+export function unreached(text: string, reach: Reach | null): string[] {
+  if (!reach) return []
+  const names = mentionParts(text).filter(p => p.mention).map(p => p.text.slice(1).toLowerCase())
+  return [...new Set(names)].filter(n => n in reach.agents && !reach.agents[n].in)
+}
 import { useMe } from './Profile'
 
 function replyLine(m: Message): string {
   const n = m.replies ?? 0
   const last = m.last_reply_at ? ` · last ${day(m.last_reply_at) === 'Today' ? clock(m.last_reply_at) : `${day(m.last_reply_at)} ${clock(m.last_reply_at)}`}` : ''
   return `${n} ${n === 1 ? 'reply' : 'replies'}${last}`
+}
+
+/** Under a composer: the agents a draft mentions that can't see the
+ *  channel, before it's sent, with a way to share it now. */
+export function ReachWarning({ text, channelId, onShared }: { text: string; channelId: string; onShared?: () => void }) {
+  const reach = useContext(ReachContext)
+  const out = unreached(text, reach)
+  const [error, setError] = useState('')
+  if (out.length === 0 || !reach) return null
+  return (
+    <p className="reachwarn" role="status">
+      <span>{out.map(n => '@' + n).join(', ')} can’t see #{reach.channel}, so {out.length === 1 ? 'it' : 'they'} won’t be told.</span>
+      <button type="button" className="link" onClick={async () => {
+        setError('')
+        try {
+          for (const n of out) await core.addToChannel(channelId, reach.agents[n].id, null)
+          onShared?.()
+          window.dispatchEvent(new Event('gild:reach'))
+        } catch (e) { setError(errorText(e)) }
+      }}>Add {out.length === 1 ? out[0] : 'them'} to #{reach.channel}</button>
+      {error && <span className="error">{error}</span>}
+    </p>
+  )
 }
 
 /** "ava is working…" while an agent runs on a mention in this place. */
@@ -58,7 +118,7 @@ export function MessageRow({ m, onThread }: { m: Message; onThread?: (m: Message
           {m.kind !== 'person' && <span className="badge">{m.kind}</span>}
           <span className="time">{clock(m.created_at)}</span>
         </div>
-        <span className="text">{mentionParts(m.body).map((p, j) => (p.mention ? <span key={j} className="mention">{p.text}</span> : p.text))}</span>
+        <span className="text">{mentionParts(m.body).map((p, j) => (p.mention ? <Mention key={j} text={p.text} messageId={m.id} /> : p.text))}</span>
         {onThread && (m.replies ?? 0) > 0 && (
           <button className="threadlink" onClick={() => onThread(m)}>{replyLine(m)}</button>
         )}
@@ -114,6 +174,7 @@ export function ThreadPanel({ channelId, channelName, rootId, onReplied, onClose
           <input id="thread-composer" autoFocus value={draft} onChange={e => setDraft(e.target.value)} placeholder="Reply in thread" />
           <button className="primary" disabled={!draft.trim()}>Reply</button>
         </form>
+        <ReachWarning text={draft} channelId={channelId} />
         <p className="faint" style={{ fontSize: 12, margin: '6px 2px 0' }}>Agents in this thread see your replies without an @mention, and answer when they have something to add.</p>
         {error && <p className="error">{error}</p>}
       </div>
