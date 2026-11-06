@@ -225,7 +225,7 @@ function ProvidersPage() {
           <input id="cf-token" className="field mono" type="password" value={token} onChange={e => setToken(e.target.value)} spellCheck={false} autoComplete="off"
             placeholder={p.has_token ? `Saved in ${p.vault === 'harar' ? 'harar' : 'your keychain'}. Paste a new one to replace it.` : 'A token with Workers AI access'} disabled={p.vault === 'none'} />
           <span className="faint hint">
-            {p.vault === 'harar' && 'Kept in harar, your vault, not in gild’s database, so agents on this computer can’t read it.'}
+            {p.vault === 'harar' && 'Kept in harar, your vault, not in gild’s database, so agents on this computer can’t read it. gild starts harar when it needs it; harar may ask for Touch ID.'}
             {p.vault === 'keychain' && 'Kept in your system keychain, not in gild’s database. Install harar (harar.addis.gg) and gild keeps it there instead.'}
             {p.vault === 'none' && 'gild keeps provider tokens in harar, your vault. Install it first: curl -fsSL https://harar.addis.gg/install.sh | sh'}
           </span>
