@@ -242,10 +242,13 @@ try {
   })
   assert.match(await reply.getText(), /I saw Northside sent three more\./, 'the conversation came with the mention')
   console.log('agent answered:', await reply.getText())
-  const woken = await driver.executeAsyncScript(`
+  // The run is logged when the agent's process ends, a moment after its answer.
+  const wokenLog = () => driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     window.__TAURI_INTERNALS__.invoke('activity', { channelId: ${JSON.stringify(intakeId)} }).then(a => done(a.filter(x => x.action === 'woken').map(x => x.agent + ': ' + x.detail + ' ' + x.ok)), e => done({ error: String(e) }))
   `)
+  let woken = []
+  await driver.wait(async () => (woken = await wokenLog()).length > 0, 15000, 'the run was logged')
   assert.deepEqual(woken, ['intake: woken by Demo · replied true'])
 
   // Threads: reply to a message in its thread. A mention there wakes the

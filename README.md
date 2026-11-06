@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.18.0)
+## What works (0.18.1)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -100,7 +100,8 @@ everything after that is the design doc.
   in the cloud: its Connect tab, *Cloud*, then a provider and a model (the
   provider's live list, those that can use tools first). The first provider
   is Cloudflare Workers AI (Settings › Providers: account ID and an API
-  token, kept in harar, Addis's vault, when it's installed, else the system
+  token, kept in harar, Addis's vault, when it's installed (gild starts
+  harar's agent if it isn't running), else the system
   keychain on macOS and Windows). When a cloud agent is mentioned, gild
   calls the model (OpenAI-compatible chat completions, streamed), and its
   reply grows in the channel as it's written; tool calls run through the

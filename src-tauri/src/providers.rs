@@ -77,7 +77,62 @@ impl Harar {
         places.into_iter().find(|p| p.is_file()).map(|bin| Harar { bin })
     }
 
+    /// How long a starting agent gets to answer.
+    const START_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Make sure harar's agent is running: if `harar status` finds none,
+    /// start `harar agent` in the background (it outlives gild, as harar
+    /// means it to) and wait for it to answer. People shouldn't need a
+    /// terminal for this.
+    pub fn ensure_running(&self) -> Result<(), String> {
+        if self.once(&["status"], None).is_ok() {
+            return Ok(());
+        }
+        let mut agent = std::process::Command::new(&self.bin)
+            .arg("agent")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("couldn't start harar: {e}"))?;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Self::START_WAIT {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if self.once(&["status"], None).is_ok() {
+                return Ok(());
+            }
+            // It stopped instead: say why, in harar's words.
+            if let Ok(Some(_)) = agent.try_wait() {
+                let mut why = String::new();
+                if let Some(mut err) = agent.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_string(&mut why);
+                }
+                return Err(format!("harar's agent wouldn't start: {}", why.trim().lines().last().unwrap_or("it stopped at once")));
+            }
+        }
+        Err("harar's agent didn't start in time. Try again in a moment.".into())
+    }
+
+    /// Whether an error means the agent isn't there: `status` says "no harar
+    /// agent", but `get`/`put` report the socket itself — refused when an
+    /// agent left its socket behind, missing when there was never one.
+    fn agent_down(err: &str) -> bool {
+        err.contains("no harar agent") || err.contains("Connection refused") || err.contains("No such file or directory")
+    }
+
+    /// A harar command, starting harar's agent first if it isn't running.
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
+        match self.once(args, input) {
+            Err(e) if Self::agent_down(&e) => {
+                self.ensure_running()?;
+                self.once(args, input)
+            }
+            other => other,
+        }
+    }
+
+    fn once(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
         use std::io::Write;
         let mut child = std::process::Command::new(&self.bin)
             .args(args)
@@ -98,8 +153,8 @@ impl Harar {
     }
 
     fn explain(err: String) -> String {
-        if err.contains("no harar agent") {
-            "harar isn't running. Start it with `harar agent` (it keeps gild's provider tokens), then try again.".into()
+        if Self::agent_down(&err) {
+            "harar's agent isn't running, and gild couldn't start it.".into()
         } else if err.contains("not_approved") {
             "harar didn't approve gild's request. Unlock harar (`harar unlock`) and try again.".into()
         } else {
@@ -356,19 +411,21 @@ pub async fn chat_stream(c: &Creds, model: &str, messages: &[Value], tools: &[Va
 mod tests {
     use super::*;
 
-    /// A stand-in for the harar CLI: `get`/`put --secret-stdin` over one
-    /// file per key, answering as harar does; `down` answers as harar does
-    /// when its agent isn't running.
-    fn fake_harar(dir: &std::path::Path, down: bool) -> Harar {
+    /// A stand-in for the harar CLI, answering as harar does: `get` and
+    /// `put --secret-stdin` over one file per key, while its agent "runs"
+    /// (a file); without it, every command says there's no agent.
+    /// `harar agent` starts it, or with `broken` fails as harar does when it
+    /// can't open the vault.
+    fn fake_harar(dir: &std::path::Path, running: bool, broken: bool) -> Harar {
         let bin = dir.join("harar");
-        let body = if down {
-            "#!/bin/sh\necho \"Error: no harar agent at /x/agent.sock; start one with \\`harar agent\\`\" >&2; exit 1\n".to_string()
-        } else {
-            format!(
-                "#!/bin/sh\nD='{}'\nk=$(printf %s \"$2\" | tr / _)\ncase $1 in\n get) [ -s \"$D/$k\" ] || {{ echo 'Error: harar refused: not_found' >&2; exit 1; }}; printf '{{\"ok\":true,\"value\":\"%s\"}}\\n' \"$(cat \"$D/$k\")\" ;;\n put) cat > \"$D/$k\"; echo '{{\"ok\":true}}' ;;\nesac\n",
-                dir.display()
-            )
-        };
+        if running {
+            std::fs::write(dir.join("running"), "").unwrap();
+        }
+        let agent = if broken { "echo 'Error: no master key at /x/master.key; create one with `harar key`' >&2; exit 1" } else { "touch \"$D/running\"; exit 0" };
+        let body = format!(
+            "#!/bin/sh\nD='{}'\n[ \"$1\" = agent ] && {{ {agent}; }}\n[ -f \"$D/running\" ] || {{ if [ \"$1\" = status ]; then echo \"Error: no harar agent at /x/agent.sock; start one with \\`harar agent\\`\" >&2; else echo 'Error: harar I/O error: Connection refused (os error 61)' >&2; fi; exit 1; }}\nk=$(printf %s \"$2\" | tr / _)\ncase $1 in\n status) echo '{{\"ok\":true}}' ;;\n get) [ -s \"$D/$k\" ] || {{ echo 'Error: harar refused: not_found' >&2; exit 1; }}; printf '{{\"ok\":true,\"value\":\"%s\"}}\\n' \"$(cat \"$D/$k\")\" ;;\n put) cat > \"$D/$k\"; echo '{{\"ok\":true}}' ;;\nesac\n",
+            dir.display()
+        );
         std::fs::write(&bin, body).unwrap();
         #[cfg(unix)]
         {
@@ -389,7 +446,7 @@ mod tests {
         let dir = temp();
         let keychain = InMemory::default();
         keychain.set("gild/workers-ai/token", Some("old-token")).unwrap();
-        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, false))), keychain: Some(Box::new(keychain)) };
+        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, true, false))), keychain: Some(Box::new(keychain)) };
         assert_eq!(vault.kind(), "harar");
         // The keychain's token moves into harar on first read…
         assert_eq!(vault.get("gild/workers-ai/token").unwrap().as_deref(), Some("old-token"));
@@ -404,15 +461,40 @@ mod tests {
     }
 
     #[test]
-    fn harar_down_or_missing_is_said_plainly() {
+    fn gild_starts_harar_when_it_isn_t_running() {
         let dir = temp();
-        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, true))), keychain: None };
-        assert!(vault.get("gild/workers-ai/token").unwrap_err().contains("Start it with `harar agent`"));
+        let harar = fake_harar(&dir, false, false);
+        assert!(harar.once(&["status"], None).is_err(), "not running to start with");
+        let vault = Vault { harar: Some(Box::new(harar)), keychain: None };
+        vault.set("gild/workers-ai/token", Some("t")).unwrap();
+        assert!(dir.join("running").exists(), "gild started it");
+        assert_eq!(vault.get("gild/workers-ai/token").unwrap().as_deref(), Some("t"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn harar_that_can_t_start_or_isn_t_installed_is_said_plainly() {
+        let dir = temp();
+        let vault = Vault { harar: Some(Box::new(fake_harar(&dir, false, true))), keychain: None };
+        let e = vault.get("gild/workers-ai/token").unwrap_err();
+        assert!(e.contains("harar's agent wouldn't start") && e.contains("create one with `harar key`"), "{e}");
         // Linux without harar: nowhere safe to keep it.
         let nowhere = Vault { harar: None, keychain: None };
         assert_eq!(nowhere.kind(), "none");
         assert!(nowhere.set("k", Some("v")).unwrap_err().contains("harar.addis.gg/install.sh"));
         assert_eq!(nowhere.get("k").unwrap(), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The real harar on this computer: run by hand with
+    /// `cargo test --lib live_harar -- --ignored`. Starting the agent asks
+    /// for nothing (it starts locked); this reads no secret.
+    #[test]
+    #[ignore]
+    fn live_harar_is_started_when_it_isn_t_running() {
+        let harar = Harar::find().expect("harar is installed");
+        let before = harar.once(&["status"], None).is_ok();
+        harar.ensure_running().unwrap();
+        println!("was running: {before}; now: {}", harar.once(&["status"], None).unwrap().trim());
     }
 }

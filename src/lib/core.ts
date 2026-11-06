@@ -55,7 +55,7 @@ export type Access = 'read' | 'write'
 export type Runner = { provider: string; model: string }
 export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean; runner?: Runner | null }
 /** A cloud provider (never its token). */
-export type ProviderInfo = { id: string; name: string; account_id: string | null; has_token: boolean; vault: 'harar' | 'keychain' | 'none' }
+export type ProviderInfo = { id: string; name: string; account_id: string | null; has_token: boolean; vault: 'harar' | 'keychain' | 'none'; vault_error: string | null }
 export type ModelInfo = { id: string; description: string; tools: boolean; context_window: number | null }
 /** Settings › Agents › Runaway loops. */
 export type LoopRules = { limit: number; ask_coordinator: boolean; notify_me: boolean }

@@ -1418,6 +1418,8 @@ pub struct ProviderInfo {
     /// Where the token is kept: "harar", "keychain", or "none" (Linux
     /// without harar: it can't be saved).
     pub vault: String,
+    /// Why the vault couldn't be read just now, if it couldn't.
+    pub vault_error: Option<String>,
 }
 
 /// Recent messages sent with a mention, unless the agent's settings say
@@ -1985,12 +1987,15 @@ impl Store {
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderInfo>, String> {
+        let token = self.secrets.get(TOKEN_KEY);
         Ok(vec![ProviderInfo {
             id: providers::WORKERS_AI.into(),
             name: "Cloudflare Workers AI".into(),
             account_id: self.setting("workers-ai.account")?,
-            has_token: self.secrets.get(TOKEN_KEY)?.is_some(),
+            // The vault failing mustn't hide the provider: say why instead.
+            has_token: token.as_ref().is_ok_and(|t| t.is_some()),
             vault: self.vault.to_string(),
+            vault_error: token.err(),
         }])
     }
 
