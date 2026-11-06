@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "gild-desktop"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "axum",
  "getrandom 0.3.4",

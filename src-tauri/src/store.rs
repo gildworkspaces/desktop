@@ -1075,6 +1075,9 @@ impl Store {
     /// kept.
     pub fn create_agent(&self, name: &str) -> Result<(Agent, String), String> {
         let name = channel_name(name).ok_or("Give the agent a name with at least one letter or digit.")?;
+        if name == EVERYONE {
+            return Err("@everyone calls every agent in a channel, so no agent can be called that.".into());
+        }
         if self.agents()?.iter().any(|a| a.name == name) {
             return Err(format!("There is already an agent called {name}."));
         }
@@ -1448,6 +1451,9 @@ pub fn mentioned_names(text: &str) -> Vec<String> {
 
 const MAX_WAKE_COMMAND: usize = 1000;
 
+/// The mention that calls every agent in the channel.
+pub const EVERYONE: &str = "everyone";
+
 impl Store {
     fn setting(&self, key: &str) -> Result<Option<String>, String> {
         Ok(self.query("SELECT value FROM profile WHERE key = ?1", &[Value::from_text(key.to_string())])?.first().map(|r| text(&r[0])))
@@ -1766,8 +1772,22 @@ impl Store {
         let coordinators = self.coordinator_names()?;
         let directs = self.directs(message, &coordinators);
         let mut tagged: Vec<&Agent> = Vec::new();
-        for name in mentioned_names(&message.body) {
+        let names = mentioned_names(&message.body);
+        // @everyone: every agent that can see the channel. Only a person or a
+        // coordinator can call everyone at once.
+        if names.iter().any(|n| n == EVERYONE) && directs {
+            for agent in &agents {
+                let author = message.kind == "agent" && message.author == agent.name;
+                if !author && self.access(&agent.id, &message.channel_id)?.is_some() && !tagged.iter().any(|t| t.id == agent.id) {
+                    tagged.push(agent);
+                }
+            }
+        }
+        for name in names {
             let Some(agent) = agents.iter().find(|a| a.name == name) else { continue };
+            if tagged.iter().any(|t| t.id == agent.id) {
+                continue;
+            }
             if message.kind == "agent" && message.author == agent.name {
                 continue;
             }
@@ -2925,6 +2945,35 @@ mod tests {
         store.take_mentions(&daemon).unwrap();
         store.add_to_channel(&general.id, &daemon.id, Some(&other.id), DEMO_NAME).unwrap();
         assert!(store.pending_mentions(&daemon.id).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn everyone_calls_every_agent_that_can_see_the_channel() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let (bob, _) = store.create_agent("bob").unwrap();
+        let (cat, _) = store.create_agent("cat").unwrap();
+        for a in [&ava, &bob] {
+            store.set_access(&c.id, DEMO_NAME, &a.id, Some(Access::Write)).unwrap();
+        }
+        store.post(&c.id, DEMO_NAME, "person", "@everyone stand-up in five, and @ava you're first").unwrap();
+        let told = |a: &Agent| store.take_mentions(a).unwrap().into_iter().map(|m| m.tagged).collect::<Vec<_>>();
+        assert_eq!(told(&ava), [true], "once, though named twice");
+        assert_eq!(told(&bob), [true]);
+        assert!(told(&cat).is_empty(), "cat can't see the channel");
+        // An agent can't call everyone; a coordinator can.
+        store.post(&c.id, "ava", "agent", "@everyone look at this").unwrap();
+        assert!(told(&bob).is_empty());
+        store.set_coordinator(&ava.id, true).unwrap();
+        store.post(&c.id, "ava", "agent", "@everyone look at this").unwrap();
+        assert_eq!(told(&bob), [true]);
+        assert!(told(&ava).is_empty(), "not itself");
+        assert!(store.create_agent("Everyone").unwrap_err().contains("no agent can be called that"));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

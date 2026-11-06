@@ -469,3 +469,4 @@ tbody tr:hover { background: var(--chip); }
 .mention.off:hover .mcard, .mention.off:focus-within .mcard { display: flex; }
 .mention.off .mcard::after { content: ''; position: absolute; left: 0; right: 0; bottom: -8px; height: 8px; }
 .mention.off .mcard .primary { padding: 4px 10px; font-size: 12px; }
+.mention.all { background: color-mix(in srgb, var(--mark) 14%, transparent); border-radius: 4px; padding: 0 3px; }

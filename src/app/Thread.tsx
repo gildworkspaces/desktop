@@ -17,6 +17,7 @@ export function Mention({ text, messageId }: { text: string; messageId?: string 
   const reach = useContext(ReachContext)
   const [error, setError] = useState('')
   const name = text.slice(1).toLowerCase()
+  if (name === 'everyone') return <span className="mention all" title={reach ? `Every agent in #${reach.channel}` : 'Every agent in the channel'}>{text}</span>
   const agent = reach?.agents[name]
   if (!reach || !agent || agent.in) return <span className="mention">{text}</span>
   return (
