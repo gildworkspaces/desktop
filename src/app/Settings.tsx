@@ -235,6 +235,7 @@ function ProvidersPage() {
           <button className="ghost" onClick={check} disabled={busy || !p.account_id || !p.has_token}>Check</button>
           {p.has_token && <button className="ghost" onClick={async () => { setBusy(true); try { setList(await core.saveProvider(p.id, account, '')); setNote({ ok: true, text: `The token was removed from ${p.vault === 'harar' ? 'harar' : 'your keychain'}.` }) } catch (e) { setNote({ ok: false, text: errorText(e) }) } finally { setBusy(false) } }} disabled={busy}>Remove token</button>}
         </div>
+        {p.vault_error && !note && <span className="error">{p.vault_error}</span>}
         {note && <span className={note.ok ? 'ok' : 'error'}>{note.text}</span>}
       </div>
     </div>

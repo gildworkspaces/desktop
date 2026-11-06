@@ -114,10 +114,17 @@ impl Harar {
         Err("harar's agent didn't start in time. Try again in a moment.".into())
     }
 
+    /// Whether an error means the agent isn't there: `status` says "no harar
+    /// agent", but `get`/`put` report the socket itself — refused when an
+    /// agent left its socket behind, missing when there was never one.
+    fn agent_down(err: &str) -> bool {
+        err.contains("no harar agent") || err.contains("Connection refused") || err.contains("No such file or directory")
+    }
+
     /// A harar command, starting harar's agent first if it isn't running.
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
         match self.once(args, input) {
-            Err(e) if e.contains("no harar agent") => {
+            Err(e) if Self::agent_down(&e) => {
                 self.ensure_running()?;
                 self.once(args, input)
             }
@@ -146,7 +153,7 @@ impl Harar {
     }
 
     fn explain(err: String) -> String {
-        if err.contains("no harar agent") {
+        if Self::agent_down(&err) {
             "harar's agent isn't running, and gild couldn't start it.".into()
         } else if err.contains("not_approved") {
             "harar didn't approve gild's request. Unlock harar (`harar unlock`) and try again.".into()
@@ -416,7 +423,7 @@ mod tests {
         }
         let agent = if broken { "echo 'Error: no master key at /x/master.key; create one with `harar key`' >&2; exit 1" } else { "touch \"$D/running\"; exit 0" };
         let body = format!(
-            "#!/bin/sh\nD='{}'\n[ \"$1\" = agent ] && {{ {agent}; }}\n[ -f \"$D/running\" ] || {{ echo \"Error: no harar agent at /x/agent.sock; start one with \\`harar agent\\`\" >&2; exit 1; }}\nk=$(printf %s \"$2\" | tr / _)\ncase $1 in\n status) echo '{{\"ok\":true}}' ;;\n get) [ -s \"$D/$k\" ] || {{ echo 'Error: harar refused: not_found' >&2; exit 1; }}; printf '{{\"ok\":true,\"value\":\"%s\"}}\\n' \"$(cat \"$D/$k\")\" ;;\n put) cat > \"$D/$k\"; echo '{{\"ok\":true}}' ;;\nesac\n",
+            "#!/bin/sh\nD='{}'\n[ \"$1\" = agent ] && {{ {agent}; }}\n[ -f \"$D/running\" ] || {{ if [ \"$1\" = status ]; then echo \"Error: no harar agent at /x/agent.sock; start one with \\`harar agent\\`\" >&2; else echo 'Error: harar I/O error: Connection refused (os error 61)' >&2; fi; exit 1; }}\nk=$(printf %s \"$2\" | tr / _)\ncase $1 in\n status) echo '{{\"ok\":true}}' ;;\n get) [ -s \"$D/$k\" ] || {{ echo 'Error: harar refused: not_found' >&2; exit 1; }}; printf '{{\"ok\":true,\"value\":\"%s\"}}\\n' \"$(cat \"$D/$k\")\" ;;\n put) cat > \"$D/$k\"; echo '{{\"ok\":true}}' ;;\nesac\n",
             dir.display()
         );
         std::fs::write(&bin, body).unwrap();

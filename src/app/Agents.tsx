@@ -153,7 +153,8 @@ function CloudSetup({ agent, onAgents, onSaved }: { agent: Agent; onAgents: (a: 
       <select id="provider" className="field" value={provider} onChange={e => { setProvider(e.target.value); setModel('') }}>
         {providers?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
       </select>
-      {providers && !ready && <p className="faint hint">{chosen?.name ?? 'This provider'} isn’t set up yet: add your account ID and API token in Settings › Providers.</p>}
+      {chosen?.vault_error && <p className="error">{chosen.vault_error}</p>}
+      {providers && !ready && !chosen?.vault_error && <p className="faint hint">{chosen?.name ?? 'This provider'} isn’t set up yet: add your account ID and API token in Settings › Providers.</p>}
       {ready && (
         <>
           <label htmlFor="model" className="flabel">Model</label>
