@@ -460,3 +460,5 @@ tbody tr:hover { background: var(--chip); }
 .mrow.head .mono { font-size: 11px; }
 .toolgroup > p { margin: 4px 0 0; }
 .mrow.head span { overflow-wrap: anywhere; line-height: 1.3; }
+.askbar { border-color: var(--mark); background: color-mix(in srgb, var(--mark) 10%, transparent); }
+.askbar .primary { margin-left: auto; }

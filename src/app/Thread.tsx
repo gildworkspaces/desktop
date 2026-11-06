@@ -11,6 +11,29 @@ function replyLine(m: Message): string {
   return `${n} ${n === 1 ? 'reply' : 'replies'}${last}`
 }
 
+/** Agents mentioned here that can't see the channel: share it in one click. */
+export function AccessAsks({ channelId, channelName, version, onShared }: { channelId: string; channelName: string; version: number; onShared: () => void }) {
+  const [asks, setAsks] = useState<{ agent: { id: string; name: string } }[]>([])
+  const [error, setError] = useState('')
+  useEffect(() => { core.accessAsks(channelId).then(setAsks, () => setAsks([])) }, [channelId, version])
+  if (asks.length === 0) return null
+  return (
+    <>
+      {asks.map(({ agent }) => (
+        <div key={agent.id} className="heldbar askbar" role="status">
+          <span><b>@{agent.name}</b> was mentioned here but can’t see #{channelName}.</span>
+          <button className="primary" onClick={async () => {
+            setError('')
+            try { await core.shareAndPassOn(channelId, agent.id); setAsks(a => a.filter(x => x.agent.id !== agent.id)); onShared() } catch (e) { setError(errorText(e)) }
+          }}>Share #{channelName} with {agent.name}</button>
+          <button className="ghost" onClick={async () => { await core.dropAccessAsk(channelId, agent.id).catch(() => {}); setAsks(a => a.filter(x => x.agent.id !== agent.id)) }}>Not now</button>
+          {error && <span className="error">{error}</span>}
+        </div>
+      ))}
+    </>
+  )
+}
+
 /** "ava is working…" while an agent runs on a mention in this place. */
 export function WorkingLine({ channelId, threadId }: { channelId: string; threadId?: string }) {
   const [all, setAll] = useState<Working[]>([])

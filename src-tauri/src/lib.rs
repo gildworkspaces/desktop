@@ -100,6 +100,29 @@ fn addons(core: State<Core>) -> Result<Vec<addons::Manifest>, String> {
     with(&core, |s| Ok(s.addons()))
 }
 
+#[derive(Serialize)]
+struct AccessAsk {
+    agent: Agent,
+    message_id: String,
+}
+
+/// Agents mentioned here that can't see the channel.
+#[tauri::command]
+fn access_asks(core: State<Core>, channel_id: String) -> Result<Vec<AccessAsk>, String> {
+    with(&core, |s| Ok(s.access_asks(&channel_id)?.into_iter().map(|(agent, message_id)| AccessAsk { agent, message_id }).collect()))
+}
+
+/// Share the channel with the agent and pass on the message that asked.
+#[tauri::command]
+fn share_and_pass_on(core: State<Core>, channel_id: String, agent_id: String) -> Result<(), String> {
+    with(&core, |s| s.share_and_pass_on(&channel_id, &agent_id, &s.me()?))
+}
+
+#[tauri::command]
+fn drop_access_ask(core: State<Core>, channel_id: String, agent_id: String) -> Result<(), String> {
+    with(&core, |s| s.drop_access_ask(&channel_id, &agent_id))
+}
+
 /// The cloud providers, set up or not (never their tokens).
 #[tauri::command]
 fn providers(core: State<Core>) -> Result<Vec<store::ProviderInfo>, String> {
@@ -505,6 +528,9 @@ pub fn run() {
             thread,
             working,
             addons,
+            access_asks,
+            share_and_pass_on,
+            drop_access_ask,
             providers,
             save_provider,
             provider_models,

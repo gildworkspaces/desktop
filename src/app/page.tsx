@@ -6,7 +6,7 @@ import { FilesPane } from './Files'
 import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
 import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
-import { HeldBar, MessageRow, ThreadPanel, WorkingLine } from './Thread'
+import { AccessAsks, HeldBar, MessageRow, ThreadPanel, WorkingLine } from './Thread'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
 
@@ -271,6 +271,7 @@ function ChannelView({ channel }: { channel: Channel }) {
             )
           })}
         </div>
+        <AccessAsks channelId={channel.id} channelName={channel.name} version={version + messages.length} onShared={refresh} />
         <WorkingLine channelId={channel.id} />
         <HeldBar channelId={channel.id} version={version + messages.length} onContinued={refresh} />
         <div className="composer">

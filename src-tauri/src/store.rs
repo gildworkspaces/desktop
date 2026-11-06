@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS agent_tools (agent_id TEXT NOT NULL, tool TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (agent_id, tool));
 CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, granted INTEGER NOT NULL, PRIMARY KEY (addon_id, kind, value));
 CREATE TABLE IF NOT EXISTS agent_runner (agent_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS access_asks (agent_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY (agent_id, channel_id));
 CREATE TABLE IF NOT EXISTS held_mentions (mention_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, root TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
 ";
@@ -1123,6 +1124,7 @@ impl Store {
         self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_tools WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_runner WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM access_asks WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM held_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
         self.run("DELETE FROM mentions WHERE agent_id = ?1", std::slice::from_ref(&id))?;
@@ -1774,6 +1776,15 @@ impl Store {
             }
             if self.access(&agent.id, &message.channel_id)?.is_none() {
                 unshared.push(agent.name.clone());
+                // Asked about where it can't see: the window offers to share
+                // the channel and pass this message on.
+                if message.kind == "person" {
+                    self.run(
+                        "INSERT INTO access_asks (agent_id, channel_id, message_id) VALUES (?1, ?2, ?3)
+                         ON CONFLICT (agent_id, channel_id) DO UPDATE SET message_id = excluded.message_id",
+                        &[Value::from_text(agent.id.clone()), Value::from_text(message.channel_id.clone()), Value::from_text(message.id.clone())],
+                    )?;
+                }
                 continue;
             }
             tagged.push(agent);
@@ -1863,7 +1874,7 @@ impl Store {
                 message.thread.as_deref(),
                 "gild",
                 "system",
-                &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} from Access."),
+                &format!("{name} can't see this channel, so it wasn't told. Share the channel with {name} to pass the message on."),
             )?;
         }
         if !tagged.is_empty() || !quiet.is_empty() || directs {
@@ -1966,6 +1977,44 @@ impl Store {
                 (agent, how)
             })
             .collect())
+    }
+
+    /// Agents mentioned in a channel they can't see, waiting for a person to
+    /// share it: (agent, the message that asked).
+    pub fn access_asks(&self, channel_id: &str) -> Result<Vec<(Agent, String)>, String> {
+        let rows = self.query(
+            "SELECT a.id, a.name, a.created_at, x.message_id FROM access_asks x JOIN agents a ON a.id = x.agent_id WHERE x.channel_id = ?1 ORDER BY a.name",
+            &[Value::from_text(channel_id.to_string())],
+        )?;
+        Ok(rows.iter().map(|r| (Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }, text(&r[3]))).collect())
+    }
+
+    /// Share the channel with the agent (it can read, answer and change it)
+    /// and pass on the message that asked, as if it could see it then.
+    pub fn share_and_pass_on(&self, channel_id: &str, agent_id: &str, author: &str) -> Result<(), String> {
+        let ask = self.access_asks(channel_id)?.into_iter().find(|(a, _)| a.id == agent_id);
+        self.set_access(channel_id, author, agent_id, Some(Access::Write))?;
+        self.drop_access_ask(channel_id, agent_id)?;
+        if let Some((agent, message_id)) = ask {
+            let rows = self.query("SELECT created_at FROM messages WHERE id = ?1", &[Value::from_text(message_id.clone())])?;
+            if let Some(r) = rows.first() {
+                self.run(
+                    "INSERT INTO mentions (id, agent_id, channel_id, message_id, created_at, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    &[Value::from_text(new_id()), Value::from_text(agent.id), Value::from_text(channel_id.to_string()), Value::from_text(message_id), Value::from_i64(int(&r[0]))],
+                )?;
+                self.signals.waiters.notify_waiters();
+                self.signals.runner.notify_one();
+            }
+        }
+        Ok(())
+    }
+
+    /// Not now: forget the ask.
+    pub fn drop_access_ask(&self, channel_id: &str, agent_id: &str) -> Result<(), String> {
+        self.run(
+            "DELETE FROM access_asks WHERE channel_id = ?1 AND agent_id = ?2",
+            &[Value::from_text(channel_id.to_string()), Value::from_text(agent_id.to_string())],
+        )
     }
 
     /// Run an agent on a provider's model (None: back to this computer).
@@ -2409,7 +2458,7 @@ mod tests {
         assert_eq!((waiting.len(), waiting[0].from.as_str(), waiting[0].channel.as_str()), (1, "Demo", "general"));
         assert!(store.pending_mentions(&payroll.id).unwrap().is_empty(), "payroll can't see the channel");
         let said = store.messages(&c.id).unwrap().last().unwrap().body.clone();
-        assert_eq!(said, "payroll can't see this channel, so it wasn't told. Share the channel with payroll from Access.");
+        assert_eq!(said, "payroll can't see this channel, so it wasn't told. Share the channel with payroll to pass the message on.");
 
         // An agent mentioning itself doesn't wake itself.
         store.post(&c.id, "intake", "agent", "I'm @intake, on it.").unwrap();
@@ -2884,6 +2933,37 @@ mod tests {
         assert!(store.set_addon_grant("nope", "files", "*.md", true).is_err());
         store.remove_agent(&ava.id, DEMO_NAME).unwrap();
         assert!(store.tools_off(&ava.id).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mentioning_an_agent_that_can_t_see_the_channel_offers_to_share_it() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (daemon, _) = store.create_agent("daemon").unwrap();
+        let asked = store.post(&general.id, DEMO_NAME, "person", "hey @daemon, welcome to the team").unwrap();
+        assert!(store.pending_mentions(&daemon.id).unwrap().is_empty(), "it can't see the channel, so it isn't told");
+        let asks: Vec<(String, String)> = store.access_asks(&general.id).unwrap().into_iter().map(|(a, m)| (a.name, m)).collect();
+        assert_eq!(asks, [("daemon".to_string(), asked.id.clone())]);
+        // Agents mentioning it don't make an ask; only people do.
+        store.post(&general.id, "bob", "agent", "@daemon hi").unwrap();
+        assert_eq!(store.access_asks(&general.id).unwrap()[0].1, asked.id);
+
+        store.share_and_pass_on(&general.id, &daemon.id, DEMO_NAME).unwrap();
+        assert_eq!(store.access(&daemon.id, &general.id).unwrap(), Some(Access::Write));
+        let m = store.pending_mentions(&daemon.id).unwrap();
+        assert_eq!(m.iter().map(|m| (m.text.as_str(), m.tagged)).collect::<Vec<_>>(), [("hey @daemon, welcome to the team", true)], "the message that asked is passed on");
+        assert!(store.access_asks(&general.id).unwrap().is_empty());
+
+        // Not now: the ask goes, nothing is shared.
+        let other = store.create_channel(&ws.id, "payroll", "").unwrap();
+        store.post(&other.id, DEMO_NAME, "person", "@daemon look at this").unwrap();
+        store.drop_access_ask(&other.id, &daemon.id).unwrap();
+        assert!(store.access_asks(&other.id).unwrap().is_empty());
+        assert_eq!(store.access(&daemon.id, &other.id).unwrap(), None);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
