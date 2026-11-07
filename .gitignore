@@ -11,3 +11,6 @@ next-env.d.ts
 dist/
 .vinext/
 .DS_Store
+
+# Screenshots for gild.addis.gg (ci/linux.sh shots)
+/shots/
