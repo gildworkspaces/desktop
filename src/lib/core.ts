@@ -63,7 +63,16 @@ export type ModelInfo = { id: string; description: string; tools: boolean; conte
 /** Settings › Agents › Runaway loops. */
 export type LoopRules = { limit: number; ask_coordinator: boolean; notify_me: boolean }
 export type NewAgent = { agent: Agent; token: string; endpoint: string }
-export type AgentAccess = { agent: Agent; access: Access | null }
+/** Why an agent can be in a channel: named there, or through the org or a team (`seat`: the team's top seat). */
+export type Via = { kind: 'named' } | { kind: 'org' } | { kind: 'team'; seat: string }
+export type AgentAccess = { agent: Agent; access: Access | null; via: Via | null }
+/** Who holds a seat: you (a person), an agent, or nobody yet (null). */
+export type Holder = { kind: 'person' | 'agent'; id: string }
+/** `team`: how many seats its team has, itself included. */
+export type Seat = { id: string; title: string; parent: string | null; holder: Holder | null; level: number; team: number }
+/** `seats` in outline order: each seat, then its reports. */
+export type Org = { id: string; name: string; workspaces: string[]; seats: Seat[]; max_levels: number }
+export type ChannelRules = { org: boolean; teams: string[] }
 /** An MCP client on this computer that gild can set an agent up in. */
 export type ClientStatus = { id: string; name: string; installed: boolean; connected: boolean; wake: string }
 export type Connected = { token: string; endpoint: string; clients: ClientStatus[]; errors: string[]; agents: Agent[] }
@@ -155,6 +164,16 @@ export const core = {
   setWake: (agentId: string, command: string) => invoke<Agent[]>('set_wake', { agentId, command }),
   channelAccess: (channelId: string) => invoke<AgentAccess[]>('channel_access', { channelId }),
   setAccess: (channelId: string, agentId: string, access: Access | null) => invoke<AgentAccess[]>('set_access', { channelId, agentId, access }),
+  setLevel: (channelId: string, agentId: string, access: Access) => invoke<AgentAccess[]>('set_level', { channelId, agentId, access }),
+  channelRules: (channelId: string) => invoke<ChannelRules>('channel_rules', { channelId }),
+  setChannelRules: (channelId: string, org: boolean, teams: string[]) => invoke<AgentAccess[]>('set_channel_rules', { channelId, org, teams }),
+  orgs: () => invoke<Org[]>('orgs'),
+  renameOrg: (orgId: string, name: string) => invoke<Org[]>('rename_org', { orgId, name }),
+  addSeat: (parentId: string, title: string) => invoke<Org[]>('add_seat', { parentId, title }),
+  setSeat: (seatId: string, title: string, holder: Holder | null) => invoke<Org[]>('set_seat', { seatId, title, holder }),
+  moveSeat: (seatId: string, parentId: string) => invoke<Org[]>('move_seat', { seatId, parentId }),
+  removeSeat: (seatId: string) => invoke<Org[]>('remove_seat', { seatId }),
+  meId: () => invoke<string>('me_id'),
   activity: (channelId: string) => invoke<AuditEntry[]>('activity', { channelId }),
   mcpStatus: () => invoke<string>('mcp_status'),
   exportWorkspace: (workspaceId: string) => invoke<string>('export_workspace', { workspaceId }),

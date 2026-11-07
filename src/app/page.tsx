@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ViewPane } from './ChannelView'
 import { DocsPane } from './Docs'
 import { FilesPane } from './Files'
-import { MembersGroup, NameModal, PlusButton, AccessPanel, ActivityPanel } from './Agents'
+import { MembersGroup, NameModal, PlusButton, ActivityPanel } from './Agents'
+import { AccessPanel } from './Org'
 import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
 import { HeldBar, MessageRow, ReachContext, ReachWarning, ThreadPanel, WorkingLine, type Reach } from './Thread'
@@ -300,7 +301,7 @@ function ChannelView({ channel }: { channel: Channel }) {
           {error && <p className="error">{error}</p>}
         </div>
       </section>
-      {panel === 'access' && <AccessPanel channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
+      {panel === 'access' && <AccessPanel channelId={channel.id} channelName={channel.name} workspaceId={channel.workspace_id} onClose={() => setPanel(null)} />}
       {threadId && <ThreadPanel key={threadId} channelId={channel.id} channelName={channel.name} rootId={threadId} onReplied={refresh} onClose={() => setThreadId(null)} />}
       {panel === 'activity' && <ActivityPanel key={version} channelId={channel.id} channelName={channel.name} onClose={() => setPanel(null)} />}
     </main>

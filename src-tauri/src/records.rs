@@ -4,7 +4,8 @@
 //!
 //! In the repository:
 //!   .gild/acl.json              who besides the workspace's people may use
-//!                               this channel: agent id → "read" | "write"
+//!                               this channel: agent id → "read" | "write",
+//!                               and the org and teams it's open to
 //!   .gild/view.json             the channel's view: columns and statuses
 //!   .gild/records/<id>.json     one file per record, so two writers never
 //!                               touch the same file for different records
@@ -36,9 +37,20 @@ pub enum Access {
     Write,
 }
 
+/// Who may be in a channel: named agents, and, through the workspace's org,
+/// everyone in it (`org`) or whole teams (`teams`: a seat and every seat
+/// under it). `levels` sets read or change for a member who is in through
+/// the org or a team (change when unset). Fields left at their default
+/// aren't written, so a channel with only named agents keeps the file it had.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Acl {
     pub agents: std::collections::BTreeMap<String, Access>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub org: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub levels: std::collections::BTreeMap<String, Access>,
 }
 pub const RECORDS_DIR: &str = ".gild/records";
 

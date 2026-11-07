@@ -179,6 +179,41 @@ try {
   assert.deepEqual(channels, ['student-intake:write'], 'general was never shared')
   console.log('agent sees:', JSON.stringify(channels))
 
+  // The org: give intake a seat (Settings › Org), and the channels open to
+  // the whole org (new channels are) let it in; close #general to the org in
+  // its Access, and it's out again.
+  const seen = async id => JSON.parse((await mcp({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)).json.result.content[0].text).channels.map(c => `${c.name}:${c.access}`)
+  await driver.findElement(By.css("button[aria-label='App settings']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'sitem') and .='Org']")), 10000).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'addseat') and contains(., 'Add a report to CEO')]")), 10000, 'Add a report to CEO').click()
+  await driver.wait(until.elementLocated(By.css('#seat-title')), 10000).sendKeys('VP Intake', Key.ENTER)
+  await driver.wait(until.elementLocated(By.css("aside[aria-label='Seat: VP Intake']")), 10000, 'the new seat, selected')
+  await driver.findElement(By.xpath("//aside[contains(@class,'seatpanel')]//button[@role='radio' and .='An agent']")).click()
+  await driver.findElement(By.xpath("//select[@id='seat-agent']/option[.='intake']")).click()
+  await driver.findElement(By.xpath("//aside[contains(@class,'seatpanel')]//button[.='Save']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//aside[contains(@class,'seatpanel')]//span[@class='ok' and .='Saved.']")), 10000, 'the seat saved')
+  await driver.wait(until.elementLocated(By.css("button.seat[aria-label='VP Intake, intake']")), 10000, 'the outline shows who holds it')
+  assert.deepEqual(await seen(30), ['general:write', 'student-intake:write'], 'a seat lets it into the channels open to the org')
+  // Its profile shows where it sits.
+  await driver.findElement(By.xpath("//button[contains(@class,'sitem') and .='Agents']")).click()
+  await driver.wait(until.elementLocated(By.css("button[aria-label='intake: profile']")), 10000).click()
+  const place = await driver.wait(until.elementLocated(By.css('.chainrow.me')), 10000, 'its place in the org')
+  assert.match(await place.getAttribute('textContent'), /VP Intake\s*intake/)
+  await driver.findElement(By.css("button[aria-label='Close settings']")).click()
+  // #general's Access: closed to the org, so intake is out.
+  await driver.findElement(By.xpath("//button[contains(@class,'chan') and contains(., 'general')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'ghost') and .='Access']")), 10000).click()
+  const orgRule = await driver.wait(until.elementLocated(By.css('#rule-org')), 10000, 'the org rule')
+  assert.equal(await orgRule.getAttribute('aria-checked'), 'true', 'a new channel is open to the org')
+  await driver.wait(async () => /\bintake\b/.test(await driver.findElement(By.xpath("//section[@aria-label='Who that is']")).getAttribute('textContent')), 10000, 'intake listed, in through the org')
+  await orgRule.click()
+  await driver.wait(async () => (await driver.findElement(By.css('#rule-org')).getAttribute('aria-checked')) === 'false', 10000)
+  assert.deepEqual(await seen(31), ['student-intake:write'], 'closed to the org, general is out of reach again')
+  await driver.findElement(By.xpath("//aside[contains(@class,'panel')]//button[.='Close']")).click()
+  await driver.findElement(By.xpath("//button[contains(@class,'chan') and contains(., 'student-intake')]")).click()
+  await driver.wait(until.elementLocated(By.css('#composer')), 10000)
+  console.log('org: a seat let intake into the channels open to the org; closing #general to the org took it out')
+
   // Docs: a person writes one in the window; the agent finds the answer in
   // it, and its edit waits until the person approves it in the window.
   await driver.findElement(By.xpath("//button[contains(@class,'tab') and starts-with(normalize-space(.),'Docs')]")).click()

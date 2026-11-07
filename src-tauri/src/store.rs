@@ -23,6 +23,9 @@ use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
 use sha2::{Digest, Sha256};
 
+mod org;
+pub use org::{Holder, Org, Via};
+
 /// Bumped when a table's columns or meaning change.
 const FORMAT: i64 = 1;
 
@@ -45,6 +48,10 @@ CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS agent_everyone (agent_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS orgs (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS org_workspaces (workspace_id TEXT PRIMARY KEY, org_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS seats (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, parent_id TEXT, title TEXT NOT NULL, holder_kind TEXT, holder_id TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_rules (channel_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, access TEXT NOT NULL, PRIMARY KEY (channel_id, kind, value));
 CREATE TABLE IF NOT EXISTS agent_profile (agent_id TEXT PRIMARY KEY, picture TEXT, prompt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_tools (agent_id TEXT NOT NULL, tool TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (agent_id, tool));
 CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, granted INTEGER NOT NULL, PRIMARY KEY (addon_id, kind, value));
@@ -275,6 +282,7 @@ impl Store {
             Some(row) => return Err(format!("this database is format {}, and this gild reads format {FORMAT}", int(&row[0]))),
         }
         store.catch_up()?;
+        store.ensure_org()?;
         Ok(store)
     }
 
@@ -348,6 +356,7 @@ impl Store {
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
             &[Value::from_text(id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
         )?;
+        self.ensure_org()?;
         self.create_channel(&id, "general", "Anything for the whole workspace")?;
         self.workspaces()?.into_iter().find(|w| w.id == id).ok_or_else(|| "the new workspace was not saved".into())
     }
@@ -382,6 +391,12 @@ impl Store {
                 Value::from_i64(channel.created_at),
             ],
         )?;
+        // A new channel is open to everyone in the workspace's org.
+        self.ensure_org()?;
+        if let Some(org) = self.channel_org(&channel.id)? {
+            let org_name = self.orgs()?.into_iter().find(|o| o.id == org).map(|o| o.name).unwrap_or_default();
+            self.save_acl(&channel.id, &self.me()?, &format!("Open to everyone in {org_name}"), &Acl { org: true, ..Acl::default() })?;
+        }
         Ok(channel)
     }
 
@@ -612,6 +627,7 @@ impl Store {
                 &[id.clone(), Value::from_text(agent.clone()), Value::from_text(access.as_str().unwrap_or("read").to_string())],
             )?;
         }
+        self.index_rules(channel_id, &snap.acl)?;
         if let (Some(view), Some(commit)) = (&snap.view, &snap.commit) {
             let config = serde_json::to_string(view).map_err(|e| err("indexing the view", e))?;
             self.run(
@@ -1037,6 +1053,8 @@ pub struct Agent {
 pub struct AgentAccess {
     pub agent: Agent,
     pub access: Option<Access>,
+    /// Why it's in: named, or through the org or a team.
+    pub via: Option<Via>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -1125,6 +1143,8 @@ impl Store {
         for row in self.query("SELECT channel_id FROM grants WHERE agent_id = ?1", std::slice::from_ref(&id))? {
             self.set_access(&text(&row[0]), author, agent_id, None)?;
         }
+        // Its seat stays, open; with no seat it's in no channel through the org.
+        self.vacate(agent_id)?;
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
@@ -1147,12 +1167,11 @@ impl Store {
         Ok(rows.first().map(|r| Agent { id: text(&r[0]), name: text(&r[1]), created_at: int(&r[2]) }))
     }
 
+    /// What an agent may do in a channel: named there, or in through its
+    /// seat in the org (see `reach`). Every check of an agent's access comes
+    /// through here.
     pub fn access(&self, agent_id: &str, channel_id: &str) -> Result<Option<Access>, String> {
-        let rows = self.query(
-            "SELECT access FROM grants WHERE channel_id = ?1 AND agent_id = ?2",
-            &[Value::from_text(channel_id.to_string()), Value::from_text(agent_id.to_string())],
-        )?;
-        Ok(rows.first().and_then(|r| parse_access(&text(&r[0]))))
+        Ok(self.reach(agent_id, channel_id)?.map(|(a, _)| a))
     }
 
     /// Refuse unless the agent has at least `need` in the channel. The answer
@@ -1169,7 +1188,10 @@ impl Store {
     pub fn channel_access(&self, channel_id: &str) -> Result<Vec<AgentAccess>, String> {
         self.agents()?
             .into_iter()
-            .map(|agent| Ok(AgentAccess { access: self.access(&agent.id, channel_id)?, agent }))
+            .map(|agent| {
+                let reach = self.reach(&agent.id, channel_id)?;
+                Ok(AgentAccess { access: reach.as_ref().map(|(a, _)| *a), via: reach.map(|(_, v)| v), agent })
+            })
             .collect()
     }
 
@@ -1178,12 +1200,7 @@ impl Store {
     pub fn set_access(&self, channel_id: &str, author: &str, agent_id: &str, access: Option<Access>) -> Result<(), String> {
         self.require_channel(channel_id)?;
         let agent = self.agents()?.into_iter().find(|a| a.id == agent_id).ok_or("That agent no longer exists.")?;
-        let mut acl = Acl::default();
-        for row in self.query("SELECT agent_id, access FROM grants WHERE channel_id = ?1", &[Value::from_text(channel_id.to_string())])? {
-            if let Some(a) = parse_access(&text(&row[1])) {
-                acl.agents.insert(text(&row[0]), a);
-            }
-        }
+        let mut acl = self.current_acl(channel_id)?;
         if acl.agents.get(agent_id).copied() == access {
             return Ok(());
         }
@@ -1196,28 +1213,24 @@ impl Store {
             Some(a) => acl.agents.insert(agent_id.to_string(), a),
             None => acl.agents.remove(agent_id),
         };
-        let bytes = serde_json::to_vec_pretty(&acl).map_err(|e| err("saving access", e))?;
-        self.write(channel_id, author, &message, &[(records::ACL_PATH.to_string(), bytes)])
+        self.save_acl(channel_id, author, &message, &acl)
     }
 
-    /// The channels shared with an agent, with what it may do in each.
+    /// The channels an agent can be in, with what it may do in each.
     pub fn agent_channels(&self, agent: &Agent) -> Result<Vec<AgentChannel>, String> {
         let rows = self.query(
-            "SELECT w.name, c.id, c.workspace_id, c.name, c.topic, c.created_at, g.access
-             FROM grants g JOIN channels c ON c.id = g.channel_id JOIN workspaces w ON w.id = c.workspace_id
-             WHERE g.agent_id = ?1 ORDER BY w.created_at, c.created_at",
-            &[Value::from_text(agent.id.clone())],
+            "SELECT w.name, c.id, c.workspace_id, c.name, c.topic, c.created_at
+             FROM channels c JOIN workspaces w ON w.id = c.workspace_id ORDER BY w.created_at, c.created_at",
+            &[],
         )?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                Some(AgentChannel {
-                    workspace: text(&r[0]),
-                    channel: Channel { id: text(&r[1]), workspace_id: text(&r[2]), name: text(&r[3]), topic: text(&r[4]), created_at: int(&r[5]) },
-                    access: parse_access(&text(&r[6]))?,
-                })
-            })
-            .collect())
+        let mut out = Vec::new();
+        for r in &rows {
+            let channel = Channel { id: text(&r[1]), workspace_id: text(&r[2]), name: text(&r[3]), topic: text(&r[4]), created_at: int(&r[5]) };
+            if let Some(access) = self.access(&agent.id, &channel.id)? {
+                out.push(AgentChannel { workspace: text(&r[0]), channel, access });
+            }
+        }
+        Ok(out)
     }
 
     pub fn channel(&self, channel_id: &str) -> Result<Option<Channel>, String> {
@@ -1311,6 +1324,9 @@ impl Store {
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
             &[Value::from_text(ws_id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
         )?;
+        // An imported workspace joins this computer's org; its channels keep
+        // the rules their history has (a team from another org matches no one).
+        self.ensure_org()?;
         for (i, c) in channels.into_iter().enumerate() {
             let id = new_id();
             if let Some(h) = &c.history {
@@ -2584,7 +2600,7 @@ mod tests {
         // Grants are commits, and they survive losing the index.
         store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
         let log: Vec<String> = records::history(&dir, &general.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
-        assert_eq!(log, ["Let intake read and change this channel", "Let intake read this channel"]);
+        assert_eq!(log, ["Let intake read and change this channel", "Let intake read this channel", "Open to everyone in Demo's org"]);
         store.run("DELETE FROM grants", &[]).unwrap();
         store.run("DELETE FROM indexed", &[]).unwrap();
         drop(store);
@@ -3052,6 +3068,103 @@ mod tests {
         store.post(&c.id, "ava", "agent", "@everyone once more").unwrap();
         assert!(told(&bob).is_empty(), "and not after it's turned off");
         assert!(store.create_agent("Everyone").unwrap_err().contains("no agent can be called that"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_org_is_a_tree_of_seats_and_channels_open_to_it_or_to_its_teams() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let ws = store.create_workspace("Addis").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let org = store.orgs().unwrap().remove(0);
+        assert!(org.workspaces.contains(&ws.id), "a workspace belongs to an org");
+        let top = org.seats[0].clone();
+        assert_eq!((top.level, top.holder.clone()), (1, Some(Holder::Person(store.me_id().unwrap()))), "you lead it");
+
+        // Five levels: the top and four under it.
+        let vp = store.add_seat(&top.id, "VP Engineering").unwrap();
+        let lead = store.add_seat(&vp, "p8 Runtime Project Lead").unwrap();
+        let eng = store.add_seat(&lead, "p8 Runtime Engineering Lead").unwrap();
+        let staff = store.add_seat(&eng, "p8 Runtime Staff").unwrap();
+        assert!(store.add_seat(&staff, "Intern").unwrap_err().contains("level 5"));
+        let sales = store.add_seat(&top.id, "VP Sales").unwrap();
+        let seats = store.seats(&org.id).unwrap();
+        assert_eq!(
+            seats.iter().map(|s| (s.title.as_str(), s.level)).collect::<Vec<_>>(),
+            [("CEO", 1), ("VP Engineering", 2), ("p8 Runtime Project Lead", 3), ("p8 Runtime Engineering Lead", 4), ("p8 Runtime Staff", 5), ("VP Sales", 2)],
+            "in outline order"
+        );
+        assert_eq!(seats.iter().map(|s| s.team).collect::<Vec<_>>(), [6, 4, 3, 2, 1, 1], "each seat's team, itself included");
+
+        let agent = |name: &str| store.create_agent(name).unwrap().0;
+        let (ava, kimi, codex, grok, lulu, stray) = (agent("ava"), agent("kimi"), agent("codex"), agent("grok"), agent("lulu"), agent("stray"));
+        for (seat, a, title) in [(&vp, &ava, "VP Engineering"), (&lead, &kimi, "p8 Runtime Project Lead"), (&eng, &codex, "p8 Runtime Engineering Lead"), (&staff, &grok, "p8 Runtime Staff")] {
+            store.set_seat(seat, title, Some(Holder::Agent(a.id.clone()))).unwrap();
+        }
+        let assistant = store.add_seat(&sales, "Sales Assistant").unwrap();
+        store.set_seat(&assistant, "Sales Assistant", Some(Holder::Agent(lulu.id.clone()))).unwrap();
+        assert!(store.set_seat(&sales, "VP Sales", Some(Holder::Agent(ava.id.clone()))).unwrap_err().contains("ava already holds VP Engineering"), "one seat each");
+        assert!(store.set_seat(&sales, "VP Sales", Some(Holder::Person("someone".into()))).is_err(), "only people in gild hold seats");
+
+        // A new channel is open to the org: every agent with a seat is in,
+        // one without isn't.
+        assert_eq!(store.reach(&ava.id, &general.id).unwrap(), Some((Access::Write, Via::Org)));
+        assert_eq!(store.access(&stray.id, &general.id).unwrap(), None);
+        assert!(store.agent_channels(&ava).unwrap().iter().any(|c| c.channel.id == general.id), "and its tools see it");
+
+        // A channel for one team: a seat and everyone under it.
+        let p8 = store.create_channel(&ws.id, "p8-runtime", "").unwrap();
+        store.set_rules(&p8.id, DEMO_NAME, false, std::slice::from_ref(&lead)).unwrap();
+        let team_of_lead = Some((Access::Write, Via::Team { seat: lead.clone() }));
+        for a in [&kimi, &codex, &grok] {
+            assert_eq!(store.reach(&a.id, &p8.id).unwrap(), team_of_lead, "{}", a.name);
+        }
+        assert_eq!(store.access(&ava.id, &p8.id).unwrap(), None, "above the team");
+        assert_eq!(store.access(&lulu.id, &p8.id).unwrap(), None, "another team");
+        // Named members, and read or change for anyone who's in.
+        store.set_access(&p8.id, DEMO_NAME, &lulu.id, Some(Access::Read)).unwrap();
+        assert_eq!(store.reach(&lulu.id, &p8.id).unwrap(), Some((Access::Read, Via::Named)));
+        store.set_level(&p8.id, DEMO_NAME, &grok.id, Access::Read).unwrap();
+        assert_eq!(store.reach(&grok.id, &p8.id).unwrap(), Some((Access::Read, Via::Team { seat: lead.clone() })));
+        assert!(store.set_level(&p8.id, DEMO_NAME, &ava.id, Access::Read).is_err(), "only for someone who's in");
+        assert!(store.set_rules(&p8.id, DEMO_NAME, false, &["nope".into()]).is_err());
+        let log: Vec<String> = records::history(&dir, &p8.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+        assert_eq!(log, ["Let grok read this channel", "Let lulu read this channel", "Close to the rest of Demo's org; Open to p8 Runtime Project Lead's team", "Open to everyone in Demo's org"]);
+
+        // The team follows the tree: a seat moves with everyone under it.
+        store.move_seat(&eng, &sales).unwrap();
+        assert_eq!(store.access(&codex.id, &p8.id).unwrap(), None);
+        assert_eq!(store.access(&grok.id, &p8.id).unwrap(), None);
+        store.move_seat(&eng, &lead).unwrap();
+        assert_eq!(store.reach(&grok.id, &p8.id).unwrap(), Some((Access::Read, Via::Team { seat: lead.clone() })), "back, with its level");
+        assert!(store.move_seat(&vp, &staff).unwrap_err().contains("its own team"));
+        assert!(store.move_seat(&vp, &assistant).unwrap_err().contains("past level 5"), "VP Engineering's team is 4 deep");
+        assert!(store.move_seat(&top.id, &sales).is_err(), "the top seat reports to no one");
+
+        // An open seat lets no one in; filling it does.
+        store.set_seat(&lead, "p8 Runtime Project Lead", None).unwrap();
+        assert_eq!(store.access(&kimi.id, &p8.id).unwrap(), None);
+        store.set_seat(&lead, "p8 Runtime Project Lead", Some(Holder::Agent(stray.id.clone()))).unwrap();
+        assert_eq!(store.reach(&stray.id, &p8.id).unwrap(), team_of_lead);
+
+        // The rules are in the channel's history; the index is rebuilt from it.
+        store.run("DELETE FROM channel_rules", &[]).unwrap();
+        store.run("DELETE FROM indexed", &[]).unwrap();
+        drop(store);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(store.reach(&grok.id, &p8.id).unwrap(), Some((Access::Read, Via::Team { seat: lead.clone() })));
+        assert_eq!(store.orgs().unwrap().len(), 1, "one org, kept");
+
+        // Removing a seat: its reports move up. Removing an agent opens its seat.
+        store.remove_seat(&eng).unwrap();
+        assert_eq!(store.seats(&org.id).unwrap().iter().find(|s| s.id == staff).map(|s| (s.parent.clone(), s.level)), Some((Some(lead.clone()), 4)));
+        assert!(store.remove_seat(&top.id).is_err());
+        store.remove_agent(&ava.id, DEMO_NAME).unwrap();
+        assert_eq!(store.seats(&org.id).unwrap().iter().find(|s| s.id == vp).unwrap().holder, None);
+        store.rename_org(&org.id, "Addis Corp").unwrap();
+        assert_eq!(store.orgs().unwrap()[0].name, "Addis Corp");
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

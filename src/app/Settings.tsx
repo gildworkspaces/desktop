@@ -8,6 +8,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { core, errorText, BANNERS, MAX_BIO, type Agent, type Channel, type Grant, type Manifest, type Profile, type ProviderInfo, type Theme, type Workspace } from '@/lib/core'
 import { Avatar, type SettingsSection } from './Profile'
 import { AgentPage, AgentProfilePage, AgentsSettings, Toggle } from './Agents'
+import { OrgPage } from './Org'
 
 type Group = { label: string; items: { key: SettingsSection; label: string }[] }
 
@@ -28,7 +29,7 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
   const groups: Group[] = [
     { label: 'Personal', items: [{ key: 'profile', label: 'My Profile' }] },
     { label: 'App', items: [{ key: 'appearance', label: 'Appearance' }, { key: 'agents', label: 'Agents' }, { key: 'providers', label: 'Providers' }, { key: 'addons', label: 'Add-ons' }] },
-    { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'data', label: 'Export and import' }] },
+    { label: workspace ? workspace.name : 'Workspaces', items: [{ key: 'org', label: 'Org' }, { key: 'data', label: 'Export and import' }] },
   ]
   // An agent's or add-on's own page sits under its section.
   const parent: SettingsSection = at.startsWith('agent:') || at.startsWith('agentprofile:') ? 'agents' : at.startsWith('addon:') ? 'addons' : at
@@ -62,11 +63,13 @@ export function SettingsModal({ section, profile, onProfile, workspace, channels
           {at === 'profile' && <ProfilePage profile={profile} onProfile={onProfile} />}
           {at === 'appearance' && <AppearancePage profile={profile} onProfile={onProfile} />}
           {at === 'agents' && <AgentsSettings channels={channels} current={current} onOpenAgent={a => setAt(`agent:${a.id}`)} onOpenProfile={a => setAt(`agentprofile:${a.id}`)} />}
-          {at.startsWith('agentprofile:') && <AgentProfilePage key={at} agentId={at.slice('agentprofile:'.length)} onBack={() => setAt('agents')} pickPicture={smallPicture} />}
+          {at.startsWith('agentprofile:') && <AgentProfilePage key={at} agentId={at.slice('agentprofile:'.length)} workspaceId={workspace?.id ?? null} onBack={() => setAt('agents')} pickPicture={smallPicture}
+            onOpenProfile={h => setAt(h.kind === 'agent' ? `agentprofile:${h.id}` : 'profile')} onOpenOrg={() => setAt('org')} />}
           {at.startsWith('agent:') && <AgentPage key={at} agentId={at.slice(6)} channels={channels} current={current} onBack={() => setAt('agents')} />}
           {at === 'providers' && <ProvidersPage />}
           {at === 'addons' && <AddonsPage onPermissions={id => setAt(`addon:${id}`)} />}
           {at.startsWith('addon:') && <AddonPermissions key={at} addonId={at.slice(6)} onBack={() => setAt('addons')} />}
+          {at === 'org' && <OrgPage workspaceId={workspace?.id ?? null} channels={channels} />}
           {at === 'data' && <DataPage workspace={workspace} onImported={onImported} />}
         </section>
       </div>
