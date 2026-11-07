@@ -347,6 +347,24 @@ fn set_coordinator(core: State<Core>, agent_id: String, on: bool) -> Result<Vec<
     })
 }
 
+/// Let an agent call @everyone, or not.
+#[tauri::command]
+fn set_everyone(core: State<Core>, agent_id: String, on: bool) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.set_everyone(&agent_id, on)?;
+        s.agent_infos()
+    })
+}
+
+/// An agent's picture and the prompt it gets on every wake.
+#[tauri::command]
+fn save_agent_profile(core: State<Core>, agent_id: String, picture: Option<String>, prompt: String) -> Result<Vec<AgentInfo>, String> {
+    with(&core, |s| {
+        s.save_agent_profile(&agent_id, picture.as_deref(), &prompt)?;
+        s.agent_infos()
+    })
+}
+
 /// How many recent messages come with a mention.
 #[tauri::command]
 fn set_context(core: State<Core>, agent_id: String, messages: i64) -> Result<Vec<AgentInfo>, String> {
@@ -541,6 +559,8 @@ pub fn run() {
             set_wake,
             set_context,
             set_coordinator,
+            set_everyone,
+            save_agent_profile,
             held,
             loop_rules,
             set_loop_rules,

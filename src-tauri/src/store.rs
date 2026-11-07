@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS thread_replies (message_id TEXT PRIMARY KEY, root_id 
 CREATE TABLE IF NOT EXISTS quiet_mentions (mention_id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS profile (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS coordinators (agent_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS agent_everyone (agent_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS agent_profile (agent_id TEXT PRIMARY KEY, picture TEXT, prompt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_tools (agent_id TEXT NOT NULL, tool TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY (agent_id, tool));
 CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, granted INTEGER NOT NULL, PRIMARY KEY (addon_id, kind, value));
 CREATE TABLE IF NOT EXISTS agent_runner (agent_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL);
@@ -78,6 +80,8 @@ pub const BANNERS: [&str; 6] = ["#f38020", "#3b6fd8", "#2f8f62", "#a2509a", "#c2
 pub const MAX_BIO: usize = 190;
 /// A data: URL for a picture the window has already made small.
 pub const MAX_PICTURE: usize = 300_000;
+/// The longest prompt an agent gets on every wake.
+pub const MAX_AGENT_PROMPT: usize = 4000;
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Workspace {
@@ -1124,6 +1128,8 @@ impl Store {
         self.run("DELETE FROM agent_wake WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_context WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM coordinators WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_everyone WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        self.run("DELETE FROM agent_profile WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_tools WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM agent_runner WHERE agent_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM quiet_mentions WHERE mention_id IN (SELECT id FROM mentions WHERE agent_id = ?1)", std::slice::from_ref(&id))?;
@@ -1389,8 +1395,15 @@ pub struct AgentInfo {
     /// person's (they reset the run of agent messages and reach agents in
     /// its threads untagged).
     pub coordinator: bool,
+    /// May call @everyone in a channel (people always may).
+    pub everyone: bool,
     /// Runs on a cloud provider's model instead of a command on this computer.
     pub runner: Option<Runner>,
+    /// Its picture, a small data: URL, like a person's.
+    pub picture: Option<String>,
+    /// What it's told on every wake, before the conversation: its role and
+    /// how to work. Empty: nothing extra.
+    pub prompt: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1773,9 +1786,10 @@ impl Store {
         let directs = self.directs(message, &coordinators);
         let mut tagged: Vec<&Agent> = Vec::new();
         let names = mentioned_names(&message.body);
-        // @everyone: every agent that can see the channel. Only a person or a
-        // coordinator can call everyone at once.
-        if names.iter().any(|n| n == EVERYONE) && directs {
+        // @everyone: every agent that can see the channel. A person can call
+        // everyone at once, and so can an agent allowed to (its Mentions tab).
+        let calls_everyone = message.kind == "person" || (message.kind == "agent" && self.everyone_names()?.contains(&message.author));
+        if names.iter().any(|n| n == EVERYONE) && calls_everyone {
             for agent in &agents {
                 let author = message.kind == "agent" && message.author == agent.name;
                 if !author && self.access(&agent.id, &message.channel_id)?.is_some() && !tagged.iter().any(|t| t.id == agent.id) {
@@ -2071,8 +2085,9 @@ impl Store {
 
     pub fn agent_infos(&self) -> Result<Vec<AgentInfo>, String> {
         let rows = self.query(
-            "SELECT a.id, a.name, a.created_at, k.command, c.messages, r.agent_id, p.provider, p.model FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
+            "SELECT a.id, a.name, a.created_at, k.command, c.messages, r.agent_id, p.provider, p.model, e.agent_id, f.picture, f.prompt FROM agents a LEFT JOIN agent_wake k ON k.agent_id = a.id
              LEFT JOIN agent_context c ON c.agent_id = a.id LEFT JOIN coordinators r ON r.agent_id = a.id LEFT JOIN agent_runner p ON p.agent_id = a.id
+             LEFT JOIN agent_everyone e ON e.agent_id = a.id LEFT JOIN agent_profile f ON f.agent_id = a.id
              ORDER BY a.created_at",
             &[],
         )?;
@@ -2093,8 +2108,63 @@ impl Store {
                     Value::Null => None,
                     v => Some(Runner { provider: text(v), model: text(&r[7]) }),
                 },
+                everyone: !matches!(r[8], Value::Null),
+                picture: match &r[9] {
+                    Value::Null => None,
+                    v => Some(text(v)),
+                },
+                prompt: match &r[10] {
+                    Value::Null => String::new(),
+                    v => text(v),
+                },
             })
             .collect())
+    }
+
+    /// Let an agent call @everyone, or not. Only the window calls this.
+    pub fn set_everyone(&self, agent_id: &str, on: bool) -> Result<(), String> {
+        self.agent(agent_id)?;
+        let id = Value::from_text(agent_id.to_string());
+        self.run("DELETE FROM agent_everyone WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        if on {
+            self.run("INSERT INTO agent_everyone (agent_id) VALUES (?1)", &[id])?;
+        }
+        Ok(())
+    }
+
+    /// An agent's picture and the prompt it gets on every wake. Only the
+    /// window calls this.
+    pub fn save_agent_profile(&self, agent_id: &str, picture: Option<&str>, prompt: &str) -> Result<(), String> {
+        self.agent(agent_id)?;
+        if let Some(p) = picture {
+            if !p.starts_with("data:image/") || p.len() > MAX_PICTURE {
+                return Err("That picture can't be used; choose another.".into());
+            }
+        }
+        let prompt = prompt.trim();
+        if prompt.chars().count() > MAX_AGENT_PROMPT {
+            return Err(format!("The prompt is at most {MAX_AGENT_PROMPT} characters."));
+        }
+        let id = Value::from_text(agent_id.to_string());
+        self.run("DELETE FROM agent_profile WHERE agent_id = ?1", std::slice::from_ref(&id))?;
+        if picture.is_some() || !prompt.is_empty() {
+            let pic = picture.map(|p| Value::from_text(p.to_string())).unwrap_or(Value::Null);
+            self.run("INSERT INTO agent_profile (agent_id, picture, prompt) VALUES (?1, ?2, ?3)", &[id, pic, Value::from_text(prompt.to_string())])?;
+        }
+        Ok(())
+    }
+
+    /// The prompt an agent gets on every wake (empty: none).
+    pub fn agent_prompt(&self, agent_id: &str) -> Result<String, String> {
+        Ok(self
+            .query("SELECT prompt FROM agent_profile WHERE agent_id = ?1", &[Value::from_text(agent_id.to_string())])?
+            .first()
+            .map(|r| text(&r[0]))
+            .unwrap_or_default())
+    }
+
+    fn everyone_names(&self) -> Result<Vec<String>, String> {
+        Ok(self.query("SELECT a.name FROM agent_everyone e JOIN agents a ON a.id = e.agent_id", &[])?.iter().map(|r| text(&r[0])).collect())
     }
 
     /// Make an agent a coordinator, or a regular agent again. Only the
@@ -2966,14 +3036,44 @@ mod tests {
         assert_eq!(told(&ava), [true], "once, though named twice");
         assert_eq!(told(&bob), [true]);
         assert!(told(&cat).is_empty(), "cat can't see the channel");
-        // An agent can't call everyone; a coordinator can.
+        // An agent can't call everyone, a coordinator included, until it's
+        // allowed to.
         store.post(&c.id, "ava", "agent", "@everyone look at this").unwrap();
         assert!(told(&bob).is_empty());
         store.set_coordinator(&ava.id, true).unwrap();
         store.post(&c.id, "ava", "agent", "@everyone look at this").unwrap();
+        assert!(told(&bob).is_empty(), "a coordinator isn't allowed by being one");
+        store.set_everyone(&ava.id, true).unwrap();
+        assert!(store.agent_infos().unwrap().iter().any(|a| a.agent.id == ava.id && a.everyone));
+        store.post(&c.id, "ava", "agent", "@everyone look at this").unwrap();
         assert_eq!(told(&bob), [true]);
         assert!(told(&ava).is_empty(), "not itself");
+        store.set_everyone(&ava.id, false).unwrap();
+        store.post(&c.id, "ava", "agent", "@everyone once more").unwrap();
+        assert!(told(&bob).is_empty(), "and not after it's turned off");
         assert!(store.create_agent("Everyone").unwrap_err().contains("no agent can be called that"));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_s_profile_is_its_picture_and_its_prompt() {
+        let (dir, file) = temp();
+        let store = Store::open(&file).unwrap();
+        let (ava, _) = store.create_agent("ava").unwrap();
+        let info = |s: &Store| s.agent_infos().unwrap().into_iter().find(|a| a.agent.id == ava.id).unwrap();
+        assert_eq!((info(&store).picture, info(&store).prompt), (None, String::new()));
+        store.save_agent_profile(&ava.id, Some("data:image/jpeg;base64,AAAA"), "  You run admissions. Be warm.  ").unwrap();
+        assert_eq!(info(&store).picture.as_deref(), Some("data:image/jpeg;base64,AAAA"));
+        assert_eq!(store.agent_prompt(&ava.id).unwrap(), "You run admissions. Be warm.");
+        assert!(store.save_agent_profile(&ava.id, Some("https://example.com/a.png"), "").is_err(), "a picture is a data: URL");
+        assert!(store.save_agent_profile(&ava.id, None, &"x".repeat(MAX_AGENT_PROMPT + 1)).is_err());
+        assert_eq!(store.agent_prompt(&ava.id).unwrap(), "You run admissions. Be warm.", "a refused save changes nothing");
+        store.save_agent_profile(&ava.id, None, "").unwrap();
+        assert_eq!((info(&store).picture, store.agent_prompt(&ava.id).unwrap()), (None, String::new()));
+        store.save_agent_profile(&ava.id, None, "Keep it short.").unwrap();
+        store.remove_agent(&ava.id, DEMO_NAME).unwrap();
+        assert!(store.query("SELECT * FROM agent_profile", &[]).unwrap().is_empty(), "removing the agent removes its profile");
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

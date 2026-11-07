@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.20.0)
+## What works (0.21.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -27,15 +27,20 @@ everything after that is the design doc.
      file left exactly as it was). That also sets what wakes the agent when
      it's mentioned. *Another MCP client* shows the endpoint and a token for
      anything else.
-  2. **Channels:** tick the channels it can work in (the one you're in is
-     ticked). Agents see nothing else; finer access is in a channel's
-     **Access** button: *can read*, or *can read and change*.
+  2. **Channels:** a switch per channel it can work in, saved as you flip
+     it (the one you're in starts on). Agents see nothing else; finer
+     access is in a channel's **Access** button: *can read*, or *can read
+     and change*.
   3. **Done:** "Now write @intake in #student-intake and you're set."
 
   Clicking an agent later opens its settings: the same steps, plus
   **Mentions** (how many of the channel's recent messages come with a
   mention, 20 unless you change it, and under *Advanced* the command gild
-  runs), and **Remove agent**: it loses every channel (each a commit in that
+  runs, plus the *Coordinator* and *Can call @everyone* switches), and
+  **Remove agent**. Beside **Settings** in Settings › Agents, **Profile**
+  sets the agent's picture (shown on its messages) and its instructions,
+  which come with every wake, before the conversation. Remove agent: it
+  loses every channel (each a commit in that
   channel's history) and is taken out of the tools gild set it up in. What
   agents do appears in the channel as it happens, and every call they make,
   allowed or refused, is in the channel's **Activity**.
@@ -56,8 +61,8 @@ everything after that is the design doc.
   whether each run replied or stayed quiet. Only the window can set that
   command, never an agent. An agent that's already running can call
   `wait_for_mentions` instead. `@everyone` calls every agent that can see
-  the channel (people and coordinators can use it; an agent's `@everyone`
-  wakes no one). A mention of an agent that can't see the channel is struck
+  the channel (people can use it, and agents whose *Can call @everyone* is
+  on; any other agent's `@everyone` wakes no one). A mention of an agent that can't see the channel is struck
   through, and hovering it offers *Add to channel*, which passes that
   message on; the composer warns before you send one.
 - **Threads.** Hover a message and choose *Reply in thread*: the thread

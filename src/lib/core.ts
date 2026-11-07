@@ -53,7 +53,10 @@ export type Access = 'read' | 'write'
 /** `wake`: the command gild runs when the agent is mentioned, if any. */
 /** `context`: how many recent messages come with a mention. */
 export type Runner = { provider: string; model: string }
-export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean; runner?: Runner | null }
+/** `everyone`: may call @everyone. `picture`, `prompt`: its profile (the prompt comes with every wake). */
+export type Agent = { id: string; name: string; created_at: number; wake?: string | null; context?: number; coordinator?: boolean; everyone?: boolean; runner?: Runner | null; picture?: string | null; prompt?: string }
+/** The longest prompt an agent's profile takes (the core's MAX_AGENT_PROMPT). */
+export const MAX_AGENT_PROMPT = 4000
 /** A cloud provider (never its token). */
 export type ProviderInfo = { id: string; name: string; account_id: string | null; has_token: boolean; vault: 'harar' | 'keychain' | 'none'; vault_error: string | null }
 export type ModelInfo = { id: string; description: string; tools: boolean; context_window: number | null }
@@ -143,6 +146,8 @@ export const core = {
   removeAgent: (agentId: string) => invoke<Agent[]>('remove_agent', { agentId }),
   setContext: (agentId: string, messages: number) => invoke<Agent[]>('set_context', { agentId, messages }),
   setCoordinator: (agentId: string, on: boolean) => invoke<Agent[]>('set_coordinator', { agentId, on }),
+  setEveryone: (agentId: string, on: boolean) => invoke<Agent[]>('set_everyone', { agentId, on }),
+  saveAgentProfile: (agentId: string, picture: string | null, prompt: string) => invoke<Agent[]>('save_agent_profile', { agentId, picture, prompt }),
   loopRules: () => invoke<LoopRules>('loop_rules'),
   setLoopRules: (rules: LoopRules) => invoke<LoopRules>('set_loop_rules', { rules }),
   held: (channelId: string, threadId?: string) => invoke<number>('held', { channelId, threadId: threadId ?? null }),
