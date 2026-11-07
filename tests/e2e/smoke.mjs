@@ -112,7 +112,8 @@ try {
   writeFileSync(join(work, 'token'), token)
   await driver.findElement(By.xpath("//div[contains(@class,'setup')]//button[normalize-space(.)='Next']")).click()
   // Channels are switches; the channel you're in is turned on for it.
-  const channelSwitch = name => By.xpath(`//div[contains(@class,'toggle') and .//label[.='#${name}']]//button[@role='switch']`)
+  // The row itself (class "toggle"), not the list around the rows ("toggles").
+  const channelSwitch = name => By.xpath(`//div[contains(concat(' ', @class, ' '), ' toggle ') and .//label[.='#${name}']]//button[@role='switch']`)
   const intakeSwitch = await driver.wait(until.elementLocated(channelSwitch('student-intake')), 10000)
   await driver.wait(async () => (await intakeSwitch.getAttribute('aria-checked')) === 'true', 10000, 'the channel you are in is on')
   assert.equal(await driver.findElement(channelSwitch('general')).getAttribute('aria-checked'), 'false')
