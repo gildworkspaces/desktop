@@ -299,16 +299,16 @@ try {
   const link = await driver.wait(until.elementLocated(By.css('.msgs button.threadlink')), 10000)
   await driver.wait(async () => /^4 replies/.test(await link.getAttribute('textContent')), 10000, 'the channel shows 4 replies')
   console.log('thread: tagged and untagged replies answered in the thread')
-  await driver.findElement(By.xpath("//aside[contains(@class,'threadpanel')]//button[normalize-space(.)='Close']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//aside[contains(@class,'threadpanel')]//button[normalize-space(.)='Close']")), 10000, 'the thread’s Close').click()
 
   // Removing it, from its settings: gone from the sidebar, and its token
   // refused.
-  await driver.findElement(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'agentrow') and contains(., 'intake')]")), 10000, 'intake in the sidebar').click()
   await driver.wait(until.elementLocated(By.xpath("//div[@role='tablist']//button[.='Connect']")), 10000).click()
   await driver.wait(until.elementLocated(By.xpath("//button[normalize-space(.)='Remove agent']")), 10000).click()
-  await driver.findElement(By.xpath("//button[contains(@class,'danger') and normalize-space(.)='Remove intake']")).click()
-  await driver.wait(async () => (await driver.findElements(By.css('button.agentrow'))).length === 0, 10000)
-  await driver.findElement(By.css("button[aria-label='Close settings']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'danger') and normalize-space(.)='Remove intake']")), 10000, 'Remove intake').click()
+  await driver.wait(async () => (await driver.findElements(By.css('button.agentrow'))).length === 0, 10000, 'intake gone from the sidebar')
+  await driver.wait(until.elementLocated(By.css("button[aria-label='Close settings']")), 10000, 'Close settings').click()
   const after = await mcp({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)
   assert.equal(after.json.result.isError, true)
   assert.match(after.json.result.content[0].text, /no valid agent token/, 'the removed agent is refused')
@@ -367,6 +367,11 @@ try {
   assert.equal(cards.length, 2, 'the imported workspace is on the home screen')
   assert.ok(await driver.findElement(By.xpath("//button[normalize-space(.)='Import a workspace']")).isDisplayed())
   console.log('imported:', JSON.stringify({ channels: imported.channels, messages: imported.messages }))
+} catch (e) {
+  // What the window showed when it failed: a lookup error alone doesn't say.
+  const shown = await driver.executeScript('return document.body.innerText').catch(() => '(unreadable)')
+  console.log('the window when it failed:\n' + String(shown).slice(0, 4000))
+  throw e
 } finally {
   await driver.quit()
 }
