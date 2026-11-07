@@ -3,8 +3,9 @@
 // the members list, Settings' agents page, what an agent may do in a
 // channel, and what agents did there.
 import { useEffect, useRef, useState } from 'react'
-import { core, clock, day, errorText, MAX_AGENT_PROMPT, type Agent, type AgentAccess, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type ModelInfo, type Profile, type ProviderInfo, type ToolInfo } from '@/lib/core'
+import { core, clock, day, errorText, MAX_AGENT_PROMPT, type Holder, type Via, type Agent, type Access, type AuditEntry, type Channel, type ClientStatus, type Connected, type LoopRules, type ModelInfo, type Profile, type ProviderInfo, type ToolInfo } from '@/lib/core'
 import { Avatar } from './Profile'
+import { OrgPlace } from './Org'
 
 /** Tell every agents list in the window that the agents changed. */
 const changed = () => window.dispatchEvent(new Event('gild:agents'))
@@ -312,6 +313,8 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
   const [coordinator, setCoordinator] = useState(!!agent.coordinator)
   const [everyone, setEveryone] = useState(!!agent.everyone)
   const [shared, setShared] = useState<Map<string, Access | null> | null>(null)
+  // How it's in each channel: named (its switch), or through the org or a team.
+  const [via, setVia] = useState<Map<string, Via | null>>(new Map())
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
   const [removing, setRemoving] = useState(false)
@@ -322,11 +325,11 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
       setClients(cs)
       setChosen(new Set(cs.filter(c => c.installed).map(c => c.id)))
     }, e => setError(errorText(e)))
-    Promise.all(channels.map(c => core.channelAccess(c.id).then(rows => [c.id, rows.find(r => r.agent.id === agent.id)?.access ?? null] as const)))
+    Promise.all(channels.map(c => core.channelAccess(c.id).then(rows => [c.id, rows.find(r => r.agent.id === agent.id)] as const)))
       .then(pairs => {
-        const m = new Map(pairs)
-        setShared(m)
-        setPicked(new Set(pairs.filter(([, a]) => a).map(([id]) => id)))
+        setShared(new Map(pairs.map(([id, r]) => [id, r?.access ?? null])))
+        setVia(new Map(pairs.map(([id, r]) => [id, r?.via ?? null])))
+        setPicked(new Set(pairs.filter(([, r]) => r?.access).map(([id]) => id)))
       }, e => setError(errorText(e)))
   }, [agent.id, channels])
 
@@ -363,6 +366,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
     if (on && !had) await core.setAccess(channelId, agent.id, 'write')
     if (!on && had) await core.setAccess(channelId, agent.id, null)
     setShared(m => new Map(m ?? []).set(channelId, on ? (had ?? 'write') : null))
+    setVia(m => new Map(m).set(channelId, on ? { kind: 'named' } : null))
     setPicked(s => { const n = new Set(s); if (on) n.add(channelId); else n.delete(channelId); return n })
     window.dispatchEvent(new Event('gild:reach'))
   })
@@ -462,11 +466,17 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
           <>
             <p className="soft">Which channels can {agent.name} work in? It sees nothing else, and every change here is saved in the channel’s history.</p>
             <div className="toggles">
-              {channels.map(c => (
-                <Toggle key={c.id} id={`channel-${c.id}`} label={`#${c.name}`}
-                  hint={shared?.get(c.id) === 'read' ? 'Can read only (set in the channel’s Access).' : undefined}
-                  on={picked.has(c.id)} disabled={!shared || busy} onChange={on => shareOne(c.id, on)} />
-              ))}
+              {channels.map(c => {
+                const through = via.get(c.id)
+                const byOrg = through?.kind === 'org' || through?.kind === 'team'
+                const hint = byOrg
+                  ? `In through ${through.kind === 'org' ? 'the whole org' : 'its team'}; change that in the channel’s Access.`
+                  : shared?.get(c.id) === 'read' ? 'Can read only (set in the channel’s Access).' : undefined
+                return (
+                  <Toggle key={c.id} id={`channel-${c.id}`} label={`#${c.name}`} hint={hint}
+                    on={picked.has(c.id)} disabled={!shared || busy || byOrg} onChange={on => shareOne(c.id, on)} />
+                )
+              })}
             </div>
             <p className="faint" style={{ fontSize: 12 }}>A channel that’s on lets {agent.name} read, answer and change it. For read-only, use the channel’s Access button.</p>
             {fresh && <div className="row"><button className="primary" onClick={() => setStep('done')} disabled={busy || !shared}>Next</button></div>}
@@ -583,14 +593,16 @@ export function AgentPage({ agentId, channels, current, onBack }: { agentId: str
 
 /** Settings › Agents › an agent's profile: its picture, and the prompt it
  *  gets on every wake. Laid out like your own profile. */
-export function AgentProfilePage({ agentId, onBack, pickPicture }: { agentId: string; onBack: () => void; pickPicture: (f: File) => Promise<string> }) {
+type ProfileLinks = { workspaceId: string | null; onOpenProfile: (h: Holder) => void; onOpenOrg: () => void }
+
+export function AgentProfilePage({ agentId, onBack, pickPicture, ...links }: { agentId: string; onBack: () => void; pickPicture: (f: File) => Promise<string> } & ProfileLinks) {
   const [agents, setAgents] = useAgents()
   const agent = agents.find(a => a.id === agentId)
   if (!agent) return <div className="spage"><button className="link back" onClick={onBack}>← Agents</button><p className="faint">Loading…</p></div>
-  return <AgentProfileForm key={agent.id} agent={agent} onAgents={setAgents} onBack={onBack} pickPicture={pickPicture} />
+  return <AgentProfileForm key={agent.id} agent={agent} onAgents={setAgents} onBack={onBack} pickPicture={pickPicture} {...links} />
 }
 
-function AgentProfileForm({ agent, onAgents, onBack, pickPicture }: { agent: Agent; onAgents: (a: Agent[]) => void; onBack: () => void; pickPicture: (f: File) => Promise<string> }) {
+function AgentProfileForm({ agent, onAgents, onBack, pickPicture, workspaceId, onOpenProfile, onOpenOrg }: { agent: Agent; onAgents: (a: Agent[]) => void; onBack: () => void; pickPicture: (f: File) => Promise<string> } & ProfileLinks) {
   const [picture, setPicture] = useState<string | null>(agent.picture ?? null)
   const [prompt, setPrompt] = useState(agent.prompt ?? '')
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
@@ -626,6 +638,10 @@ function AgentProfileForm({ agent, onAgents, onBack, pickPicture }: { agent: Age
                 placeholder={`Who ${agent.name} is and how it works. For example: You run student intake. Answer from the Intake SOP, and ask before changing a record.`} />
               <span className="faint hint">{agent.name} gets this every time it’s woken, before the conversation.</span>
               <span className="faint hint mono" style={{ textAlign: 'right' }}>{prompt.length} / {MAX_AGENT_PROMPT}</span>
+            </div>
+            <div className="sfield">
+              <span className="flabel">In the org</span>
+              <OrgPlace workspaceId={workspaceId} agent={agent} onOpenProfile={onOpenProfile} onOpenOrg={onOpenOrg} />
             </div>
           </div>
           <div className="sfield">
@@ -685,40 +701,6 @@ function ToolsTab({ agent }: { agent: Agent }) {
       })}
       {error && <p className="error">{error}</p>}
     </div>
-  )
-}
-
-const LEVELS: { value: '' | Access; label: string }[] = [
-  { value: '', label: 'No access' },
-  { value: 'read', label: 'Can read' },
-  { value: 'write', label: 'Can read and change' },
-]
-
-export function AccessPanel({ channelId, channelName, onClose }: { channelId: string; channelName: string; onClose: () => void }) {
-  const [rows, setRows] = useState<AgentAccess[] | null>(null)
-  const [error, setError] = useState('')
-  useEffect(() => { core.channelAccess(channelId).then(setRows, e => setError(errorText(e))) }, [channelId])
-  async function change(agentId: string, value: string) {
-    setError('')
-    try { setRows(await core.setAccess(channelId, agentId, (value || null) as Access | null)); window.dispatchEvent(new Event('gild:reach')) } catch (err) { setError(errorText(err)) }
-  }
-  return (
-    <aside className="panel" aria-label={`Access to #${channelName}`}>
-      <div className="panelhead"><span className="label">Access to #{channelName}</span><button className="ghost" onClick={onClose}>Close</button></div>
-      <div className="panelform">
-        <p className="soft" style={{ margin: 0, fontSize: 13 }}>People in the workspace can use every channel. Agents only see the channels shared with them, and every change here is saved in the channel's history.</p>
-        {rows?.length === 0 && <p className="faint">No agents yet. Add one in the sidebar.</p>}
-        {rows?.map(r => (
-          <div key={r.agent.id} className="accessrow">
-            <label htmlFor={`acc-${r.agent.id}`}><span className="dot agent" aria-hidden="true" /> {r.agent.name}</label>
-            <select id={`acc-${r.agent.id}`} className="field" value={r.access ?? ''} onChange={e => change(r.agent.id, e.target.value)}>
-              {LEVELS.map(l => <option key={l.value} value={l.value}>{l.label}</option>)}
-            </select>
-          </div>
-        ))}
-        {error && <p className="error">{error}</p>}
-      </div>
-    </aside>
   )
 }
 

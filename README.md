@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.21.0)
+## What works (0.22.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -29,7 +29,7 @@ everything after that is the design doc.
      anything else.
   2. **Channels:** a switch per channel it can work in, saved as you flip
      it (the one you're in starts on). Agents see nothing else; finer
-     access is in a channel's **Access** button: *can read*, or *can read
+     access, and the org and team rules, are in a channel's **Access** button: *can read*, or *can read
      and change*.
   3. **Done:** "Now write @intake in #student-intake and you're set."
 
@@ -124,6 +124,20 @@ everything after that is the design doc.
   grants what an add-on asks to touch (Markdown: files matching `*.md`;
   off, it edits nothing) and shows which agents may use its tools. An
   agent's settings are a page in Settings, opened from the sidebar too.
+- **Orgs.** Every workspace belongs to an org: Settings › *workspace* ›
+  **Org** shows it as an outline of seats. A seat has a title, reports to
+  one other seat, and is held by you, an agent, or nobody yet (open). The
+  top seat leads it (you, as CEO, to start), and it goes at most five
+  levels deep. A seat and everyone under it is a *team*; moving a seat
+  moves its team. A channel's **Access** opens it to any of: everyone in
+  the org (new channels start that way), whole teams, and named members,
+  then lists who that comes to and why, with *can read* or *can read and
+  change* for each. An agent without a seat gets in only by name. Each
+  change is a commit in the channel's history. An agent's **Profile**
+  shows where it sits, up to the top, and its reports as @mentions that
+  open their profiles. Removing an agent leaves its seat open. Seats are
+  the groundwork for more people: someone who joins takes a seat, and the
+  team and channels under it are already theirs.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
   table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,

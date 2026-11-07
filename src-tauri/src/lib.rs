@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use clients::{ClientStatus, Clients, KINDS};
 use records::{Access, Change, Doc, Record};
-use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, ChannelView, LoopRules, Message, Profile, Store, Workspace, Working};
+use store::{Agent, AgentAccess, AgentInfo, AuditEntry, Channel, ChannelData, ChannelDocs, ChannelView, Holder, LoopRules, Message, Org, Profile, Store, Workspace, Working};
 use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
@@ -455,6 +455,90 @@ fn set_access(core: State<Core>, channel_id: String, agent_id: String, access: O
     })
 }
 
+/// Open a channel to its org, to teams in it, or neither.
+#[tauri::command]
+fn set_channel_rules(core: State<Core>, channel_id: String, org: bool, teams: Vec<String>) -> Result<Vec<AgentAccess>, String> {
+    with(&core, |s| {
+        s.set_rules(&channel_id, &s.me()?, org, &teams)?;
+        s.channel_access(&channel_id)
+    })
+}
+
+/// Read or change for an agent that's in a channel, however it's in.
+#[tauri::command]
+fn set_level(core: State<Core>, channel_id: String, agent_id: String, access: Access) -> Result<Vec<AgentAccess>, String> {
+    with(&core, |s| {
+        s.set_level(&channel_id, &s.me()?, &agent_id, access)?;
+        s.channel_access(&channel_id)
+    })
+}
+
+/// The channel's org and team rules, as its history has them.
+#[tauri::command]
+fn channel_rules(core: State<Core>, channel_id: String) -> Result<ChannelRules, String> {
+    with(&core, |s| {
+        let acl = s.current_acl(&channel_id)?;
+        Ok(ChannelRules { org: acl.org, teams: acl.teams })
+    })
+}
+
+#[derive(Serialize)]
+struct ChannelRules {
+    org: bool,
+    teams: Vec<String>,
+}
+
+#[tauri::command]
+fn orgs(core: State<Core>) -> Result<Vec<Org>, String> {
+    with(&core, |s| s.orgs())
+}
+
+#[tauri::command]
+fn rename_org(core: State<Core>, org_id: String, name: String) -> Result<Vec<Org>, String> {
+    with(&core, |s| {
+        s.rename_org(&org_id, &name)?;
+        s.orgs()
+    })
+}
+
+#[tauri::command]
+fn add_seat(core: State<Core>, parent_id: String, title: String) -> Result<Vec<Org>, String> {
+    with(&core, |s| {
+        s.add_seat(&parent_id, &title)?;
+        s.orgs()
+    })
+}
+
+#[tauri::command]
+fn set_seat(core: State<Core>, seat_id: String, title: String, holder: Option<Holder>) -> Result<Vec<Org>, String> {
+    with(&core, |s| {
+        s.set_seat(&seat_id, &title, holder)?;
+        s.orgs()
+    })
+}
+
+#[tauri::command]
+fn move_seat(core: State<Core>, seat_id: String, parent_id: String) -> Result<Vec<Org>, String> {
+    with(&core, |s| {
+        s.move_seat(&seat_id, &parent_id)?;
+        s.orgs()
+    })
+}
+
+#[tauri::command]
+fn remove_seat(core: State<Core>, seat_id: String) -> Result<Vec<Org>, String> {
+    with(&core, |s| {
+        s.remove_seat(&seat_id)?;
+        s.orgs()
+    })
+}
+
+/// You, as the holder of seats.
+#[tauri::command]
+fn me_id(core: State<Core>) -> Result<String, String> {
+    with(&core, |s| s.me_id())
+}
+
 #[tauri::command]
 fn activity(core: State<Core>, channel_id: String) -> Result<Vec<AuditEntry>, String> {
     with(&core, |s| s.activity(&channel_id))
@@ -570,6 +654,16 @@ pub fn run() {
             connect_agent,
             remove_agent,
             channel_access,
+            set_channel_rules,
+            set_level,
+            channel_rules,
+            orgs,
+            rename_org,
+            add_seat,
+            set_seat,
+            move_seat,
+            remove_seat,
+            me_id,
             set_access,
             activity,
             mcp_status,
