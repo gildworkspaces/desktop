@@ -2,7 +2,7 @@
   "name": "gild-desktop",
   "private": true,
   "version": "0.22.0",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite dev --port 1430 --strictPort",
