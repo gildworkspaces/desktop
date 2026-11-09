@@ -3,7 +3,7 @@ name = "gild-addon-markdown"
 version = "0.1.0"
 edition = "2021"
 description = "gild's Markdown add-on: its editor, built as a WebAssembly module the app runs in a sandbox."
-license = "Apache-2.0"
+license = "MIT"
 publish = false
 
 # Its own crate, outside the app's: an add-on is built and shipped apart.

@@ -212,4 +212,4 @@ message and reads it back through the core.
 
 ## License
 
-Apache-2.0.
+MIT.
