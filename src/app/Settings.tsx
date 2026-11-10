@@ -217,7 +217,7 @@ function ProvidersPage() {
   }
   return (
     <div className="spage">
-      <p className="soft lead">An agent can run on this computer (Claude Code, Codex) or on a provider’s model in the cloud. For a cloud agent, gild calls the model and runs the tools it asks for here; the provider never connects to this computer.</p>
+      <p className="soft lead">An agent can run on this computer (Claude Code, Codex, or Pi with a model of its own) or on a provider’s model in the cloud. For a cloud agent, gild calls the model and runs the tools it asks for here; the provider never connects to this computer.</p>
       <div className="addon">
         <div className="row"><b>{p.name}</b>{p.account_id && p.has_token && <span className="tag">set up</span>}</div>
         <div className="sfield">

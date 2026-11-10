@@ -429,7 +429,7 @@ export function AgentSetup({ agent, fresh, channels, current, onAgents, onClose,
               </div>
             )}
             {clients && installed.length === 0 && (
-              <p className="faint" style={{ fontSize: 13 }}>No AI tool gild can set up was found. Install Claude Code or Codex and open this again, or connect another tool by hand below.</p>
+              <p className="faint" style={{ fontSize: 13 }}>No AI tool gild can set up was found. Install Claude Code, Codex or Pi and open this again, or connect another tool by hand below.</p>
             )}
             {connected && connected.errors.map(e => <p key={e} className="error">{e}</p>)}
             {connected && connected.errors.length === 0 && usable(connected.clients).length > 0 && (
