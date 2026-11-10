@@ -99,7 +99,7 @@ pub fn prompt(agent: &str, role: &str, mentions: &[Mention], places: &[Place], e
         }
         Answer::Writes => {
             out.push_str(&format!(
-                "\nWhat you write back is posted where this happened, as your reply, so write just your answer to the people there. Use gild's tools only to look things up first (MCP at {endpoint}: read_thread for more of the conversation, search_docs and read_doc for the channel's docs), or post_message to post somewhere else. "
+                "\nUse gild's tools (MCP at {endpoint}) to look things up and to do what was asked: read_thread for more of the conversation, search_docs and read_doc for the channel's docs, propose_doc_edit to create or change a doc (a person approves it), and the others you have. Asked to make or change something, do it with a tool; don't write its contents into the chat. When you're done, what you write back is posted where this happened as your reply, so write just your answer to the people there; use post_message only to post somewhere else. "
             ));
             out.push_str(&if tagged {
                 "Do what was asked if you can; if you can't, say why.".to_string()
@@ -425,7 +425,9 @@ mod tests {
         let posts = prompt("local", "", std::slice::from_ref(&m), &[], "http://127.0.0.1:4747/mcp", Answer::Posts);
         let writes = prompt("local", "", std::slice::from_ref(&m), &[], "http://127.0.0.1:4747/mcp", Answer::Writes);
         assert!(posts.contains("post_message to answer where it happened"));
-        assert!(writes.contains("What you write back is posted where this happened") && !writes.contains("post_message to answer"));
+        assert!(writes.contains("what you write back is posted where this happened") && !writes.contains("post_message to answer"));
+        // Writing the answer mustn't stop it acting: asked to make something, it uses a tool.
+        assert!(writes.contains("to do what was asked") && writes.contains("propose_doc_edit to create or change a doc"));
         let untagged = prompt("local", "", &[Mention { tagged: false, ..m }], &[], "http://127.0.0.1:4747/mcp", Answer::Writes);
         assert!(untagged.contains(&format!("otherwise write exactly {NOTHING}")));
     }
