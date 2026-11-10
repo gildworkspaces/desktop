@@ -84,6 +84,12 @@ pub fn wake_command(kind: Kind, agent: &str) -> String {
     }
 }
 
+/// Whether `command` is the Pi wake command gild set `agent` up with: such an
+/// agent's written answer is its reply (see `wake::Answer::Writes`).
+pub fn answers_by_writing(command: &str, agent: &str) -> bool {
+    command == wake_command(Kind::Pi, agent)
+}
+
 /// Pi names an MCP server's tools `mcp__<server>__<tool>`, with every
 /// character other than a letter, digit or `_` in the server's name made `_`.
 fn pi_tool_prefix(agent: &str) -> String {
