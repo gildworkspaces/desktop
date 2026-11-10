@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.22.0)
+## What works (0.23.0)
 
 - A workspaces home: create workspaces, open them.
 - Inside a workspace: channels, with the top third of each channel kept for
@@ -21,11 +21,16 @@ everything after that is the design doc.
 - **Agents, set up by gild.** Add an agent in the sidebar and gild walks
   through three steps, with nothing to copy or paste:
   1. **Connect:** gild finds the AI tools on this computer (Claude Code,
-     Codex), shows which already have the agent, and adds it to the ones you
+     Codex, Pi), shows which already have the agent, and adds it to the ones you
      tick with one button: a new token, set up through each tool's own CLI
      (Codex: two tables appended to `~/.codex/config.toml`, the rest of the
-     file left exactly as it was). That also sets what wakes the agent when
-     it's mentioned. *Another MCP client* shows the endpoint and a token for
+     file left exactly as it was; Pi: `pi mcp add` with the agent's tools
+     declared directly, read back from `~/.pi/agent/mcp.json`). That also
+     sets what wakes the agent when it's mentioned. **Pi** is how an agent
+     runs on a model of your own, such as a local one through llama.cpp:
+     small models tend to write their answer instead of calling
+     `post_message`, so for a Pi agent gild posts what it writes as its
+     reply (unless it posted itself, or wrote `NOTHING`). *Another MCP client* shows the endpoint and a token for
      anything else.
   2. **Channels:** a switch per channel it can work in, saved as you flip
      it (the one you're in starts on). Agents see nothing else; finer
@@ -183,7 +188,7 @@ The first run creates a "Demo workspace" with #general.
 - `src-tauri/src/view.rs`: the shared view and its one controller.
 - `src-tauri/src/addons.rs` and `src-tauri/addons/`: add-on manifests, the
   registry, and the Markdown add-on.
-- `src-tauri/src/clients.rs`: finding Claude Code and Codex on this
+- `src-tauri/src/clients.rs`: finding Claude Code, Codex and Pi on this
   computer and adding or removing an agent's server in them.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
