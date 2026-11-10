@@ -96,12 +96,25 @@ fn pi_config(home: &Path) -> PathBuf {
     home.join(".pi").join("agent").join("mcp.json")
 }
 
-/// The address and Authorization header Pi has for `name`, if it has it.
-fn pi_server(home: &Path, name: &str) -> Option<(String, String)> {
+/// What Pi has for server `name`, if it has it.
+#[derive(Debug, PartialEq)]
+struct PiServer {
+    url: String,
+    authorization: String,
+    exposure: String,
+}
+
+fn pi_server(home: &Path, name: &str) -> Option<PiServer> {
     let text = std::fs::read_to_string(pi_config(home)).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let server = &json["mcpServers"][name];
-    Some((server["url"].as_str()?.to_string(), server["headers"]["Authorization"].as_str().unwrap_or_default().to_string()))
+    let field = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    Some(PiServer {
+        url: server["url"].as_str()?.to_string(),
+        authorization: field(&server["headers"]["Authorization"]),
+        // Pi's default when a server doesn't say.
+        exposure: server["exposure"].as_str().unwrap_or("codemode").to_string(),
+    })
 }
 
 impl Clients {
@@ -219,12 +232,20 @@ impl Clients {
                 }
             }
             Kind::Pi => {
-                // A user-level server, found from any folder. Pi writes it to
-                // its mcp.json without connecting, so gild reads it back.
+                // A user-level server, found from any folder. Its tools are
+                // `direct`: declared to the model like built-in tools. Pi's
+                // default, `codemode`, reaches MCP tools only through scripts
+                // the model writes, and the wake command allows only the
+                // agent's gild tools, so the model would have none. Pi writes
+                // the server to its mcp.json without connecting, so gild
+                // reads it back.
                 let header = format!("Authorization=Bearer {token}");
-                self.run(kind, &format!("mcp add {} --url {} --header {}", quote(&name), quote(endpoint), quote(&header))).await.map_err(fail)?;
-                if pi_server(&self.home, &name) != Some((endpoint.to_string(), format!("Bearer {token}"))) {
-                    return Err(fail("it doesn't read back the address and token gild gave it".into()));
+                self.run(kind, &format!("mcp add {} --url {} --header {} --exposure direct", quote(&name), quote(endpoint), quote(&header)))
+                    .await
+                    .map_err(fail)?;
+                let want = PiServer { url: endpoint.to_string(), authorization: format!("Bearer {token}"), exposure: "direct".into() };
+                if pi_server(&self.home, &name).as_ref() != Some(&want) {
+                    return Err(fail("it doesn't read back the address, token and direct tools gild gave it".into()));
                 }
             }
         }
@@ -340,7 +361,8 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
 
     /// A stand-in for `pi mcp add/remove`: keeps one file per server and
     /// writes `~/.pi/agent/mcp.json` from them in the shape the real Pi
-    /// writes (`{"mcpServers":{"<name>":{"url":…,"headers":{…}}}}`), without
+    /// writes (`{"mcpServers":{"<name>":{"url":…,"headers":{…},"exposure":…}}}`,
+    /// with no `exposure` when none was given), without
     /// connecting; removing a server it doesn't have fails, as Pi's does.
     fn fake_pi(dir: &Path) -> String {
         let store = dir.join("pi-servers");
@@ -352,16 +374,17 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
 [ "$1" = mcp ] || exit 2
 cmd=$2; n=$3; shift 3
 case $cmd in
-  add) u=; h=
-       while [ $# -gt 0 ]; do case $1 in --url) u=$2; shift 2;; --header) h=${{2#Authorization=}}; shift 2;; *) shift;; esac; done
-       printf '%s\n%s\n' "$u" "$h" > "$S/$n" ;;
+  add) u=; h=; x=
+       while [ $# -gt 0 ]; do case $1 in --url) u=$2; shift 2;; --header) h=${{2#Authorization=}}; shift 2;; --exposure) x=$2; shift 2;; *) shift;; esac; done
+       printf '%s\n%s\n%s\n' "$u" "$h" "$x" > "$S/$n" ;;
   remove) [ -f "$S/$n" ] || {{ echo "No global MCP server named \"$n\"" >&2; exit 1; }}; rm "$S/$n" ;;
   *) exit 2 ;;
 esac
 mkdir -p "$(dirname "$C")"
 {{ printf '{{"mcpServers":{{'; sep=
   for f in "$S"/*; do [ -f "$f" ] || continue
-    printf '%s"%s":{{"url":"%s","headers":{{"Authorization":"%s"}}}}' "$sep" "$(basename "$f")" "$(sed -n 1p "$f")" "$(sed -n 2p "$f")"; sep=,
+    x=$(sed -n 3p "$f"); [ -n "$x" ] && x=",\"exposure\":\"$x\""
+    printf '%s"%s":{{"url":"%s","headers":{{"Authorization":"%s"}}%s}}' "$sep" "$(basename "$f")" "$(sed -n 1p "$f")" "$(sed -n 2p "$f")" "$x"; sep=,
   done; printf '}}}}\n'; }} > "$C"
 "#,
                 store.display(),
@@ -402,7 +425,8 @@ mkdir -p "$(dirname "$C")"
         assert_eq!(added.trim(), "http://127.0.0.1:4747/mcp --header Authorization: Bearer gild_one");
         let ours = "[mcp_servers.gild-ava]\nurl = \"http://127.0.0.1:4747/mcp\"\n\n[mcp_servers.gild-ava.http_headers]\nAuthorization = \"Bearer gild_one\"\n";
         assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{ours}"), "the person's config untouched, gild's tables after it");
-        assert_eq!(pi_server(&dir, "gild-ava"), Some((endpoint.to_string(), "Bearer gild_one".to_string())));
+        let pi = |token: &str| Some(PiServer { url: endpoint.into(), authorization: format!("Bearer {token}"), exposure: "direct".into() });
+        assert_eq!(pi_server(&dir, "gild-ava"), pi("gild_one"), "direct tools, or the wake command leaves the model none");
         assert!(clients.status("ava").await.iter().all(|c| c.connected));
         assert!(clients.status("intake").await.iter().all(|c| !c.connected), "only the agent it was set up for");
 
@@ -412,7 +436,7 @@ mkdir -p "$(dirname "$C")"
         clients.connect(Kind::Pi, "ava", endpoint, "gild_two").await.unwrap();
         assert!(std::fs::read_to_string(dir.join("claude-servers/gild-ava")).unwrap().contains("Bearer gild_two"));
         assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{}", ours.replace("gild_one", "gild_two")));
-        assert_eq!(pi_server(&dir, "gild-ava"), Some((endpoint.to_string(), "Bearer gild_two".to_string())));
+        assert_eq!(pi_server(&dir, "gild-ava"), pi("gild_two"));
 
         clients.disconnect(Kind::ClaudeCode, "ava").await;
         assert_eq!(clients.status("ava").await.iter().map(|c| c.connected).collect::<Vec<_>>(), [false, true, true]);
