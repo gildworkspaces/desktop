@@ -18,21 +18,26 @@ const STEP: Duration = Duration::from_secs(30);
 pub enum Kind {
     ClaudeCode,
     Codex,
+    /// Pi (pi.dev), the agent harness that also runs local models: how an
+    /// agent on this computer's own model, like Ava, works in gild.
+    Pi,
 }
 
-pub const KINDS: [Kind; 2] = [Kind::ClaudeCode, Kind::Codex];
+pub const KINDS: [Kind; 3] = [Kind::ClaudeCode, Kind::Codex, Kind::Pi];
 
 impl Kind {
     pub fn id(self) -> &'static str {
         match self {
             Kind::ClaudeCode => "claude-code",
             Kind::Codex => "codex",
+            Kind::Pi => "pi",
         }
     }
     fn name(self) -> &'static str {
         match self {
             Kind::ClaudeCode => "Claude Code",
             Kind::Codex => "Codex",
+            Kind::Pi => "Pi",
         }
     }
 }
@@ -42,6 +47,7 @@ impl Kind {
 pub struct Clients {
     pub claude: String,
     pub codex: String,
+    pub pi: String,
     pub home: PathBuf,
 }
 
@@ -71,19 +77,63 @@ pub fn wake_command(kind: Kind, agent: &str) -> String {
     match kind {
         Kind::ClaudeCode => format!("claude -p --allowedTools mcp__{}", server_name(agent)),
         Kind::Codex => "codex exec --skip-git-repo-check -".into(),
+        // Only the agent's gild tools (Pi's built-in file and shell tools are
+        // left out), no AGENTS.md from the folder it wakes in, and no saved
+        // session: gild sends the conversation with every wake.
+        Kind::Pi => format!("pi -p --no-session --no-context-files --tools {}", quote(&format!("{}*", pi_tool_prefix(agent)))),
     }
+}
+
+/// Whether `command` is the Pi wake command gild set `agent` up with: such an
+/// agent's written answer is its reply (see `wake::Answer::Writes`).
+pub fn answers_by_writing(command: &str, agent: &str) -> bool {
+    command == wake_command(Kind::Pi, agent)
+}
+
+/// Pi names an MCP server's tools `mcp__<server>__<tool>`, with every
+/// character other than a letter, digit or `_` in the server's name made `_`.
+fn pi_tool_prefix(agent: &str) -> String {
+    let server: String = server_name(agent).chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    format!("mcp__{server}__")
+}
+
+/// Pi's user-level MCP servers, where `pi mcp add` puts them.
+fn pi_config(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent").join("mcp.json")
+}
+
+/// What Pi has for server `name`, if it has it.
+#[derive(Debug, PartialEq)]
+struct PiServer {
+    url: String,
+    authorization: String,
+    exposure: String,
+}
+
+fn pi_server(home: &Path, name: &str) -> Option<PiServer> {
+    let text = std::fs::read_to_string(pi_config(home)).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let server = &json["mcpServers"][name];
+    let field = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    Some(PiServer {
+        url: server["url"].as_str()?.to_string(),
+        authorization: field(&server["headers"]["Authorization"]),
+        // Pi's default when a server doesn't say.
+        exposure: server["exposure"].as_str().unwrap_or("codemode").to_string(),
+    })
 }
 
 impl Clients {
     pub fn for_this_computer() -> Clients {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| "/".into());
-        Clients { claude: "claude".into(), codex: "codex".into(), home }
+        Clients { claude: "claude".into(), codex: "codex".into(), pi: "pi".into(), home }
     }
 
     fn program(&self, kind: Kind) -> &str {
         match kind {
             Kind::ClaudeCode => &self.claude,
             Kind::Codex => &self.codex,
+            Kind::Pi => &self.pi,
         }
     }
 
@@ -100,6 +150,9 @@ impl Clients {
         match kind {
             Kind::ClaudeCode => self.run(kind, &format!("mcp get {name}")).await.is_ok(),
             Kind::Codex => self.run(kind, &format!("mcp get {name} --json")).await.is_ok(),
+            // `pi mcp list` connects to every server it has; reading its
+            // config answers without that.
+            Kind::Pi => pi_server(&self.home, &server_name(agent)).is_some(),
         }
     }
 
@@ -128,6 +181,9 @@ impl Clients {
                         let _ = std::fs::write(&config, kept);
                     }
                 }
+            }
+            Kind::Pi => {
+                let _ = self.run(kind, &format!("mcp remove {}", quote(&server_name(agent)))).await;
             }
         }
     }
@@ -179,6 +235,23 @@ impl Clients {
                 let json: serde_json::Value = serde_json::from_str(&got).map_err(|e| fail(format!("reading its answer: {e}")))?;
                 if json["transport"]["url"].as_str() != Some(endpoint) || json["transport"]["http_headers"]["Authorization"].as_str() != Some(&format!("Bearer {token}")) {
                     return Err(fail("it doesn't read back the address and token gild wrote".into()));
+                }
+            }
+            Kind::Pi => {
+                // A user-level server, found from any folder. Its tools are
+                // `direct`: declared to the model like built-in tools. Pi's
+                // default, `codemode`, reaches MCP tools only through scripts
+                // the model writes, and the wake command allows only the
+                // agent's gild tools, so the model would have none. Pi writes
+                // the server to its mcp.json without connecting, so gild
+                // reads it back.
+                let header = format!("Authorization=Bearer {token}");
+                self.run(kind, &format!("mcp add {} --url {} --header {} --exposure direct", quote(&name), quote(endpoint), quote(&header)))
+                    .await
+                    .map_err(fail)?;
+                let want = PiServer { url: endpoint.to_string(), authorization: format!("Bearer {token}"), exposure: "direct".into() };
+                if pi_server(&self.home, &name).as_ref() != Some(&want) {
+                    return Err(fail("it doesn't read back the address, token and direct tools gild gave it".into()));
                 }
             }
         }
@@ -292,6 +365,40 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
         )
     }
 
+    /// A stand-in for `pi mcp add/remove`: keeps one file per server and
+    /// writes `~/.pi/agent/mcp.json` from them in the shape the real Pi
+    /// writes (`{"mcpServers":{"<name>":{"url":…,"headers":{…},"exposure":…}}}`,
+    /// with no `exposure` when none was given), without
+    /// connecting; removing a server it doesn't have fails, as Pi's does.
+    fn fake_pi(dir: &Path) -> String {
+        let store = dir.join("pi-servers");
+        std::fs::create_dir_all(&store).unwrap();
+        script(
+            &dir.join("pi"),
+            &format!(
+                r#"S='{}'; C='{}'
+[ "$1" = mcp ] || exit 2
+cmd=$2; n=$3; shift 3
+case $cmd in
+  add) u=; h=; x=
+       while [ $# -gt 0 ]; do case $1 in --url) u=$2; shift 2;; --header) h=${{2#Authorization=}}; shift 2;; --exposure) x=$2; shift 2;; *) shift;; esac; done
+       printf '%s\n%s\n%s\n' "$u" "$h" "$x" > "$S/$n" ;;
+  remove) [ -f "$S/$n" ] || {{ echo "No global MCP server named \"$n\"" >&2; exit 1; }}; rm "$S/$n" ;;
+  *) exit 2 ;;
+esac
+mkdir -p "$(dirname "$C")"
+{{ printf '{{"mcpServers":{{'; sep=
+  for f in "$S"/*; do [ -f "$f" ] || continue
+    x=$(sed -n 3p "$f"); [ -n "$x" ] && x=",\"exposure\":\"$x\""
+    printf '%s"%s":{{"url":"%s","headers":{{"Authorization":"%s"}}%s}}' "$sep" "$(basename "$f")" "$(sed -n 1p "$f")" "$(sed -n 2p "$f")" "$x"; sep=,
+  done; printf '}}}}\n'; }} > "$C"
+"#,
+                store.display(),
+                pi_config(dir).display()
+            ),
+        )
+    }
+
     fn temp() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gild-clients-{}", crate::store::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -304,34 +411,45 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
     #[tokio::test]
     async fn gild_finds_the_clients_and_sets_the_agent_up_in_them() {
         let dir = temp();
-        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), home: dir.clone() };
+        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), pi: fake_pi(&dir), home: dir.clone() };
         std::fs::create_dir_all(dir.join(".codex")).unwrap();
         std::fs::write(codex_config(&dir), MINE).unwrap();
         let endpoint = "http://127.0.0.1:4747/mcp";
 
         let before = clients.status("ava").await;
-        assert_eq!(before.iter().map(|c| (c.id, c.installed, c.connected)).collect::<Vec<_>>(), [("claude-code", true, false), ("codex", true, false)]);
+        assert_eq!(
+            before.iter().map(|c| (c.id, c.installed, c.connected)).collect::<Vec<_>>(),
+            [("claude-code", true, false), ("codex", true, false), ("pi", true, false)]
+        );
         assert_eq!(before[0].wake, "claude -p --allowedTools mcp__gild-ava");
+        assert_eq!(before[2].wake, "pi -p --no-session --no-context-files --tools 'mcp__gild_ava__*'");
 
         clients.connect(Kind::ClaudeCode, "ava", endpoint, "gild_one").await.unwrap();
         clients.connect(Kind::Codex, "ava", endpoint, "gild_one").await.unwrap();
+        clients.connect(Kind::Pi, "ava", endpoint, "gild_one").await.unwrap();
         let added = std::fs::read_to_string(dir.join("claude-servers/gild-ava")).unwrap();
         assert_eq!(added.trim(), "http://127.0.0.1:4747/mcp --header Authorization: Bearer gild_one");
         let ours = "[mcp_servers.gild-ava]\nurl = \"http://127.0.0.1:4747/mcp\"\n\n[mcp_servers.gild-ava.http_headers]\nAuthorization = \"Bearer gild_one\"\n";
         assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{ours}"), "the person's config untouched, gild's tables after it");
+        let pi = |token: &str| Some(PiServer { url: endpoint.into(), authorization: format!("Bearer {token}"), exposure: "direct".into() });
+        assert_eq!(pi_server(&dir, "gild-ava"), pi("gild_one"), "direct tools, or the wake command leaves the model none");
         assert!(clients.status("ava").await.iter().all(|c| c.connected));
         assert!(clients.status("intake").await.iter().all(|c| !c.connected), "only the agent it was set up for");
 
         // Connecting again replaces the server: the new token, once.
         clients.connect(Kind::ClaudeCode, "ava", endpoint, "gild_two").await.unwrap();
         clients.connect(Kind::Codex, "ava", endpoint, "gild_two").await.unwrap();
+        clients.connect(Kind::Pi, "ava", endpoint, "gild_two").await.unwrap();
         assert!(std::fs::read_to_string(dir.join("claude-servers/gild-ava")).unwrap().contains("Bearer gild_two"));
         assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), format!("{MINE}\n{}", ours.replace("gild_one", "gild_two")));
+        assert_eq!(pi_server(&dir, "gild-ava"), pi("gild_two"));
 
         clients.disconnect(Kind::ClaudeCode, "ava").await;
-        assert_eq!(clients.status("ava").await.iter().map(|c| c.connected).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(clients.status("ava").await.iter().map(|c| c.connected).collect::<Vec<_>>(), [false, true, true]);
         clients.disconnect(Kind::Codex, "ava").await;
         assert_eq!(std::fs::read_to_string(codex_config(&dir)).unwrap(), MINE, "byte for byte as it was");
+        clients.disconnect(Kind::Pi, "ava").await;
+        assert_eq!(pi_server(&dir, "gild-ava"), None);
         assert!(clients.status("ava").await.iter().all(|c| !c.connected));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -339,7 +457,7 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
     #[tokio::test]
     async fn codex_without_a_config_yet_gets_one() {
         let dir = temp();
-        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), home: dir.clone() };
+        let clients = Clients { claude: fake_claude(&dir), codex: fake_codex(&dir), pi: fake_pi(&dir), home: dir.clone() };
         clients.connect(Kind::Codex, "ava", "http://127.0.0.1:4747/mcp", "gild_x").await.unwrap();
         assert!(std::fs::read_to_string(codex_config(&dir)).unwrap().starts_with("[mcp_servers.gild-ava]\n"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -348,11 +466,14 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
     #[tokio::test]
     async fn a_client_that_isn_t_installed_says_so() {
         let dir = temp();
-        let clients = Clients { claude: dir.join("nothing-here").display().to_string(), codex: fake_codex(&dir), home: dir.clone() };
+        let nothing = dir.join("nothing-here").display().to_string();
+        let clients = Clients { claude: nothing.clone(), codex: fake_codex(&dir), pi: nothing, home: dir.clone() };
         let status = clients.status("ava").await;
-        assert_eq!(status.iter().map(|c| (c.id, c.installed)).collect::<Vec<_>>(), [("claude-code", false), ("codex", true)]);
+        assert_eq!(status.iter().map(|c| (c.id, c.installed)).collect::<Vec<_>>(), [("claude-code", false), ("codex", true), ("pi", false)]);
         let err = clients.connect(Kind::ClaudeCode, "ava", "http://127.0.0.1:4747/mcp", "gild_x").await.unwrap_err();
         assert!(err.starts_with("Claude Code couldn't add gild-ava"), "{err}");
+        let err = clients.connect(Kind::Pi, "ava", "http://127.0.0.1:4747/mcp", "gild_x").await.unwrap_err();
+        assert!(err.starts_with("Pi couldn't add gild-ava"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -361,6 +482,10 @@ printf '{{\n  "name": "%s",\n  "enabled": true,\n  "disabled_reason": null,\n  "
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(toml_key("gild-ava"), "gild-ava");
         assert_eq!(toml_key("gild-é"), "\"gild-é\"");
+        // Pi's tool names: the server's name with anything but letters,
+        // digits and `_` made `_`.
+        assert_eq!(pi_tool_prefix("ava"), "mcp__gild_ava__");
+        assert_eq!(pi_tool_prefix("north-side é"), "mcp__gild_north_side____");
         // Only the agent's own tables go, not another server sharing a prefix.
         let text = "[mcp_servers.gild-ava]\nurl = \"a\"\n\n[mcp_servers.gild-ava.http_headers]\nx = 1\n[mcp_servers.gild-ava2]\nurl = \"b\"\n";
         assert_eq!(without_server(text, "gild-ava"), "[mcp_servers.gild-ava2]\nurl = \"b\"\n");

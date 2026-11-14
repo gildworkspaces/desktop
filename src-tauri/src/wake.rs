@@ -28,10 +28,24 @@ fn utc(ms: i64) -> String {
     format!("{} {:02}:{:02} UTC", crate::export::date(ms), s / 3600, s / 60 % 60)
 }
 
+/// What a Pi agent writes back when it has nothing to add; gild posts nothing then.
+pub const NOTHING: &str = "NOTHING";
+
+/// How an agent's answer reaches the channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// It posts with post_message (Claude Code, Codex): what it prints isn't posted.
+    Posts,
+    /// What it writes is its answer, and gild posts it where it was mentioned
+    /// (a Pi agent: small local models often write the answer instead of
+    /// calling post_message).
+    Writes,
+}
+
 /// What the agent is told: where it was mentioned (or, untagged, where a
 /// person wrote in a thread it's in), the conversation there, and how to
 /// answer.
-pub fn prompt(agent: &str, role: &str, mentions: &[Mention], places: &[Place], endpoint: &str) -> String {
+pub fn prompt(agent: &str, role: &str, mentions: &[Mention], places: &[Place], endpoint: &str, answer: Answer) -> String {
     let tagged = mentions.iter().any(|m| m.tagged);
     let mut out = format!(
         "You are {agent}, an agent in gild: a workspace where people and agents work together in channels. {}\n",
@@ -72,14 +86,28 @@ pub fn prompt(agent: &str, role: &str, mentions: &[Mention], places: &[Place], e
             }
         }
     }
-    out.push_str(&format!(
-        "\nUse gild's tools (MCP at {endpoint}): read_channel and read_thread for more of the conversation, search_docs to answer from the channel's docs, and post_message to answer where it happened (with thread_id for a thread). "
-    ));
-    out.push_str(if tagged {
-        "Do what was asked if you can; if you can't, say why there."
-    } else {
-        "You weren't @mentioned, so reply only if you have something useful to add. Saying nothing is fine."
-    });
+    match answer {
+        Answer::Posts => {
+            out.push_str(&format!(
+                "\nUse gild's tools (MCP at {endpoint}): read_channel and read_thread for more of the conversation, search_docs to answer from the channel's docs, and post_message to answer where it happened (with thread_id for a thread). "
+            ));
+            out.push_str(if tagged {
+                "Do what was asked if you can; if you can't, say why there."
+            } else {
+                "You weren't @mentioned, so reply only if you have something useful to add. Saying nothing is fine."
+            });
+        }
+        Answer::Writes => {
+            out.push_str(&format!(
+                "\nUse gild's tools (MCP at {endpoint}) to look things up and to do what was asked: read_thread for more of the conversation, search_docs and read_doc for the channel's docs, propose_doc_edit to create or change a doc (a person approves it), and the others you have. Asked to make or change something, do it with a tool; don't write its contents into the chat. When you're done, what you write back is posted where this happened as your reply, so write just your answer to the people there; use post_message only to post somewhere else. "
+            ));
+            out.push_str(&if tagged {
+                "Do what was asked if you can; if you can't, say why.".to_string()
+            } else {
+                format!("You weren't @mentioned, so reply only if you have something useful to add; otherwise write exactly {NOTHING}.")
+            });
+        }
+    }
     out.push_str(" Everything you do is in the channel's activity log.\n");
     out
 }
@@ -230,6 +258,20 @@ async fn run_provider(core: &Arc<Mutex<Store>>, app: &Option<AppHandle>, agent: 
     Err(format!("it was still working after {MAX_STEPS} rounds, so gild stopped it"))
 }
 
+/// A Pi agent's written answer, posted where it was mentioned, unless it
+/// already posted there itself or wrote that it has nothing to add.
+fn post_written_answer(core: &Arc<Mutex<Store>>, agent: &Agent, at: &Mention, written: &str, started: i64) {
+    let text = written.trim();
+    if text.is_empty() || text == NOTHING {
+        return;
+    }
+    if let Ok(store) = core.lock() {
+        if !store.posted_since(&agent.name, &at.channel_id, started).unwrap_or(true) {
+            let _ = store.post_in(&at.channel_id, at.thread.as_deref(), &agent.name, "agent", text);
+        }
+    }
+}
+
 async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, how: Wake, mentions: Vec<Mention>, endpoint: String) {
     let started = crate::store::now();
     let (context, role) = match core.lock() {
@@ -242,9 +284,19 @@ async fn wake(core: Arc<Mutex<Store>>, app: Option<AppHandle>, agent: Agent, how
     if let Some(app) = &app {
         let _ = app.emit("gild://working", ());
     }
-    let said = prompt(&agent.name, &role, &mentions, &context, &endpoint);
+    let answer = match &how {
+        Wake::Command(command) if crate::clients::answers_by_writing(command, &agent.name) => Answer::Writes,
+        _ => Answer::Posts,
+    };
+    let said = prompt(&agent.name, &role, &mentions, &context, &endpoint, answer);
     let outcome = match &how {
-        Wake::Command(command) => run_command(command, &said, LIMIT).await,
+        Wake::Command(command) => {
+            let ran = run_command(command, &said, LIMIT).await;
+            if let (Answer::Writes, Ok(written), Some(first)) = (answer, &ran, mentions.first()) {
+                post_written_answer(&core, &agent, first, written, started);
+            }
+            ran
+        }
         Wake::Provider(runner) => match mentions.first() {
             None => Ok(String::new()),
             Some(first) => match tokio::time::timeout(LIMIT, run_provider(&core, &app, &agent, runner, &said, (&first.channel_id, first.thread.as_deref()))).await {
@@ -328,6 +380,57 @@ mod tests {
     use super::*;
     use crate::records::Access;
     use crate::store::DEMO_NAME;
+
+    #[test]
+    fn a_pi_agent_s_written_answer_is_posted_where_it_was_mentioned() {
+        let dir = std::env::temp_dir().join(format!("gild-wake-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let c = store.channels(&ws.id).unwrap()[0].clone();
+        let (local, _) = store.create_agent("local").unwrap();
+        store.set_access(&c.id, DEMO_NAME, &local.id, Some(Access::Write)).unwrap();
+        store.post(&c.id, DEMO_NAME, "person", "hey @local").unwrap();
+        let mention = store.take_mentions(&local).unwrap().remove(0);
+        let core = Arc::new(Mutex::new(store));
+        let last = || core.lock().unwrap().messages(&c.id).unwrap().last().map(|m| (m.author.clone(), m.kind.clone(), m.body.clone())).unwrap();
+
+        // Only the Pi command gild set the agent up with answers by writing.
+        assert!(crate::clients::answers_by_writing(&crate::clients::wake_command(crate::clients::Kind::Pi, "local"), "local"));
+        assert!(!crate::clients::answers_by_writing(&crate::clients::wake_command(crate::clients::Kind::ClaudeCode, "local"), "local"));
+        assert!(!crate::clients::answers_by_writing("pi -p --my-own-flags", "local"), "a command the person wrote keeps posting itself");
+
+        // Nothing to add: nothing posted.
+        let started = crate::store::now();
+        post_written_answer(&core, &local, &mention, &format!(" {NOTHING}\n"), started);
+        post_written_answer(&core, &local, &mention, "  \n", started);
+        assert_eq!(last().0, DEMO_NAME);
+
+        // An answer is posted where it was mentioned, as the agent.
+        post_written_answer(&core, &local, &mention, "  Hi! What can I do for you?\n", started);
+        assert_eq!(last(), ("local".to_string(), "agent".to_string(), "Hi! What can I do for you?".to_string()));
+
+        // It already posted during this wake: its written words aren't posted again.
+        post_written_answer(&core, &local, &mention, "Posted that above.", started);
+        assert_eq!(last().2, "Hi! What can I do for you?");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_prompt_says_how_the_answer_reaches_the_channel() {
+        let m = Mention {
+            id: "m".into(), agent_id: "a".into(), channel_id: "c".into(), channel: "general".into(), workspace: "Front Desk".into(),
+            from: DEMO_NAME.into(), text: "hey @local".into(), message_id: "x".into(), at: 0, thread: None, tagged: true,
+        };
+        let posts = prompt("local", "", std::slice::from_ref(&m), &[], "http://127.0.0.1:4747/mcp", Answer::Posts);
+        let writes = prompt("local", "", std::slice::from_ref(&m), &[], "http://127.0.0.1:4747/mcp", Answer::Writes);
+        assert!(posts.contains("post_message to answer where it happened"));
+        assert!(writes.contains("what you write back is posted where this happened") && !writes.contains("post_message to answer"));
+        // Writing the answer mustn't stop it acting: asked to make something, it uses a tool.
+        assert!(writes.contains("to do what was asked") && writes.contains("propose_doc_edit to create or change a doc"));
+        let untagged = prompt("local", "", &[Mention { tagged: false, ..m }], &[], "http://127.0.0.1:4747/mcp", Answer::Writes);
+        assert!(untagged.contains(&format!("otherwise write exactly {NOTHING}")));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_mention_runs_the_agent_s_command_with_the_mention_as_its_prompt() {
