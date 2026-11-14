@@ -18,7 +18,8 @@
         "minWidth": 760,
         "minHeight": 600,
         "resizable": true,
-        "url": "/"
+        "url": "/",
+        "dragDropEnabled": false
       }
     ],
     "security": {

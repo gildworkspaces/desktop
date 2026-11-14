@@ -10,13 +10,21 @@ export type Controller = { kind: 'none' } | { kind: 'person'; name: string; at: 
 export type ViewState = { expanded: string[]; selected: string | null; open: string | null; controller: Controller }
 export type ChannelView = { state: ViewState; files: FileEntry[]; text: string | null; file_type: string | null; operations: string[] }
 export type Nav = { op: 'expand' | 'collapse' | 'select' | 'open'; path: string } | { op: 'close' }
-/** An add-on's manifest (gild-addon.json). */
+/** An add-on's manifest (gild-addon.json). `builtIn`: part of gild itself (Files). */
 export type AddonOperation = { name: string; description: string; params: unknown }
 export type Manifest = {
-  id: string; name: string; version: string; publisher: string; description: string
-  contributes: { fileTypes: { id: string; name: string; extensions: string[]; operations: AddonOperation[] }[] }
+  id: string; name: string; version: string; publisher: string; description: string; builtIn?: boolean
+  contributes: { fileTypes: { id: string; name: string; extensions: string[]; operations: AddonOperation[] }[]; pane?: string; tools?: AddonOperation[] }
   permissions: { network: string[]; secrets: string[]; files: string[] }
 }
+/** The Files add-on: what the pane shows for an open file. */
+export type FilePreview = { path: string; size: number; kind: 'text' | 'image' | 'other'; text: string | null; data: string | null; show: string }
+/** An add-on's pane in a channel, in the channel's order. */
+export type Pane = { addon: string; name: string; hidden: boolean }
+export type PaneSetting = { addon: string; hidden: boolean }
+/** The Files add-on's id, and the file that keeps an empty folder. */
+export const FILES_ADDON = 'gild.files'
+export const KEEP = '.gitkeep'
 
 /** An agent tool, as Settings lists it. */
 export type ToolInfo = { name: string; description: string; group: string; addon: string | null }
@@ -140,6 +148,18 @@ export const core = {
   driveView: (channelId: string, nav: Nav) => invoke<ChannelView>('drive_view', { channelId, nav }),
   editFile: (channelId: string, path: string, op: string, args: Record<string, unknown>) => invoke<ChannelView>('edit_file', { channelId, path, op, args }),
   takeOverView: (channelId: string) => invoke<ChannelView>('take_over_view', { channelId }),
+  // The Files add-on.
+  channelPanes: (channelId: string) => invoke<Pane[]>('channel_panes', { channelId }),
+  setChannelPanes: (channelId: string, panes: PaneSetting[]) => invoke<Pane[]>('set_channel_panes', { channelId, panes }),
+  filePreview: (channelId: string, path: string) => invoke<FilePreview>('file_preview', { channelId, path }),
+  writeFile: (channelId: string, path: string, text: string) => invoke<FileEntry>('write_file', { channelId, path, text }),
+  /** `files`: name and bytes as base64, into `folder` ("" for the top). */
+  uploadFiles: (channelId: string, folder: string, files: { name: string; data: string }[]) => invoke<FileEntry[]>('upload_files', { channelId, folder, files }),
+  newFolder: (channelId: string, path: string) => invoke<string>('new_folder', { channelId, path }),
+  moveFile: (channelId: string, path: string, to: string) => invoke<null>('move_file', { channelId, path, to }),
+  deleteFile: (channelId: string, path: string) => invoke<null>('delete_file', { channelId, path }),
+  fileHistory: (channelId: string, path: string) => invoke<Change[]>('file_history', { channelId, path }),
+  showFile: (channelId: string, path: string) => invoke<null>('show_file', { channelId, path }),
   thread: (channelId: string, threadId: string) => invoke<Message[]>('thread', { channelId, threadId }),
   reply: (channelId: string, threadId: string, body: string) => invoke<Message>('send_reply', { channelId, threadId, body }),
   channelData: (channelId: string) => invoke<ChannelData>('channel_data', { channelId }),
@@ -229,3 +249,23 @@ export function day(ms: number): string {
 }
 
 export const errorText = (e: unknown) => (typeof e === 'string' ? e : e instanceof Error ? e.message : String(e))
+
+/** "12.3 KB", "4 MB": a size people read. */
+export function fileSize(bytes: number): string {
+  if (bytes < 1000) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let n = bytes / 1000
+  let i = 0
+  while (n >= 1000 && i < units.length - 1) { n /= 1000; i++ }
+  return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[i]}`
+}
+
+/** A File's bytes as base64, for the core. */
+export function fileBase64(file: File): Promise<string> {
+  return new Promise((ok, bad) => {
+    const r = new FileReader()
+    r.onload = () => ok(String(r.result).replace(/^data:[^,]*,/, ''))
+    r.onerror = () => bad(new Error(`Couldn’t read ${file.name}.`))
+    r.readAsDataURL(file)
+  })
+}

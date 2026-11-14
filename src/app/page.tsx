@@ -9,7 +9,12 @@ import { MeContext, UserCard, type SettingsSection } from './Profile'
 import { SettingsModal } from './Settings'
 import { HeldBar, MessageRow, ReachContext, ReachWarning, ThreadPanel, WorkingLine, type Reach } from './Thread'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { core, inApp, onChanged, tint, initial, day, errorText, type Profile, type Workspace, type Channel, type ChannelDocs, type Message } from '@/lib/core'
+import { core, inApp, onChanged, tint, initial, day, errorText, FILES_ADDON, type Profile, type Workspace, type Channel, type ChannelDocs, type Message, type Pane } from '@/lib/core'
+
+/** The Markdown add-on's pane is Docs. */
+const DOCS_ADDON = 'gild.markdown'
+/** Every channel's panes until the channel's own list has loaded. */
+const DEFAULT_PANES: Pane[] = [{ addon: DOCS_ADDON, name: 'Docs', hidden: false }, { addon: FILES_ADDON, name: 'Files', hidden: false }]
 
 /** What every screen needs: you, and a way to open Settings. */
 type Me = { profile: Profile; setProfile: (p: Profile) => void; settings: (s: SettingsSection) => void }
@@ -243,6 +248,52 @@ function WorkspaceMenu({ workspace }: { workspace: Workspace }) {
   )
 }
 
+/** Which add-on panes the channel shows, and in what order: a menu beside
+ *  the tabs. Each change is a commit in the channel (.gild/addons.json). */
+function PanesMenu({ channelId, panes, onChanged }: { channelId: string; panes: Pane[]; onChanged: (p: Pane[]) => void }) {
+  const [open, setOpen] = useState(false)
+  const [error, setError] = useState('')
+  const box = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const away = (e: MouseEvent) => { if (box.current && !box.current.contains(e.target as Node)) setOpen(false) }
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', away)
+    document.addEventListener('keydown', esc)
+    return () => { document.removeEventListener('mousedown', away); document.removeEventListener('keydown', esc) }
+  }, [open])
+  async function save(next: Pane[]) {
+    setError('')
+    try { onChanged(await core.setChannelPanes(channelId, next.map(p => ({ addon: p.addon, hidden: p.hidden })))) } catch (e) { setError(errorText(e)) }
+  }
+  const move = (i: number, by: number) => {
+    const next = [...panes]
+    const [p] = next.splice(i, 1)
+    next.splice(i + by, 0, p)
+    save(next)
+  }
+  return (
+    <div className="panes" ref={box}>
+      <button className="ghost" onClick={() => setOpen(o => !o)} aria-expanded={open} aria-haspopup="true" aria-label="Panes: which add-on panes this channel shows">Panes</button>
+      {open && (
+        <div className="smenu panesmenu" role="group" aria-label="Panes">
+          <span className="label">Panes in this channel</span>
+          {panes.map((p, i) => (
+            <div key={p.addon} className="panerow">
+              <button role="switch" aria-checked={!p.hidden} aria-label={`Show ${p.name}`} className={p.hidden ? 'switch' : 'switch on'} onClick={() => save(panes.map(q => q.addon === p.addon ? { ...q, hidden: !q.hidden } : q))}><span /></button>
+              <span className="name">{p.name}</span>
+              <button className="iconbtn" aria-label={`Move ${p.name} up`} disabled={i === 0} onClick={() => move(i, -1)}>↑</button>
+              <button className="iconbtn" aria-label={`Move ${p.name} down`} disabled={i === panes.length - 1} onClick={() => move(i, 1)}>↓</button>
+            </div>
+          ))}
+          <span className="faint" style={{ fontSize: 12, padding: '4px 10px 6px' }}>Hidden panes stay; their files and tools do too.</span>
+          {error && <p className="error" style={{ margin: '0 10px 6px' }}>{error}</p>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ChannelView({ channel }: { channel: Channel }) {
   // Which agents a mention here reaches, for colouring and warnings.
   const [reach, setReach] = useState<Reach | null>(null)
@@ -281,8 +332,14 @@ function ChannelView({ channel }: { channel: Channel }) {
   // Files in the channel's folder gild couldn't take in (a broken .gild file).
   const [problems, setProblems] = useState<string[]>([])
   useEffect(() => { core.folderProblems(channel.id).then(setProblems, () => setProblems([])) }, [channel.id, version])
+  // The channel's add-on panes (Docs, Files), in its order, some hidden.
+  const [panes, setPanes] = useState<Pane[]>(DEFAULT_PANES)
+  useEffect(() => { core.channelPanes(channel.id).then(setPanes, () => setPanes(DEFAULT_PANES)) }, [channel.id, version])
+  const paneOn = (addon: string) => panes.some(p => p.addon === addon && !p.hidden)
   // A channel with docs and no table opens on its docs.
-  useEffect(() => { if (!chosen && count === null && docs && (docs.docs.length > 0 || docs.proposals.length > 0)) setMode('docs') }, [chosen, count, docs])
+  useEffect(() => { if (!chosen && count === null && docs && (docs.docs.length > 0 || docs.proposals.length > 0) && paneOn(DOCS_ADDON)) setMode('docs') }, [chosen, count, docs, panes]) // eslint-disable-line react-hooks/exhaustive-deps
+  // A pane hidden while it was showing: back to the table.
+  useEffect(() => { if ((mode === 'docs' && !paneOn(DOCS_ADDON)) || (mode === 'files' && !paneOn(FILES_ADDON))) setMode('table') }, [mode, panes]) // eslint-disable-line react-hooks/exhaustive-deps
   const show = (m: 'table' | 'board' | 'docs' | 'files') => { setChosen(true); setMode(m) }
   const waiting = docs?.proposals.length ?? 0
   // An agent changed this channel: show it.
@@ -312,11 +369,15 @@ function ChannelView({ channel }: { channel: Channel }) {
         <div className="tabs" role="group" aria-label="Show">
           <button className={mode === 'table' ? 'tab on' : 'tab'} aria-pressed={mode === 'table'} onClick={() => show('table')}>Table</button>
           {typeof count === 'number' && <button className={mode === 'board' ? 'tab on' : 'tab'} aria-pressed={mode === 'board'} onClick={() => show('board')}>Board</button>}
-          <button className={mode === 'docs' ? 'tab on' : 'tab'} aria-pressed={mode === 'docs'} onClick={() => show('docs')}>
-            Docs{waiting > 0 && <span className="count" aria-label={`${waiting} waiting for approval`}>{waiting}</span>}
-          </button>
-          <button className={mode === 'files' ? 'tab on' : 'tab'} aria-pressed={mode === 'files'} onClick={() => show('files')}>Files</button>
+          {panes.filter(p => !p.hidden).map(p => p.addon === DOCS_ADDON ? (
+            <button key={p.addon} className={mode === 'docs' ? 'tab on' : 'tab'} aria-pressed={mode === 'docs'} onClick={() => show('docs')}>
+              {p.name}{waiting > 0 && <span className="count" aria-label={`${waiting} waiting for approval`}>{waiting}</span>}
+            </button>
+          ) : p.addon === FILES_ADDON ? (
+            <button key={p.addon} className={mode === 'files' ? 'tab on' : 'tab'} aria-pressed={mode === 'files'} onClick={() => show('files')}>{p.name}</button>
+          ) : null)}
         </div>
+        <PanesMenu channelId={channel.id} panes={panes} onChanged={setPanes} />
         <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'access' ? null : 'access')) }}>Access</button>
         <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'activity' ? null : 'activity')) }}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>

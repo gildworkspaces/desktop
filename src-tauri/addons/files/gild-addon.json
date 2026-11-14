@@ -1,0 +1,74 @@
+{
+  "id": "gild.files",
+  "name": "Files",
+  "version": "0.1.0",
+  "publisher": "gild",
+  "description": "Every channel's files: a tree of its repository, with open, new folder, upload, rename, move, delete, and each file's history. Part of gild: in every channel, hide it or not.",
+  "builtIn": true,
+  "contributes": {
+    "pane": "Files",
+    "tools": [
+      {
+        "name": "list_files",
+        "description": "Every file in a channel, by path, with its size, and every folder. gild's own .gild/ folder isn't listed.",
+        "params": { "type": "object", "properties": {}, "required": [] }
+      },
+      {
+        "name": "read_file",
+        "description": "A file's text, without touching the view.",
+        "params": {
+          "type": "object",
+          "properties": { "path": { "type": "string", "description": "The file's path, such as docs/intake-sop.md or forms/consent.txt." } },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "write_file",
+        "description": "Write a text file: its whole new text, at a path (folders on the way are made). A new file or a changed one; the same text changes nothing. One commit by you, in the channel's Activity. Needs write access.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "Where the file goes, such as notes/2026-11-14.md. Not inside .gild/." },
+            "text": { "type": "string", "description": "The file's whole new text." }
+          },
+          "required": ["path", "text"]
+        }
+      },
+      {
+        "name": "move_file",
+        "description": "Move or rename a file or a folder (everything in it moves). Nothing may already be at the new path. One commit by you. Needs write access.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "The file or folder as it is now." },
+            "to": { "type": "string", "description": "Its new path." }
+          },
+          "required": ["path", "to"]
+        }
+      },
+      {
+        "name": "delete_file",
+        "description": "Delete a file, or a folder and everything in it. It stays in the channel's history (file_history shows the commit). One commit by you. Needs write access.",
+        "params": {
+          "type": "object",
+          "properties": { "path": { "type": "string", "description": "The file or folder to delete." } },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "file_history",
+        "description": "Every commit that changed a file (or anything in a folder), newest first: who, when, and the commit's message.",
+        "params": {
+          "type": "object",
+          "properties": { "path": { "type": "string", "description": "The file or folder." } },
+          "required": ["path"]
+        }
+      }
+    ]
+  },
+  "permissions": {
+    "network": [],
+    "secrets": [],
+    "files": ["*"]
+  }
+}

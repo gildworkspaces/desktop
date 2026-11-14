@@ -280,6 +280,78 @@ try {
   assert.match(refusedEdit.json.result.content[0].text, /took over the view/)
   console.log('view: the agent edited in the shared view; Take over gave it back')
 
+  // The Files add-on, in the same pane: a new file through the toolbar (it
+  // opens, as a doc), a new folder, a rename, and a delete behind an in-page
+  // confirmation. Each is a commit in the channel's repository on disk. New
+  // things go into the selected item's folder: docs/, as the SOP is selected.
+  const fileRow = name => By.xpath(`//nav[@aria-label='Files']//button[contains(@class,'frow')][span[@class='fname' and .='${name}']]`)
+  await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='New file']")).click()
+  await driver.wait(until.elementLocated(By.css('#file-name')), 10000).sendKeys('Checklist', Key.ENTER)
+  await driver.wait(until.elementLocated(fileRow('Checklist.md')), 10000)
+  await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'fbody')]//h2[contains(., 'Checklist')]")), 10000, 'the new .md opens in the Markdown view')
+  await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='New folder']")).click()
+  await driver.wait(until.elementLocated(By.css('#file-name')), 10000).sendKeys('plans', Key.ENTER)
+  await driver.wait(until.elementLocated(fileRow('plans')), 10000, 'an empty folder is kept')
+  await driver.findElement(fileRow('Checklist.md')).click()
+  await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='Rename']")).click()
+  const renameBox = await driver.wait(until.elementLocated(By.css('#file-name')), 10000)
+  assert.equal(await renameBox.getAttribute('value'), 'Checklist.md')
+  await renameBox.clear()
+  await renameBox.sendKeys('intake-checklist.md', Key.ENTER)
+  await driver.wait(until.elementLocated(fileRow('intake-checklist.md')), 10000, 'renamed')
+  const where0 = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    call('workspaces').then(ws => call('workspace_folder', { workspaceId: ws[0].id })).then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(where0.error, undefined, where0.error)
+  const intakeDir = join(where0.path, 'channels/student-intake')
+  assert.match(readFileSync(join(intakeDir, 'docs/intake-checklist.md'), 'utf8'), /^# Checklist/)
+  assert.ok(!existsSync(join(intakeDir, 'docs/Checklist.md')) && existsSync(join(intakeDir, 'docs/plans/.gitkeep')), 'the folder matches the commit')
+  // Delete asks in the pane, never in a system dialog.
+  await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='Delete']")).click()
+  const confirm = await driver.wait(until.elementLocated(By.xpath("//div[@role='alertdialog']//button[contains(@class,'danger')]")), 10000)
+  assert.equal(await confirm.getText(), 'Delete intake-checklist.md', 'the name, not the path')
+  await confirm.click()
+  await driver.wait(async () => (await driver.findElements(fileRow('intake-checklist.md')).catch(() => null))?.length === 0, 10000, 'gone from the tree')
+  assert.ok(!existsSync(join(intakeDir, 'docs/intake-checklist.md')), 'gone from disk')
+  const fileLog = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    ;(async () => {
+      const files = (await call('channel_view', { channelId: ${JSON.stringify(intakeId)} })).files.map(f => f.path)
+      const history = (await call('file_history', { channelId: ${JSON.stringify(intakeId)}, path: 'docs/intake-checklist.md' })).map(h => h.author + ': ' + h.message)
+      // An upload through the same command the pane's Upload and drop use: a PNG, shown as an image.
+      const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+      const added = await call('upload_files', { channelId: ${JSON.stringify(intakeId)}, folder: 'docs/plans', files: [{ name: 'dot.png', data: png }] })
+      const preview = await call('file_preview', { channelId: ${JSON.stringify(intakeId)}, path: 'docs/plans/dot.png' })
+      return { files, history, added: added.map(f => f.path + ':' + f.size), preview: preview.kind + ':' + preview.data.slice(0, 22) }
+    })().then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(fileLog.error, undefined, fileLog.error)
+  assert.deepEqual(fileLog.files, ['docs/intake-sop.md', 'docs/plans/.gitkeep'])
+  // A path's history: the commits that changed what's at that path (its
+  // life as Checklist.md is under that name).
+  assert.deepEqual(fileLog.history, ['Demo: Delete docs/intake-checklist.md', 'Demo: Move docs/Checklist.md to docs/intake-checklist.md'])
+  assert.deepEqual(fileLog.added, ['docs/plans/dot.png:70'])
+  assert.equal(fileLog.preview, 'image:data:image/png;base64,')
+  // The folder was made collapsed; open it, and the upload is in it.
+  await driver.findElement(fileRow('plans')).click()
+  await driver.wait(until.elementLocated(fileRow('dot.png')), 10000, 'the upload shows in the tree')
+  await driver.findElement(fileRow('dot.png')).click()
+  await driver.wait(until.elementLocated(By.css('.fbody img.fimg')), 10000, 'an image preview')
+  // The Files pane can be hidden per channel (and comes back), through the Panes menu.
+  await driver.findElement(By.xpath("//button[starts-with(@aria-label, 'Panes:')]")).click()
+  await driver.wait(until.elementLocated(By.css("button[aria-label='Show Files']")), 10000).click()
+  await driver.wait(async () => (await driver.findElements(By.xpath("//button[contains(@class,'tab') and normalize-space(.)='Files']")).catch(() => null))?.length === 0, 10000, 'the Files tab is gone')
+  await driver.wait(until.elementLocated(By.css("button[aria-label='Show Files'][aria-checked='false']")), 10000)
+  await driver.findElement(By.css("button[aria-label='Show Files']")).click()
+  await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'tab') and normalize-space(.)='Files']")), 10000, 'and back')
+  await driver.findElement(By.xpath("//button[starts-with(@aria-label, 'Panes:')]")).click()
+  const panesFile = JSON.parse(readFileSync(join(intakeDir, '.gild/addons.json'), 'utf8'))
+  assert.deepEqual(panesFile.panes.map(p => p.addon + ':' + !!p.hidden), ['gild.markdown:false', 'gild.files:false'], 'the channel keeps its panes in its repository')
+  console.log('files: created, renamed, deleted and uploaded through the pane; panes hidden and shown')
+
   // The workspace is a folder on disk: gild.json lists its channels, and the
   // doc saved in the window is a file in the channel's own repository.
   const where = await driver.executeAsyncScript(`

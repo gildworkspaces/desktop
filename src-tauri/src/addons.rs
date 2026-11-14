@@ -14,6 +14,13 @@
 //! has a memory limit and an instruction budget. gild's own file types are
 //! add-ons built the same way (`addons/<name>`, compiled by build.rs), so the
 //! app runs exactly what a third party would ship.
+//!
+//! One add-on is part of gild itself: Files (`builtIn`). It has no module;
+//! its tools (list, read, write, move, delete, history) are gild's own code
+//! in `store/files.rs`, because they touch the channel's repository, which
+//! no sandboxed module may. It is in every channel, and declared like any
+//! other add-on so Settings, the tool switches and Activity treat it the
+//! same way.
 
 use std::sync::OnceLock;
 
@@ -29,6 +36,10 @@ pub struct Manifest {
     pub version: String,
     pub publisher: String,
     pub description: String,
+    /// Part of gild: runs as gild's own code (no module), in every channel,
+    /// and can't be removed. Only gild's manifests may say so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub built_in: bool,
     pub contributes: Contributes,
     pub permissions: Permissions,
 }
@@ -38,6 +49,14 @@ pub struct Manifest {
 pub struct Contributes {
     #[serde(default)]
     pub file_types: Vec<FileType>,
+    /// A pane in every channel, by the name on its tab ("Docs", "Files").
+    /// A channel may hide it or reorder it (`.gild/addons.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    /// Tools that aren't tied to a file type (Files' `list_files`, …): each
+    /// is an agent tool under its own name, run by gild (built-in only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Operation>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -82,15 +101,23 @@ struct Addon {
 
 impl Addon {
     /// An add-on from its manifest and its module: the module edits every
-    /// file type the manifest names.
-    fn load(manifest: &str, module: &[u8]) -> Result<Addon, String> {
+    /// file type the manifest names. A built-in add-on (gild's own code) has
+    /// no module and no file types; only it may have general tools.
+    fn load(manifest: &str, module: Option<&[u8]>) -> Result<Addon, String> {
         let manifest: Manifest = serde_json::from_str(manifest).map_err(|e| format!("its gild-addon.json: {e}"))?;
-        let editors = manifest
-            .contributes
-            .file_types
-            .iter()
-            .map(|t| WasmEditor::new(&manifest.name, module).map(|e| (t.id.clone(), Box::new(e) as Box<dyn Editor>)))
-            .collect::<Result<_, _>>()?;
+        if !manifest.contributes.tools.is_empty() && !manifest.built_in {
+            return Err(format!("{} declares tools of its own; only add-ons built into gild may (others contribute file types).", manifest.name));
+        }
+        let editors = match module {
+            Some(module) => manifest
+                .contributes
+                .file_types
+                .iter()
+                .map(|t| WasmEditor::new(&manifest.name, module).map(|e| (t.id.clone(), Box::new(e) as Box<dyn Editor>)))
+                .collect::<Result<_, _>>()?,
+            None if manifest.built_in && manifest.contributes.file_types.is_empty() => Vec::new(),
+            None => return Err(format!("{} has no module, so it can't edit the file types it declares.", manifest.name)),
+        };
         Ok(Addon { manifest, editors })
     }
 }
@@ -175,6 +202,15 @@ pub struct ToolOp<'a> {
     pub op: &'a Operation,
 }
 
+/// An add-on's general tool (not tied to a file type), with its add-on.
+pub struct GeneralTool<'a> {
+    pub addon: &'a Manifest,
+    pub op: &'a Operation,
+}
+
+/// The id of the Files add-on, gild's own.
+pub const FILES: &str = "gild.files";
+
 static BUILT_IN: OnceLock<Registry> = OnceLock::new();
 
 impl Registry {
@@ -182,14 +218,29 @@ impl Registry {
     /// once.
     pub fn built_in() -> &'static Registry {
         BUILT_IN.get_or_init(|| {
-            let markdown = Addon::load(include_str!("../addons/markdown/gild-addon.json"), include_bytes!(env!("GILD_ADDON_MARKDOWN_WASM")))
+            let markdown = Addon::load(include_str!("../addons/markdown/gild-addon.json"), Some(include_bytes!(env!("GILD_ADDON_MARKDOWN_WASM"))))
                 .expect("the markdown add-on that ships with gild loads");
-            Registry { addons: vec![markdown] }
+            let files = Addon::load(include_str!("../addons/files/gild-addon.json"), None).expect("the files add-on that is part of gild loads");
+            Registry { addons: vec![markdown, files] }
         })
     }
 
     pub fn manifests(&self) -> Vec<&Manifest> {
         self.addons.iter().map(|a| &a.manifest).collect()
+    }
+
+    /// Every add-on's general tools, in add-on order.
+    pub fn general_tools(&self) -> Vec<GeneralTool<'_>> {
+        self.addons.iter().flat_map(|a| a.manifest.contributes.tools.iter().map(move |op| GeneralTool { addon: &a.manifest, op })).collect()
+    }
+
+    pub fn general_tool(&self, name: &str) -> Option<GeneralTool<'_>> {
+        self.general_tools().into_iter().find(|t| t.op.name == name)
+    }
+
+    /// The add-ons with a pane, in gild's order: (add-on id, the tab's name).
+    pub fn panes(&self) -> Vec<(&str, &str)> {
+        self.addons.iter().filter_map(|a| a.manifest.contributes.pane.as_deref().map(|p| (a.manifest.id.as_str(), p))).collect()
     }
 
     /// The add-on whose file type a path is.
@@ -266,12 +317,29 @@ mod tests {
     #[test]
     fn the_markdown_add_on_is_a_manifest_and_its_operations_are_tools() {
         let r = Registry::built_in();
-        assert_eq!(r.manifests().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gild.markdown"]);
+        assert_eq!(r.manifests().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gild.markdown", FILES]);
         assert_eq!(r.file_type("docs/Intake SOP.MD").map(|t| t.id.as_str()), Some("markdown"));
         assert!(r.file_type("data/table.csv").is_none());
         let tools: Vec<String> = r.tools().into_iter().map(|t| t.tool).collect();
         assert_eq!(tools, ["markdown_replace_section", "markdown_insert_after", "markdown_replace_text", "markdown_append", "markdown_set_text"]);
         assert!(r.tool("markdown_replace_section").is_some_and(|t| t.op.params["required"] == json!(["heading", "text"])));
+    }
+
+    #[test]
+    fn the_files_add_on_is_built_in_with_general_tools_and_a_pane() {
+        let r = Registry::built_in();
+        let files = r.manifest(FILES).unwrap();
+        assert!(files.built_in && files.contributes.file_types.is_empty(), "no module, no file types: its tools are gild's own code");
+        assert_eq!((files.publisher.as_str(), files.permissions.files.as_slice()), ("gild", &["*".to_string()][..]));
+        let general: Vec<&str> = r.general_tools().iter().map(|t| t.op.name.as_str()).collect();
+        assert_eq!(general, ["list_files", "read_file", "write_file", "move_file", "delete_file", "file_history"]);
+        assert_eq!(r.general_tool("move_file").map(|t| (t.addon.id.as_str(), t.op.params["required"].clone())), Some((FILES, json!(["path", "to"]))));
+        assert_eq!(r.panes(), [("gild.markdown", "Docs"), (FILES, "Files")]);
+        // A third-party manifest can't claim general tools or skip its module.
+        let claims = r#"{"id":"x","name":"X","version":"1","publisher":"p","description":"","contributes":{"tools":[{"name":"rm","description":"","params":{}}]},"permissions":{}}"#;
+        assert!(Addon::load(claims, None).err().unwrap().contains("only add-ons built into gild may"));
+        let no_module = r#"{"id":"x","name":"X","version":"1","publisher":"p","description":"","contributes":{"fileTypes":[{"id":"t","name":"T","extensions":[".t"],"operations":[]}]},"permissions":{}}"#;
+        assert!(Addon::load(no_module, None).err().unwrap().contains("has no module"));
     }
 
     /// A module in the WebAssembly text format.

@@ -5,6 +5,7 @@
   "publisher": "gild",
   "description": "Markdown files in a channel: read, write, and edit section by section.",
   "contributes": {
+    "pane": "Docs",
     "fileTypes": [
       {
         "id": "markdown",

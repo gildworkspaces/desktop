@@ -23,8 +23,10 @@ use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
 use sha2::{Digest, Sha256};
 
+mod files;
 mod folders;
 mod org;
+pub use files::{FilePreview, Pane, Upload};
 pub use folders::{channel_folder, folder_name, join as folder_path, main_index, safe_dir, WorkspaceFile, MAIN as MAIN_FOLDER};
 pub use org::{Holder, Org, Via};
 
@@ -721,9 +723,15 @@ impl Store {
     /// index follows it. What a person changed in the folder outside gild
     /// goes in first, as its own commit, so gild never writes over it.
     fn write(&self, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+        let changes: Vec<(String, Option<Vec<u8>>)> = files.iter().map(|(p, b)| (p.clone(), Some(b.clone()))).collect();
+        self.write_changes(channel_id, author, message, &changes)
+    }
+
+    /// `write`, with removals too (None: the file goes).
+    fn write_changes(&self, channel_id: &str, author: &str, message: &str, changes: &[(String, Option<Vec<u8>>)]) -> Result<(), String> {
         self.require_indexed(channel_id)?;
         self.check_outside(channel_id)?;
-        records::commit(&self.repo(channel_id)?, author, message, files)?;
+        records::commit_changes(&self.repo(channel_id)?, author, message, changes)?;
         self.reindex(channel_id)
     }
 

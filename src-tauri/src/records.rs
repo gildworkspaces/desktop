@@ -31,6 +31,23 @@ use serde::{Deserialize, Serialize};
 
 pub const VIEW_PATH: &str = ".gild/view.json";
 pub const ACL_PATH: &str = ".gild/acl.json";
+/// Which add-on panes the channel shows, and in what order.
+pub const ADDONS_PATH: &str = ".gild/addons.json";
+
+/// `.gild/addons.json`: the channel's add-on panes in order, each shown or
+/// hidden. An add-on that isn't listed is shown, after the listed ones.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PanesFile {
+    #[serde(default)]
+    pub panes: Vec<PaneSetting>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PaneSetting {
+    pub addon: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
 
 /// What an agent may do in a channel. No entry means nothing: an agent sees
 /// only the channels it was given.
@@ -461,33 +478,86 @@ pub fn head_commit(dir: &Path) -> Result<Option<String>, String> {
 }
 
 /// Write `files` (path → bytes) as one commit by `author`, and return its id.
+#[cfg(test)]
 pub fn commit(dir: &Path, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<String, String> {
+    let changes: Vec<(String, Option<Vec<u8>>)> = files.iter().map(|(p, b)| (p.clone(), Some(b.clone()))).collect();
+    commit_changes(dir, author, message, &changes)
+}
+
+/// Write `changes` (path → new bytes, or None: removed) as one commit by
+/// `author`, and return its id. Every path is checked (`check_path`) before
+/// anything is written, whether or not the repository has a folder.
+pub fn commit_changes(dir: &Path, author: &str, message: &str, changes: &[(String, Option<Vec<u8>>)]) -> Result<String, String> {
+    for (i, (path, _)) in changes.iter().enumerate() {
+        check_path(path)?;
+        if changes[..i].iter().any(|(p, _)| p == path) {
+            return Err(format!("{path} is in the same change twice."));
+        }
+    }
     let repo = open_existing(dir)?;
     on_branch(&repo)?;
-    let changes: Vec<(String, Option<Vec<u8>>)> = files.iter().map(|(p, b)| (p.clone(), Some(b.clone()))).collect();
-    unchanged_on_disk(&repo, &changes)?;
-    let fresh = put_files(&repo, &changes)?;
+    unchanged_on_disk(&repo, changes)?;
+    let fresh = put_files(&repo, changes)?;
     let parent = head(&repo);
-    let id = commit_on(&repo, &branch(&repo), parent, parent.into_iter().collect(), &changes, author, message)?;
+    let id = commit_on(&repo, &branch(&repo), parent, parent.into_iter().collect(), changes, author, message)?;
     sync_index(&repo, id, &fresh)?;
     Ok(id.to_string())
 }
 
-/// A path in a repository's folder: relative, `/`-separated, never into
-/// `.git`, and through no link (a linked `docs` or `.gild`, or a file that
-/// is a link, would take gild's reads and writes out of the folder).
+/// Whether `path` is one gild reads or writes in a repository: relative,
+/// `/`-separated, no empty, `.` or `..` parts, never into `.git` (in any
+/// case), no backslashes or control characters. Pure: nothing on disk is
+/// looked at, so a bare repository gets the same check as a folder.
+pub fn check_path(path: &str) -> Result<(), String> {
+    let bad = path.is_empty()
+        || path.len() > 4096
+        || path.chars().any(|c| c.is_control() || c == '\\')
+        || path.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git"));
+    if bad {
+        return Err(format!("{path} isn't a path gild writes."));
+    }
+    Ok(())
+}
+
+/// A path in a repository's folder (`check_path`), and through no link (a
+/// linked `docs` or `.gild`, or a file that is a link, would take gild's
+/// reads and writes out of the folder).
 fn disk_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    check_path(path)?;
     let mut out = root.to_path_buf();
     for part in path.split('/') {
-        if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git") || part.contains('\\') {
-            return Err(format!("{path} isn't a path gild writes."));
-        }
         out.push(part);
         if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(format!("{path} goes through a link, so gild doesn't read or write it."));
         }
     }
     Ok(out)
+}
+
+/// Where a file of the repository in `dir` is on disk, for showing it in
+/// the file manager: checked like every other path, and it must be there.
+pub fn file_on_disk(dir: &Path, path: &str) -> Result<PathBuf, String> {
+    let file = disk_path(dir, path)?;
+    if !std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+        return Err(format!("{path} isn't in the channel's folder right now."));
+    }
+    Ok(file)
+}
+
+/// After a file is removed, the folders it leaves empty go too (git keeps
+/// no empty folders, so the folder would otherwise show as a change).
+/// Never the repository's folder itself.
+fn prune_empty_dirs(root: &Path, file: &Path) {
+    let mut at = file.parent();
+    while let Some(dir) = at {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false) && std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        at = dir.parent();
+    }
 }
 
 /// The id git gives these bytes as a file.
@@ -545,6 +615,7 @@ fn put_files(repo: &gix::Repository, changes: &[(String, Option<Vec<u8>>)]) -> R
                 if file.exists() {
                     std::fs::remove_file(&file).map_err(|e| err(&format!("removing {path}"), e))?;
                 }
+                prune_empty_dirs(root, &file);
             }
         }
     }
@@ -987,6 +1058,8 @@ fn check_gild_file(path: &str, bytes: &[u8]) -> Result<(), String> {
         serde_json::from_slice::<Acl>(bytes).map(|_| ())
     } else if path == VIEW_PATH {
         serde_json::from_slice::<View>(bytes).map(|_| ())
+    } else if path == ADDONS_PATH {
+        serde_json::from_slice::<PanesFile>(bytes).map(|_| ())
     } else if path.starts_with(&format!("{RECORDS_DIR}/")) && path.ends_with(".json") {
         serde_json::from_slice::<Record>(bytes).map(|_| ())
     } else if path == MANIFEST {
