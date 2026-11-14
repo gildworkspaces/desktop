@@ -282,7 +282,8 @@ try {
 
   // The Files add-on, in the same pane: a new file through the toolbar (it
   // opens, as a doc), a new folder, a rename, and a delete behind an in-page
-  // confirmation. Each is a commit in the channel's repository on disk.
+  // confirmation. Each is a commit in the channel's repository on disk. New
+  // things go into the selected item's folder: docs/, as the SOP is selected.
   const fileRow = name => By.xpath(`//nav[@aria-label='Files']//button[contains(@class,'frow')][span[@class='fname' and .='${name}']]`)
   await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='New file']")).click()
   await driver.wait(until.elementLocated(By.css('#file-name')), 10000).sendKeys('Checklist', Key.ENTER)
@@ -305,35 +306,37 @@ try {
   `)
   assert.equal(where0.error, undefined, where0.error)
   const intakeDir = join(where0.path, 'channels/student-intake')
-  assert.match(readFileSync(join(intakeDir, 'intake-checklist.md'), 'utf8'), /^# Checklist/)
-  assert.ok(!existsSync(join(intakeDir, 'Checklist.md')) && existsSync(join(intakeDir, 'plans/.gitkeep')), 'the folder matches the commit')
+  assert.match(readFileSync(join(intakeDir, 'docs/intake-checklist.md'), 'utf8'), /^# Checklist/)
+  assert.ok(!existsSync(join(intakeDir, 'docs/Checklist.md')) && existsSync(join(intakeDir, 'docs/plans/.gitkeep')), 'the folder matches the commit')
   // Delete asks in the pane, never in a system dialog.
   await driver.findElement(By.xpath("//div[@role='toolbar']//button[normalize-space(.)='Delete']")).click()
   const confirm = await driver.wait(until.elementLocated(By.xpath("//div[@role='alertdialog']//button[contains(@class,'danger')]")), 10000)
-  assert.equal(await confirm.getText(), 'Delete intake-checklist.md')
+  assert.equal(await confirm.getText(), 'Delete intake-checklist.md', 'the name, not the path')
   await confirm.click()
   await driver.wait(async () => (await driver.findElements(fileRow('intake-checklist.md')).catch(() => null))?.length === 0, 10000, 'gone from the tree')
-  assert.ok(!existsSync(join(intakeDir, 'intake-checklist.md')), 'gone from disk')
+  assert.ok(!existsSync(join(intakeDir, 'docs/intake-checklist.md')), 'gone from disk')
   const fileLog = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
     ;(async () => {
       const files = (await call('channel_view', { channelId: ${JSON.stringify(intakeId)} })).files.map(f => f.path)
-      const history = (await call('file_history', { channelId: ${JSON.stringify(intakeId)}, path: 'intake-checklist.md' })).map(h => h.author + ': ' + h.message)
+      const history = (await call('file_history', { channelId: ${JSON.stringify(intakeId)}, path: 'docs/intake-checklist.md' })).map(h => h.author + ': ' + h.message)
       // An upload through the same command the pane's Upload and drop use: a PNG, shown as an image.
       const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
-      const added = await call('upload_files', { channelId: ${JSON.stringify(intakeId)}, folder: 'plans', files: [{ name: 'dot.png', data: png }] })
-      const preview = await call('file_preview', { channelId: ${JSON.stringify(intakeId)}, path: 'plans/dot.png' })
+      const added = await call('upload_files', { channelId: ${JSON.stringify(intakeId)}, folder: 'docs/plans', files: [{ name: 'dot.png', data: png }] })
+      const preview = await call('file_preview', { channelId: ${JSON.stringify(intakeId)}, path: 'docs/plans/dot.png' })
       return { files, history, added: added.map(f => f.path + ':' + f.size), preview: preview.kind + ':' + preview.data.slice(0, 22) }
     })().then(done, e => done({ error: String(e) }))
   `)
   assert.equal(fileLog.error, undefined, fileLog.error)
-  assert.deepEqual(fileLog.files, ['docs/intake-sop.md', 'plans/.gitkeep'])
+  assert.deepEqual(fileLog.files, ['docs/intake-sop.md', 'docs/plans/.gitkeep'])
   // A path's history: the commits that changed what's at that path (its
   // life as Checklist.md is under that name).
-  assert.deepEqual(fileLog.history, ['Demo: Delete intake-checklist.md', 'Demo: Move Checklist.md to intake-checklist.md'])
-  assert.deepEqual(fileLog.added, ['plans/dot.png:70'])
+  assert.deepEqual(fileLog.history, ['Demo: Delete docs/intake-checklist.md', 'Demo: Move docs/Checklist.md to docs/intake-checklist.md'])
+  assert.deepEqual(fileLog.added, ['docs/plans/dot.png:70'])
   assert.equal(fileLog.preview, 'image:data:image/png;base64,')
+  // The folder was made collapsed; open it, and the upload is in it.
+  await driver.findElement(fileRow('plans')).click()
   await driver.wait(until.elementLocated(fileRow('dot.png')), 10000, 'the upload shows in the tree')
   await driver.findElement(fileRow('dot.png')).click()
   await driver.wait(until.elementLocated(By.css('.fbody img.fimg')), 10000, 'an image preview')
