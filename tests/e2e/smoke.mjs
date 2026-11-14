@@ -345,7 +345,7 @@ try {
   await driver.wait(until.elementLocated(By.xpath("//div[@role='tablist']//button[.='Connect']")), 10000).click()
   await driver.wait(until.elementLocated(By.xpath("//button[normalize-space(.)='Remove agent']")), 10000).click()
   await driver.wait(until.elementLocated(By.xpath("//button[contains(@class,'danger') and normalize-space(.)='Remove intake']")), 10000, 'Remove intake').click()
-  await driver.wait(async () => (await driver.findElements(By.css('button.agentrow'))).length === 0, 10000, 'intake gone from the sidebar')
+  await driver.wait(async () => (await driver.findElements(By.css('button.agentrow')).catch(() => null))?.length === 0, 10000, 'intake gone from the sidebar')
   await driver.wait(until.elementLocated(By.css("button[aria-label='Close settings']")), 10000, 'Close settings').click()
   const after = await mcp({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'list_channels', arguments: {} } }, init.session)
   assert.equal(after.json.result.isError, true)
