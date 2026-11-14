@@ -7,7 +7,7 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.24.0)
+## What works (0.25.0)
 
 - A workspaces home: create workspaces, open them.
 - **A workspace is a folder you can open**: `~/Gild/<name>/` unless you pick
@@ -115,22 +115,48 @@ everything after that is the design doc.
   *Let them continue* bar, or any reply there) or a coordinator (gild
   @mentions it unless *Ask the coordinator* is off) lets them continue.
   *Notify me* adds a notification on this computer.
-- **Files: the view as a shared computer.** A channel's **Files** tab shows
-  every file in its repository (gild's own `.gild/` folder aside) as a tree,
-  and the open file. The view's state (open folders, selection, the open
-  file) lives in the core, so a person and an agent see and move the same
-  screen. One controller at a time: an agent with write access calls
-  `take_view`, and while it drives the view shows **Controlled by @agent**
-  with **Take over**; a person always wins, and an idle controller gives the
-  view up after a minute. Agents navigate with `open_folder`, `select`,
-  `open_file`, paced so people can follow, and edit only the file they have
-  open.
+- **Files: every channel's files, as the view as a shared computer.** Files
+  is an add-on built into gild, in every channel from the start: a channel
+  is a git repository, so it has files whether or not anyone adds anything.
+  The **Files** tab shows every file in the channel's repository (gild's own
+  `.gild/` folder aside) as a tree, and the open file: a `.md` opens in the
+  Markdown view (with **Edit**), text shows as text, an image as a picture,
+  anything else as its name and size with **Show in Finder**. The toolbar
+  has **New file** (a name without an extension becomes a `.md`), **New
+  folder** (kept in the history by an empty `.gitkeep`), **Upload** (or
+  drop files onto the pane), and for the selected file or folder
+  **Rename**, **Move**, **Delete** (confirmed in the pane, never in a
+  system dialog; the history keeps the file) and **History**. A folder with
+  more than 200 entries shows them 200 at a time. Every change is one
+  commit by you, like a doc's edit. **Panes**, beside the tabs, hides a
+  pane in this channel or reorders the panes (Docs, Files); that's a commit
+  too, `.gild/addons.json` in the channel's repository, so a channel keeps
+  its panes wherever its folder goes. A pane can be hidden, never removed.
+  Agents get the same through tools: `list_files`, `read_file`,
+  `write_file`, `move_file`, `delete_file`, `file_history`, with the
+  channel's access and the per-agent tool switches applying, every write a
+  commit under the agent's name and an Activity entry. Paths are checked
+  before anything is written (`../`, absolute paths, `.git`, links, names
+  this computer's file system wouldn't tell apart), and gild's own files
+  (`.gild/`, `gild.json`) can't be changed through Files at all. The view's
+  state (open folders, selection, the open file) lives in the core, so a
+  person and an agent see and move the same screen. One controller at a
+  time: an agent with write access calls `take_view`, and while it drives
+  the view shows **Controlled by @agent** with **Take over**; a person
+  always wins, and an idle controller gives the view up after a minute.
+  Agents navigate with `open_folder`, `select`, `open_file`, paced so
+  people can follow, and edit a file type's operations only on the file
+  they have open.
 - **Add-ons.** A file type comes from an add-on: a manifest
   (`gild-addon.json`) with its extensions, its operations (typed, described)
   and what it may touch. Every operation is an agent tool
   (`markdown_replace_section`, …), and the window's own edits go through the
   same operations; each is a commit and an Activity entry. Markdown is the
-  first add-on (Settings › Add-ons). An add-on's logic is a WebAssembly
+  first add-on (Settings › Add-ons); Files is the second, and the one
+  built into gild itself (`builtIn` in its manifest: no module, its tools
+  are gild's own code, since they touch the channel's repository). An
+  add-on may also contribute a *pane*, a tab in every channel (Markdown:
+  Docs; Files: Files). An add-on's logic is a WebAssembly
   module the app runs in a sandbox: it may import nothing (no files,
   network or clock), and each call has 64 MB of memory and an instruction
   budget. gild's own add-ons are built the same way: each is a crate under
@@ -222,15 +248,21 @@ The first run creates a "Demo workspace" with #general.
   approved, and rejecting it moves the branch to `refs/gild/rejected/<id>`,
   so what was proposed is never lost.
 - `src-tauri/src/view.rs`: the shared view and its one controller.
+- `src-tauri/src/store/files.rs`: the Files add-on's operations (list,
+  preview, write, upload, new folder, move, delete, history) and each
+  channel's panes (`.gild/addons.json`), all through `records.rs`.
 - `src-tauri/src/addons.rs` and `src-tauri/addons/`: add-on manifests, the
-  registry, and the Markdown add-on.
+  registry, the Markdown add-on, and the Files add-on's manifest.
 - `src-tauri/src/clients.rs`: finding Claude Code, Codex and Pi on this
   computer and adding or removing an agent's server in them.
 - `src-tauri/src/mcp.rs`: the agents' way in, an MCP server (Streamable
   HTTP, rmcp) at `http://127.0.0.1:4747/mcp`, on this computer only. Tools:
   `list_channels`, `read_channel`, `read_thread`, `post_message`, `add_record`,
   `update_record`, `record_history`, `read_doc`, `search_docs`,
-  `propose_doc_edit`, `wait_for_mentions`. Each call carries the agent's token;
+  `propose_doc_edit`, `wait_for_mentions`, the view's (`view_state`,
+  `take_view`, …), the Files add-on's (`list_files`, `read_file`,
+  `write_file`, `move_file`, `delete_file`, `file_history`) and each file
+  type's operations (`markdown_*`). Each call carries the agent's token;
   access is checked by the same store functions the window uses, and a
   channel's grants live in its git history as `.gild/acl.json`.
 - The database file: `gild.db` in the app's data folder

@@ -254,19 +254,28 @@ function AddonsPage({ onPermissions }: { onPermissions: (id: string) => void }) 
   const none = (xs: string[]) => (xs.length === 0 ? 'none' : xs.join(', '))
   return (
     <div className="spage">
-      <p className="soft lead">Add-ons give gild new kinds of files. Each file type’s operations are what you and agents edit it with: every one is an agent tool, a commit and an Activity entry.</p>
+      <p className="soft lead">Add-ons give gild new kinds of files and new panes in every channel. Each add-on’s operations are what you and agents work with: every one is an agent tool, a commit and an Activity entry.</p>
       {error && <p className="error">{error}</p>}
       {list?.map(m => (
         <div key={m.id} className="addon">
-          <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span><span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span><span className="spacer" /><button className="ghost" onClick={() => onPermissions(m.id)}>Permissions</button></div>
+          <div className="row"><b>{m.name}</b><span className="tag">{m.version}</span>{m.builtIn && <span className="tag">built in</span>}<span className="faint" style={{ fontSize: 12 }}>by {m.publisher}</span><span className="spacer" /><button className="ghost" onClick={() => onPermissions(m.id)}>Permissions</button></div>
           <p className="soft" style={{ margin: 0, fontSize: 13 }}>{m.description}</p>
-          <p className="faint" style={{ margin: 0, fontSize: 12 }}>Runs as a WebAssembly module in a sandbox: it reaches no files, network or clock except what gild hands it, with limits on memory and time.</p>
+          {m.builtIn
+            ? <p className="faint" style={{ margin: 0, fontSize: 12 }}>Part of gild: it runs as gild’s own code, in every channel. A channel can hide its pane (the Panes menu beside the tabs), never remove it.</p>
+            : <p className="faint" style={{ margin: 0, fontSize: 12 }}>Runs as a WebAssembly module in a sandbox: it reaches no files, network or clock except what gild hands it, with limits on memory and time.</p>}
+          {m.contributes.pane && <p className="faint" style={{ margin: 0, fontSize: 12 }}>Pane in every channel: <b>{m.contributes.pane}</b>.</p>}
           {m.contributes.fileTypes.map(t => (
             <div key={t.id} className="addonpart">
               <span className="flabel">{t.name} files ({t.extensions.join(', ')})</span>
               <ul>{t.operations.map(o => <li key={o.name}><span className="mono">{t.id}_{o.name}</span> <span className="faint">{o.description}</span></li>)}</ul>
             </div>
           ))}
+          {(m.contributes.tools?.length ?? 0) > 0 && (
+            <div className="addonpart">
+              <span className="flabel">Tools</span>
+              <ul>{m.contributes.tools!.map(o => <li key={o.name}><span className="mono">{o.name}</span> <span className="faint">{o.description}</span></li>)}</ul>
+            </div>
+          )}
           <div className="addonpart">
             <span className="flabel">May touch</span>
             <span className="faint" style={{ fontSize: 12 }}>Files: {none(m.permissions.files)} · Network: {none(m.permissions.network)} · Secrets: {none(m.permissions.secrets)}</span>
@@ -296,7 +305,7 @@ function AddonPermissions({ addonId, onBack }: { addonId: string; onBack: () => 
     }, e => setError(errorText(e)))
   }, [addonId])
   if (!manifest) return <div className="spage"><button className="link back" onClick={onBack}>← Add-ons</button>{error && <p className="error">{error}</p>}</div>
-  const tools = manifest.contributes.fileTypes.flatMap(t => t.operations.map(o => `${t.id}_${o.name}`))
+  const tools = [...manifest.contributes.fileTypes.flatMap(t => t.operations.map(o => `${t.id}_${o.name}`)), ...(manifest.contributes.tools ?? []).map(o => o.name)]
   async function grant(g: Grant, v: boolean) {
     setError('')
     try { setGrants(await core.setAddonGrant(addonId, g.kind, g.value, v)) } catch (e) { setError(errorText(e)) }

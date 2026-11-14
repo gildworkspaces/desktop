@@ -717,6 +717,12 @@ const ACTIONS: Record<string, string> = {
   propose_doc_edit: 'proposed a change',
   wait_for_mentions: 'picked up a mention',
   woken: 'was woken',
+  list_files: 'listed the files',
+  read_file: 'read a file',
+  write_file: 'wrote a file',
+  move_file: 'moved a file',
+  delete_file: 'deleted a file',
+  file_history: 'read a file’s history',
 }
 
 export function ActivityPanel({ channelId, channelName, onClose }: { channelId: string; channelName: string; onClose: () => void }) {

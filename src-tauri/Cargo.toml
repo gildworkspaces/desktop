@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.24.0"
+version = "0.25.0"
 description = "gild: the open workspace where people and agents work together"
 license = "MIT"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -41,6 +41,9 @@ tokio-util = "0.7"
 http = "1"
 # Line diffs of agents' proposed doc edits (Apache-2.0, pure Rust).
 similar = "2.7"
+# Files the window hands in to upload, and images it previews, cross the
+# window boundary as base64.
+base64 = "0.22"
 tauri-plugin-notification = "2"
 wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
 

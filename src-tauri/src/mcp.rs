@@ -155,7 +155,6 @@ pub(crate) fn tools() -> Vec<Tool> {
     };
     tools.extend([
         on_channel("view_state", "What the channel's view shows now: its files, which folders are open, what's selected, the open file and its text, the operations it can be edited with, and who controls the view."),
-        on_path("read_file", "A file's text, without touching the view."),
         on_channel("take_view", "Take control of the channel's view, so you can move around it and edit files where people can watch. One controller at a time; a person always wins. Needs write access. Give it back with release_view when you're done."),
         on_channel("release_view", "Give the view back."),
         on_path("open_folder", "Open a folder in the view (you must hold the view)."),
@@ -164,8 +163,18 @@ pub(crate) fn tools() -> Vec<Tool> {
         on_path("open_file", "Open a file in the view. Edit it with its file type's operations (view_state lists them)."),
         on_channel("close_file", "Close the open file."),
     ]);
-    // Every add-on operation is a tool.
+    // An add-on's general tools (Files: list_files, read_file, write_file,
+    // move_file, delete_file, file_history), each in a channel.
     let registry = Registry::built_in();
+    for t in registry.general_tools() {
+        let mut properties = Map::new();
+        properties.insert("channel_id".into(), channel.clone());
+        properties.extend(t.op.params["properties"].as_object().cloned().unwrap_or_default());
+        let mut required = vec![json!("channel_id")];
+        required.extend(t.op.params["required"].as_array().cloned().unwrap_or_default());
+        tools.push(Tool::new(t.op.name.clone(), t.op.description.clone(), schema(json!({ "type": "object", "properties": properties, "required": required }))));
+    }
+    // Every file type's operation is a tool.
     for t in registry.tools() {
         let mut params = t.op.params.clone();
         let props = params["properties"].as_object_mut().map(std::mem::take).unwrap_or_default();
@@ -202,9 +211,12 @@ pub fn catalog() -> Vec<ToolInfo> {
         .into_iter()
         .map(|t| {
             let name = t.name.to_string();
-            let from = registry.tool(&name).map(|op| (op.file_type.name.clone(), registry.addon_for(&format!("x{}", op.file_type.extensions[0])).map(|m| m.id.clone())));
+            let from = registry
+                .tool(&name)
+                .map(|op| (format!("{} files", op.file_type.name), registry.addon_for(&format!("x{}", op.file_type.extensions[0])).map(|m| m.id.clone())))
+                .or_else(|| registry.general_tool(&name).map(|g| (g.addon.name.clone(), Some(g.addon.id.clone()))));
             let group = match (&from, name.as_str()) {
-                (Some((file_type, _)), _) => format!("{file_type} files"),
+                (Some((group, _)), _) => group.clone(),
                 (None, "list_channels" | "read_channel" | "read_thread" | "post_message" | "wait_for_mentions") => "Channels and messages".into(),
                 (None, "add_record" | "update_record" | "record_history") => "Table".into(),
                 (None, "read_doc" | "search_docs" | "propose_doc_edit") => "Docs".into(),
@@ -355,6 +367,39 @@ impl Gild {
                 let text = store.file_text(id, path)?;
                 Ok((None, json!({ "path": path, "text": text, "note": if text.is_none() { "not a text file gild can open" } else { "" } })))
             }
+            // The Files add-on: general file tools, every write one commit
+            // by the agent (the channel's access and the agent's tool
+            // switches apply, as for every tool).
+            "list_files" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                Ok((None, json!(store.list_files(id)?)))
+            }
+            "file_history" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Read)?;
+                Ok((None, json!({ "path": arg(args, "path")?, "changes": store.file_history(id, arg(args, "path")?)? })))
+            }
+            "write_file" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let f = store.write_file(id, &agent.name, arg(args, "path")?, arg(args, "text")?.as_bytes().to_vec())?;
+                Ok((Some(id.to_string()), json!({ "written": f.path, "size": f.size })))
+            }
+            "move_file" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let (from, to) = (arg(args, "path")?, arg(args, "to")?);
+                store.move_file(id, &agent.name, from, to)?;
+                Ok((Some(id.to_string()), json!({ "moved": from, "to": to })))
+            }
+            "delete_file" => {
+                let id = arg(args, "channel_id")?;
+                store.require(agent, id, Access::Write)?;
+                let path = arg(args, "path")?;
+                store.delete_file(id, &agent.name, path)?;
+                Ok((Some(id.to_string()), json!({ "deleted": path })))
+            }
             "take_view" => {
                 let id = arg(args, "channel_id")?;
                 Ok((Some(id.to_string()), view_json(&store.take_view(id, agent)?)))
@@ -452,7 +497,7 @@ impl ServerHandler for Gild {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("gild", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-            "gild is a workspace where people and agents work together in channels. Start with list_channels: you see only the channels shared with you. Everything you do is recorded in the channel's audit log, and record changes are commits in the channel's history under your name. To answer a question about how things are done, use search_docs and cite the doc and section. You can't change a doc directly: propose_doc_edit, and a person approves it.",
+            "gild is a workspace where people and agents work together in channels. Start with list_channels: you see only the channels shared with you. Everything you do is recorded in the channel's audit log, and record and file changes are commits in the channel's history under your name. Each channel is a folder of files: list_files, read_file, write_file, move_file, delete_file and file_history work on them where you have write access. To answer a question about how things are done, use search_docs and cite the doc and section. You can't change a doc directly: propose_doc_edit, and a person approves it.",
         )
     }
 
@@ -740,6 +785,90 @@ mod tests {
         assert_eq!(group("post_message"), ("Channels and messages".into(), None));
         assert_eq!(group("open_file"), ("View".into(), None));
         assert_eq!(group("markdown_replace_section"), ("Markdown files".into(), Some("gild.markdown".into())));
+        for t in ["list_files", "read_file", "write_file", "move_file", "delete_file", "file_history"] {
+            assert_eq!(group(t), ("Files".into(), Some("gild.files".into())), "{t}");
+        }
+        let names: Vec<&str> = c.iter().map(|t| t.name.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len(), "every tool once: {names:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agents_manage_files_where_they_may_and_every_write_is_theirs() {
+        let dir = std::env::temp_dir().join(format!("gild-mcp-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let ws = store.create_workspace("Front Desk").unwrap();
+        let intake = store.create_channel(&ws.id, "student-intake", "").unwrap();
+        let general = store.channels(&ws.id).unwrap()[0].clone();
+        let (agent, token) = store.create_agent("intake").unwrap();
+        store.set_access(&intake.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
+        store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Read)).unwrap();
+        store.write_file(&general.id, DEMO_NAME, "forms/consent.txt", b"Sign here.".to_vec()).unwrap();
+        let folder = store.repo(&intake.id).unwrap();
+        let core = Arc::new(Mutex::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = router(Gild { core: core.clone(), app: None });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut c = Client::connect(url, Some(token)).await;
+        let (ch, ro) = (intake.id.as_str(), general.id.as_str());
+
+        // The tools are offered, with the channel and their own arguments.
+        let listed = c.list_tools().await;
+        for t in ["list_files", "read_file", "write_file", "move_file", "delete_file", "file_history"] {
+            assert!(listed.contains(&t.to_string()), "{t}");
+        }
+        let (err, text) = c.call("write_file", json!({ "channel_id": ch, "path": "notes/first.md", "text": "# First\n\nHello.\n" })).await;
+        assert!(!err && text.contains("\"written\": \"notes/first.md\""), "{text}");
+        assert_eq!(std::fs::read_to_string(folder.join("notes/first.md")).unwrap(), "# First\n\nHello.\n");
+        let (err, text) = c.call("list_files", json!({ "channel_id": ch })).await;
+        assert!(!err, "{text}");
+        let list: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(list["files"][0]["path"], "notes/first.md");
+        assert_eq!(list["folders"], json!(["notes"]));
+        let (err, text) = c.call("read_file", json!({ "channel_id": ch, "path": "notes/first.md" })).await;
+        assert!(!err && text.contains("Hello."), "{text}");
+        assert!(!c.call("move_file", json!({ "channel_id": ch, "path": "notes/first.md", "to": "notes/renamed.md" })).await.0);
+        let (err, text) = c.call("file_history", json!({ "channel_id": ch, "path": "notes/renamed.md" })).await;
+        assert!(!err && text.contains("Move notes/first.md to notes/renamed.md"), "{text}");
+        assert!(!c.call("delete_file", json!({ "channel_id": ch, "path": "notes" })).await.0);
+        assert!(!folder.join("notes").exists());
+
+        // Hostile paths, gild's own files: refused, nothing written.
+        for bad in ["../../escape.md", ".gild/acl.json", ".git/config", "/tmp/x"] {
+            let (err, text) = c.call("write_file", json!({ "channel_id": ch, "path": bad, "text": "x" })).await;
+            assert!(err, "{bad}: {text}");
+        }
+        assert!(!dir.join("escape.md").exists() && !folder.parent().unwrap().join("escape.md").exists());
+        // Read access reads, never writes; a channel it can't see doesn't exist.
+        let (err, text) = c.call("read_file", json!({ "channel_id": ro, "path": "forms/consent.txt" })).await;
+        assert!(!err && text.contains("Sign here."), "{text}");
+        let (err, text) = c.call("write_file", json!({ "channel_id": ro, "path": "forms/x.txt", "text": "x" })).await;
+        assert!(err && text.contains("not change"), "{text}");
+        let (err, text) = c.call("delete_file", json!({ "channel_id": ro, "path": "forms/consent.txt" })).await;
+        assert!(err && text.contains("not change"), "{text}");
+        // The switch: off, and the tool is gone and refused.
+        core.lock().unwrap().set_tool(&agent.id, "delete_file", false).unwrap();
+        assert!(!c.list_tools().await.contains(&"delete_file".to_string()));
+        let (err, text) = c.call("delete_file", json!({ "channel_id": ch, "path": "x" })).await;
+        assert!(err && text.contains("isn't allowed to use delete_file"), "{text}");
+
+        let store = core.lock().unwrap();
+        assert_eq!(store.file_text(&general.id, "forms/consent.txt").unwrap().as_deref(), Some("Sign here."));
+        let log: Vec<(String, bool)> = store.activity(ch).unwrap().into_iter().map(|a| (a.action, a.ok)).collect();
+        assert_eq!(
+            log,
+            [("delete_file", false), ("write_file", false), ("write_file", false), ("write_file", false), ("write_file", false), ("delete_file", true), ("file_history", true), ("move_file", true), ("read_file", true), ("list_files", true), ("write_file", true)]
+                .map(|(a, ok)| (a.to_string(), ok)),
+            "every call, allowed or refused, is in Activity"
+        );
+        let history = store.file_history(ch, "notes").unwrap();
+        assert_eq!(history.iter().map(|h| format!("{}: {}", h.author, h.message)).collect::<Vec<_>>(), ["intake: Delete notes", "intake: Move notes/first.md to notes/renamed.md", "intake: Add notes/first.md"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

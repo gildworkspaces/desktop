@@ -269,6 +269,91 @@ fn take_over_view(app: tauri::AppHandle, core: State<Core>, channel_id: String) 
     Ok(v)
 }
 
+// The Files add-on, from the window: the same store functions agents' file
+// tools use, as you. Each write is one commit by you, and the window is
+// told the channel's view changed.
+
+fn view_changed(app: &tauri::AppHandle, channel_id: &str) {
+    let _ = tauri::Emitter::emit(app, "gild://view", channel_id);
+}
+
+/// The channel's add-on panes, in its order, shown or hidden.
+#[tauri::command]
+fn channel_panes(core: State<Core>, channel_id: String) -> Result<Vec<store::Pane>, String> {
+    with(&core, |s| s.channel_panes(&channel_id))
+}
+
+/// Reorder the channel's panes, or hide and show them (a commit in the channel).
+#[tauri::command]
+fn set_channel_panes(core: State<Core>, channel_id: String, panes: Vec<records::PaneSetting>) -> Result<Vec<store::Pane>, String> {
+    with(&core, |s| s.set_channel_panes(&channel_id, &s.me()?, &panes))
+}
+
+#[derive(Serialize)]
+struct Preview {
+    #[serde(flatten)]
+    preview: store::FilePreview,
+    /// What "Show in Finder" is called here.
+    show: &'static str,
+}
+
+/// What the Files pane shows for a file: text, an image, or its name and size.
+#[tauri::command]
+fn file_preview(core: State<Core>, channel_id: String, path: String) -> Result<Preview, String> {
+    Ok(Preview { preview: with(&core, |s| s.file_preview(&channel_id, &path))?, show: SHOW_FOLDER })
+}
+
+/// A new text file, or a file's whole new text.
+#[tauri::command]
+fn write_file(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String, text: String) -> Result<records::FileEntry, String> {
+    let f = with(&core, |s| s.write_file(&channel_id, &s.me()?, &path, text.into_bytes()))?;
+    view_changed(&app, &channel_id);
+    Ok(f)
+}
+
+/// Files you chose or dropped in, into a folder ("" for the top).
+#[tauri::command]
+fn upload_files(app: tauri::AppHandle, core: State<Core>, channel_id: String, folder: String, files: Vec<store::Upload>) -> Result<Vec<records::FileEntry>, String> {
+    let out = with(&core, |s| s.upload_files(&channel_id, &s.me()?, &folder, &files))?;
+    view_changed(&app, &channel_id);
+    Ok(out)
+}
+
+#[tauri::command]
+fn new_folder(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String) -> Result<String, String> {
+    let out = with(&core, |s| s.new_folder(&channel_id, &s.me()?, &path))?;
+    view_changed(&app, &channel_id);
+    Ok(out)
+}
+
+/// Move or rename a file or folder.
+#[tauri::command]
+fn move_file(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String, to: String) -> Result<(), String> {
+    with(&core, |s| s.move_file(&channel_id, &s.me()?, &path, &to))?;
+    view_changed(&app, &channel_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_file(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String) -> Result<(), String> {
+    with(&core, |s| s.delete_file(&channel_id, &s.me()?, &path))?;
+    view_changed(&app, &channel_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn file_history(core: State<Core>, channel_id: String, path: String) -> Result<Vec<Change>, String> {
+    with(&core, |s| s.file_history(&channel_id, &path))
+}
+
+/// Show a file in Finder, Explorer or the file manager.
+#[tauri::command]
+fn show_file(app: tauri::AppHandle, core: State<Core>, channel_id: String, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let file = with(&core, |s| s.file_location(&channel_id, &path))?;
+    app.opener().reveal_item_in_dir(&file).map_err(|e| format!("showing {}: {e}", file.display()))
+}
+
 /// Agents running right now, and where they were called.
 #[tauri::command]
 fn working(core: State<Core>) -> Result<Vec<Working>, String> {
@@ -702,6 +787,16 @@ pub fn run() {
             drive_view,
             edit_file,
             take_over_view,
+            channel_panes,
+            set_channel_panes,
+            file_preview,
+            write_file,
+            upload_files,
+            new_folder,
+            move_file,
+            delete_file,
+            file_history,
+            show_file,
             send_reply,
             channel_data,
             set_view,
