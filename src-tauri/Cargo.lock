@@ -2009,6 +2009,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "turso_core",
+ "unicode-normalization",
  "wasmtime",
  "wat",
 ]

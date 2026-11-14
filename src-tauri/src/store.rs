@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 mod folders;
 mod org;
-pub use folders::{channel_folder, folder_name, join as folder_path, main_index, WorkspaceFile, MAIN as MAIN_FOLDER};
+pub use folders::{channel_folder, folder_name, join as folder_path, main_index, safe_dir, WorkspaceFile, MAIN as MAIN_FOLDER};
 pub use org::{Holder, Org, Via};
 
 /// Bumped when a table's columns or meaning change.
@@ -381,7 +381,10 @@ impl Store {
         )?;
         self.set_workspace_folder(&id, &root)?;
         self.ensure_org()?;
-        self.create_channel(&id, "general", "Anything for the whole workspace")?;
+        if let Err(e) = self.create_channel(&id, "general", "Anything for the whole workspace") {
+            self.forget_workspace(&id);
+            return Err(e);
+        }
         self.workspaces()?.into_iter().find(|w| w.id == id).ok_or_else(|| "the new workspace was not saved".into())
     }
 
@@ -404,6 +407,10 @@ impl Store {
         if self.channels(workspace_id)?.iter().any(|c| c.name == name) {
             return Err(format!("#{name} already exists in this workspace."));
         }
+        // Its repository: the workspace's folder for the first channel
+        // (#general), `channels/<name>/` in it for every other. Checked before
+        // anything is written, so a refusal leaves nothing behind.
+        let (folder, dir) = self.new_channel_folder(workspace_id, &name)?;
         let channel = Channel { id: new_id(), workspace_id: workspace_id.to_string(), name, topic: topic.trim().to_string(), created_at: now_ms() };
         self.run(
             "INSERT INTO channels (id, workspace_id, name, topic, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -415,9 +422,10 @@ impl Store {
                 Value::from_i64(channel.created_at),
             ],
         )?;
-        // Its repository: the workspace's folder for the first channel
-        // (#general), `channels/<name>/` in it for every other.
-        self.place_channel(&channel)?;
+        if let Err(e) = self.place_channel(&channel, &folder, &dir) {
+            self.forget_channel(&channel.id);
+            return Err(e);
+        }
         // A new channel is open to everyone in the workspace's org.
         self.ensure_org()?;
         if let Some(org) = self.channel_org(&channel.id)? {
@@ -1318,6 +1326,8 @@ pub struct ImportChannel {
     /// A history to copy in (a bare repository, or another repository's
     /// `.git`). None: the repository already in the folder, or a new one.
     pub history: Option<PathBuf>,
+    /// The branch gild commits to there (from `gild.json`).
+    pub branch: Option<String>,
 }
 
 /// Where an imported workspace's folder is.
@@ -1348,8 +1358,30 @@ impl Store {
                 return Err(format!("That folder is already open in gild, as {w}."));
             }
         }
-        let mut seen = Vec::new();
+        // Ids name files and folders: only the shape gild makes, each once.
+        if let Some(w) = id.filter(|w| !folders::valid_id(w)) {
+            return Err(format!("\"{w}\" isn't a workspace id gild makes."));
+        }
+        let mut ids_seen = Vec::new();
         for c in &channels {
+            if let Some(i) = &c.id {
+                if !folders::valid_id(i) {
+                    return Err(format!("#{}'s id \"{i}\" isn't one gild makes.", c.name));
+                }
+                if ids_seen.contains(i) {
+                    return Err(format!("Two channels have the id {i}."));
+                }
+                ids_seen.push(i.clone());
+            }
+            if let Some(b) = c.branch.as_deref().filter(|b| !records::branch_ok(b)) {
+                return Err(format!("#{}'s branch \"{b}\" isn't a branch name gild uses.", c.name));
+            }
+        }
+        let main = folders::main_index(channels.iter().map(|c| c.name.as_str()));
+        let folder_for = |i: usize, name: &str| if i == main { folders::MAIN.to_string() } else { folders::channel_folder(name) };
+        let mut seen = Vec::new();
+        let mut identities: Vec<(String, &str)> = Vec::new();
+        for (i, c) in channels.iter().enumerate() {
             if channel_name(&c.name).as_deref() != Some(c.name.as_str()) {
                 return Err(format!("\"{}\" isn't a channel name gild makes.", c.name));
             }
@@ -1357,6 +1389,16 @@ impl Store {
                 return Err(format!("#{} is in the export twice.", c.name));
             }
             seen.push(c.name.clone());
+            let folder = folder_for(i, &c.name);
+            if let Some((_, other)) = identities.iter().find(|(k, _)| *k == folders::identity(&folder)) {
+                return Err(format!("#{} and #{other} would share one folder on this computer, which doesn't tell their names apart.", c.name));
+            }
+            identities.push((folders::identity(&folder), &c.name));
+            // In place: every channel's folder a real folder inside this one,
+            // never a link out of it, and not another channel's.
+            if let ImportTo::InPlace(root) = to {
+                folders::safe_dir(root, &folder, c.id.as_deref().unwrap_or(""))?;
+            }
             if let Some(m) = c.messages.iter().find(|m| !["person", "system", "agent"].contains(&m.kind.as_str()) || m.body.trim().is_empty()) {
                 return Err(format!("A message in #{} has no text or an unknown kind ({}).", c.name, m.kind));
             }
@@ -1385,30 +1427,47 @@ impl Store {
             taken |= c.id.as_deref().is_none_or(|i| self.channel(i).map(|x| x.is_some()).unwrap_or(true));
         }
         let ws_id = if taken { new_id() } else { id.unwrap_or_default().to_string() };
-        let at = now_ms();
         let root = match to {
             ImportTo::InPlace(root) => root.to_path_buf(),
             ImportTo::NewFolder => self.free_folder(&self.home, name)?,
         };
         std::fs::create_dir_all(&root).map_err(|e| err(&format!("creating the folder {}", root.display()), e))?;
+        // Everything is checked: now write, and if anything fails, forget
+        // the rows written so far (no half-imported workspace).
+        let folders: Vec<String> = channels.iter().enumerate().map(|(i, c)| folder_for(i, &c.name)).collect();
+        match self.import_rows(&ws_id, name, &root, channels, &folders, taken) {
+            Ok(ws) => Ok(ws),
+            Err(e) => {
+                self.forget_workspace(&ws_id);
+                Err(e)
+            }
+        }
+    }
+
+    fn import_rows(&self, ws_id: &str, name: &str, root: &Path, channels: Vec<ImportChannel>, folders: &[String], taken: bool) -> Result<Workspace, String> {
+        let ws_id = ws_id.to_string();
+        let at = now_ms();
         self.run(
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
             &[Value::from_text(ws_id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
         )?;
-        self.set_workspace_folder(&ws_id, &root)?;
+        self.set_workspace_folder(&ws_id, root)?;
         // An imported workspace joins this computer's org; its channels keep
         // the rules their history has (a team from another org matches no one).
         self.ensure_org()?;
-        let main = folders::main_index(channels.iter().map(|c| c.name.as_str()));
         let mut ids_made = Vec::new();
         for (i, c) in channels.into_iter().enumerate() {
             let id = if taken { new_id() } else { c.id.clone().unwrap_or_default() };
-            let folder = if i == main { folders::MAIN.to_string() } else { folders::channel_folder(&c.name) };
-            let dir = folders::join(&root, &folder);
+            let folder = folders[i].clone();
+            let dir = folders::join(root, &folder);
             match &c.history {
                 Some(h) => records::copy_repo(h, &dir)?,
                 None if !records::is_repo(&dir) => records::init(&dir)?,
                 None => {}
+            }
+            records::mark(&dir, &id)?;
+            if let Some(b) = &c.branch {
+                records::set_branch(&dir, b)?;
             }
             // Channels are listed by when they were made: keep the export's order.
             let created = at + i as i64;

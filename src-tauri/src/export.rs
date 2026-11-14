@@ -230,7 +230,7 @@ pub fn import_workspace(store: &Store, folder: &Path) -> Result<crate::store::Wo
         let channels = file
             .channels
             .into_iter()
-            .map(|c| ImportChannel { id: Some(c.id), name: c.name, topic: c.topic, messages: Vec::new(), history: None })
+            .map(|c| ImportChannel { id: Some(c.id), name: c.name, topic: c.topic, messages: Vec::new(), history: None, branch: c.branch })
             .collect();
         return store.import_workspace(Some(&file.id), &file.name, channels, ImportTo::InPlace(folder));
     }
@@ -254,16 +254,20 @@ pub fn import_workspace(store: &Store, folder: &Path) -> Result<crate::store::Wo
                 .collect::<Result<_, _>>()?,
             Err(_) => serde_json::from_value(c["messages"].clone()).map_err(|e| err(&format!("reading #{cname}'s messages"), e))?,
         };
-        let (id, history) = match file.as_ref().and_then(|f| f.channels.iter().find(|e| e.name == cname)) {
-            Some(e) => (Some(e.id.clone()), Some(crate::store::folder_path(&copied, &e.folder).join(".git"))),
-            None => (None, Some(dir.join("history.git"))),
+        // A history is copied only from a real folder in the export: never
+        // through a link that would copy another repository on this computer.
+        let (id, history, branch) = match file.as_ref().and_then(|f| f.channels.iter().find(|e| e.name == cname)) {
+            Some(e) => (Some(e.id.clone()), Some(crate::store::safe_dir(&copied, &e.folder, &e.id)?.join(".git")), e.branch.clone()),
+            None => (None, Some(dir.join("history.git")), None),
         };
+        let real_dir = |h: &PathBuf| fs::symlink_metadata(h).is_ok_and(|m| m.is_dir());
         channels.push(ImportChannel {
             id,
             name: cname,
             topic: c["topic"].as_str().unwrap_or("").to_string(),
             messages,
-            history: history.filter(|h| h.is_dir()),
+            history: history.filter(real_dir),
+            branch,
         });
     }
     store.import_workspace(file.as_ref().map(|f| f.id.as_str()), name, channels, ImportTo::NewFolder)
