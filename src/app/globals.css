@@ -77,8 +77,15 @@ button { cursor: pointer; }
 .side { width: 250px; flex: none; background: var(--panel); border-right: 1px solid var(--rule); padding: 14px 10px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
 .side .back { all: unset; cursor: pointer; padding: 6px 10px; border-radius: 7px; color: var(--faint); font-size: 13px; }
 .side .back:hover { color: var(--ink); }
-.side .wsname { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-weight: 600; font-size: 15px; }
+.side .wsname { all: unset; box-sizing: border-box; cursor: pointer; width: 100%; display: flex; align-items: center; gap: 10px; padding: 4px 8px; border-radius: 8px; font-weight: 600; font-size: 15px; }
+.side .wsname:hover, .side .wsname[aria-expanded='true'], .side .wsname:focus-visible { background: var(--chip); }
 .side .wsname .tile { width: 30px; height: 30px; font-size: 14px; border-radius: 8px; }
+.wsmenu { position: relative; }
+.wsmenu .wsitems { left: 0; right: 0; bottom: auto; top: calc(100% + 6px); width: auto; z-index: 30; }
+.wsmenu .wsitems .stext .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 190px; }
+.newform + .place, .place { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 12px; }
+.place .mono { overflow-wrap: anywhere; }
+.folderproblem { margin: 0; padding: 6px 16px; }
 .group { display: flex; flex-direction: column; gap: 2px; }
 .group .label { padding: 0 10px 6px; }
 .chan { all: unset; box-sizing: border-box; cursor: pointer; display: flex; gap: 8px; align-items: center; width: 100%; padding: 7px 10px; border-radius: 7px; color: var(--soft); }

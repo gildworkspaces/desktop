@@ -23,7 +23,9 @@ use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value, IO};
 use crate::records::{self, Access, Acl, Change, DiffLine, Doc, Record, View};
 use sha2::{Digest, Sha256};
 
+mod folders;
 mod org;
+pub use folders::{channel_folder, folder_name, join as folder_path, main_index, safe_dir, WorkspaceFile, MAIN as MAIN_FOLDER};
 pub use org::{Holder, Org, Via};
 
 /// Bumped when a table's columns or meaning change.
@@ -58,6 +60,8 @@ CREATE TABLE IF NOT EXISTS addon_grants (addon_id TEXT NOT NULL, kind TEXT NOT N
 CREATE TABLE IF NOT EXISTS agent_runner (agent_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS held_mentions (mention_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, root TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, agent TEXT NOT NULL, action TEXT NOT NULL, channel_id TEXT NOT NULL, detail TEXT NOT NULL, ok INTEGER NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS workspace_folders (workspace_id TEXT PRIMARY KEY, path TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_folders (channel_id TEXT PRIMARY KEY, folder TEXT NOT NULL);
 ";
 
 /// The file name of the database inside the data folder.
@@ -160,9 +164,15 @@ pub struct ChannelData {
 }
 
 pub struct Store {
-    /// The data folder: the database, and `channels/<id>.git` for each
-    /// channel's records (the truth the index is built from).
+    /// The data folder: the database. (Until 0.24 also `channels/<id>.git`,
+    /// each channel's history, which `folders.rs` moves into the
+    /// workspace's folder.)
     data: PathBuf,
+    /// Where new workspaces' folders go unless the person picks another
+    /// place: `~/Gild` in the app.
+    home: PathBuf,
+    /// Why files in a channel's folder weren't taken in, from the last look.
+    problems: std::sync::Mutex<HashMap<String, Vec<String>>>,
     conn: Arc<Connection>,
     // Held so the database outlives every statement on `conn`.
     _db: Arc<Database>,
@@ -259,9 +269,17 @@ pub fn channel_name(input: &str) -> Option<String> {
 }
 
 impl Store {
-    /// Open the store in `data`, and bring the index up to date with every
-    /// channel's history.
+    /// Open the store in `data`, with new workspaces' folders in
+    /// `data/Gild` (tests; the app uses `open_in`).
+    #[cfg(test)]
     pub fn open(data: &Path) -> Result<Store, String> {
+        Self::open_in(data, &data.join("Gild"))
+    }
+
+    /// Open the store in `data`, move any history kept the old way into
+    /// workspace folders, take in what changed in them while gild was
+    /// closed, and bring the index up to date with every channel's history.
+    pub fn open_in(data: &Path, home: &Path) -> Result<Store, String> {
         let db_path = data.join(DB_FILE);
         let path = db_path.to_str().ok_or("the data folder's path is not valid UTF-8")?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| err("starting SQLite I/O", e))?);
@@ -271,7 +289,7 @@ impl Store {
             .and_then(|()| conn.execute("PRAGMA synchronous = FULL"))
             .and_then(|()| conn.execute(SCHEMA))
             .map_err(|e| err("preparing the workspace database", e))?;
-        let store = Store { data: data.to_path_buf(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in(),
+        let store = Store { data: data.to_path_buf(), home: home.to_path_buf(), problems: Default::default(), conn, _db: db, signals: Signals::default(), on_hold: None, working: Vec::new(), views: Default::default(), addons: Registry::built_in(),
             // Tests never touch the real keychain.
             secrets: if cfg!(test) { Box::new(providers::InMemory::default()) } else { Box::new(providers::Vault::for_this_computer()) },
             vault: if cfg!(test) { "harar" } else { providers::Vault::for_this_computer().kind() },
@@ -281,8 +299,10 @@ impl Store {
             Some(row) if int(&row[0]) == FORMAT => {}
             Some(row) => return Err(format!("this database is format {}, and this gild reads format {FORMAT}", int(&row[0]))),
         }
-        store.catch_up()?;
         store.ensure_org()?;
+        store.ensure_folders()?;
+        store.check_all_outside()?;
+        store.catch_up()?;
         Ok(store)
     }
 
@@ -323,11 +343,6 @@ impl Store {
         Ok(())
     }
 
-    /// The data folder this store keeps its database and histories in.
-    pub fn data_dir(&self) -> &Path {
-        &self.data
-    }
-
     pub fn workspaces(&self) -> Result<Vec<Workspace>, String> {
         let rows = self.query(
             "SELECT w.id, w.name, w.created_at,
@@ -342,8 +357,14 @@ impl Store {
             .collect())
     }
 
-    /// A new workspace starts with #general.
+    /// A new workspace starts with #general, in a new folder in `~/Gild`.
     pub fn create_workspace(&self, name: &str) -> Result<Workspace, String> {
+        self.create_workspace_in(name, None)
+    }
+
+    /// A new workspace in a new folder inside `parent` (None: `~/Gild`),
+    /// named after it ("Front Desk 2" if "Front Desk" is taken).
+    pub fn create_workspace_in(&self, name: &str, parent: Option<&Path>) -> Result<Workspace, String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("Give the workspace a name.".into());
@@ -351,13 +372,19 @@ impl Store {
         if name.chars().count() > 60 {
             return Err("Workspace names are at most 60 characters.".into());
         }
+        let root = self.free_folder(parent.unwrap_or(&self.home), name)?;
+        std::fs::create_dir_all(&root).map_err(|e| err(&format!("creating the folder {}", root.display()), e))?;
         let (id, at) = (new_id(), now_ms());
         self.run(
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
             &[Value::from_text(id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
         )?;
+        self.set_workspace_folder(&id, &root)?;
         self.ensure_org()?;
-        self.create_channel(&id, "general", "Anything for the whole workspace")?;
+        if let Err(e) = self.create_channel(&id, "general", "Anything for the whole workspace") {
+            self.forget_workspace(&id);
+            return Err(e);
+        }
         self.workspaces()?.into_iter().find(|w| w.id == id).ok_or_else(|| "the new workspace was not saved".into())
     }
 
@@ -380,6 +407,10 @@ impl Store {
         if self.channels(workspace_id)?.iter().any(|c| c.name == name) {
             return Err(format!("#{name} already exists in this workspace."));
         }
+        // Its repository: the workspace's folder for the first channel
+        // (#general), `channels/<name>/` in it for every other. Checked before
+        // anything is written, so a refusal leaves nothing behind.
+        let (folder, dir) = self.new_channel_folder(workspace_id, &name)?;
         let channel = Channel { id: new_id(), workspace_id: workspace_id.to_string(), name, topic: topic.trim().to_string(), created_at: now_ms() };
         self.run(
             "INSERT INTO channels (id, workspace_id, name, topic, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -391,12 +422,17 @@ impl Store {
                 Value::from_i64(channel.created_at),
             ],
         )?;
+        if let Err(e) = self.place_channel(&channel, &folder, &dir) {
+            self.forget_channel(&channel.id);
+            return Err(e);
+        }
         // A new channel is open to everyone in the workspace's org.
         self.ensure_org()?;
         if let Some(org) = self.channel_org(&channel.id)? {
             let org_name = self.orgs()?.into_iter().find(|o| o.id == org).map(|o| o.name).unwrap_or_default();
             self.save_acl(&channel.id, &self.me()?, &format!("Open to everyone in {org_name}"), &Acl { org: true, ..Acl::default() })?;
         }
+        self.write_manifest(workspace_id)?;
         Ok(channel)
     }
 
@@ -590,21 +626,50 @@ impl Store {
     fn catch_up(&self) -> Result<(), String> {
         for row in self.query("SELECT id FROM channels", &[])? {
             let channel = text(&row[0]);
-            let head = records::head_commit(&self.data, &channel)?;
-            let indexed = self
-                .query("SELECT commit_id FROM indexed WHERE channel_id = ?1", &[Value::from_text(channel.clone())])?
-                .first()
-                .map(|r| text(&r[0]));
-            if head != indexed {
-                self.reindex(&channel)?;
+            // A workspace whose folder is gone keeps its index until it's
+            // back (its problem says so); it isn't emptied.
+            // One channel gild can't read (a broken .gild file a pull brought
+            // in, a repository it won't open) is that channel's problem; the
+            // others, and the app, carry on.
+            if let Err(e) = self.catch_up_channel(&channel) {
+                self.add_problem(&channel, e);
             }
+        }
+        Ok(())
+    }
+
+    /// Re-index a channel if its history moved past its index.
+    fn catch_up_channel(&self, channel: &str) -> Result<bool, String> {
+        let Ok(dir) = self.repo(channel) else { return Ok(false) };
+        if records::head_commit(&dir)? != self.indexed_commit(channel)? {
+            self.reindex(channel)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn indexed_commit(&self, channel: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .query("SELECT commit_id FROM indexed WHERE channel_id = ?1", &[Value::from_text(channel.to_string())])?
+            .first()
+            .map(|r| text(&r[0])))
+    }
+
+    /// Refuse to write when the history moved outside gild (a `git pull`, a
+    /// commit, a checkout) since gild last indexed it: what's on screen may
+    /// be older than what's there now. The index catches up first.
+    fn require_indexed(&self, channel: &str) -> Result<(), String> {
+        let dir = self.repo(channel)?;
+        if records::head_commit(&dir)? != self.indexed_commit(channel)? {
+            self.reindex(channel)?;
+            return Err("This channel changed outside gild just now, so gild didn't save over it. Try again.".into());
         }
         Ok(())
     }
 
     /// Replace a channel's index with what its history says now.
     fn reindex(&self, channel_id: &str) -> Result<(), String> {
-        let snap = records::snapshot(&self.data, channel_id)?;
+        let snap = records::snapshot(&self.repo(channel_id)?)?;
         let id = Value::from_text(channel_id.to_string());
         self.run("DELETE FROM records WHERE channel_id = ?1", std::slice::from_ref(&id))?;
         self.run("DELETE FROM views WHERE channel_id = ?1", std::slice::from_ref(&id))?;
@@ -653,9 +718,12 @@ impl Store {
     }
 
     /// Commit, then index: the change is real once the commit exists, and the
-    /// index follows it.
+    /// index follows it. What a person changed in the folder outside gild
+    /// goes in first, as its own commit, so gild never writes over it.
     fn write(&self, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
-        records::commit(&self.data, channel_id, author, message, files)?;
+        self.require_indexed(channel_id)?;
+        self.check_outside(channel_id)?;
+        records::commit(&self.repo(channel_id)?, author, message, files)?;
         self.reindex(channel_id)
     }
 
@@ -791,7 +859,7 @@ impl Store {
 
     /// Every change to one record, newest first, from git.
     pub fn record_history(&self, channel_id: &str, record_id: &str) -> Result<Vec<Change>, String> {
-        records::history(&self.data, channel_id, &records::record_path(record_id))
+        records::history(&self.repo(channel_id)?, &records::record_path(record_id))
     }
 }
 
@@ -947,11 +1015,11 @@ impl Store {
     }
 
     pub fn doc_history(&self, channel_id: &str, path: &str) -> Result<Vec<Change>, String> {
-        records::history(&self.data, channel_id, path)
+        records::history(&self.repo(channel_id)?, path)
     }
 
     pub fn proposals(&self, channel_id: &str) -> Result<Vec<Proposal>, String> {
-        Ok(records::proposals(&self.data, channel_id)?
+        Ok(records::proposals(&self.repo(channel_id)?)?
             .into_iter()
             .map(|p| Proposal {
                 title: Doc::new(&p.path, p.after.clone()).title,
@@ -994,7 +1062,7 @@ impl Store {
             (None, None) => return Err("Give `path` to edit a doc, or `title` for a new one.".into()),
         };
         let id = new_id();
-        records::propose(&self.data, channel_id, &id, agent, summary, &path, body.as_bytes())?;
+        records::propose(&self.repo(channel_id)?, &id, agent, summary, &path, body.as_bytes())?;
         self.post(channel_id, "gild", "system", &format!("{agent} proposed a change to {title}: {summary}. It waits for approval in Docs."))?;
         self.proposals(channel_id)?.into_iter().find(|p| p.id == id).ok_or_else(|| "the proposal was not saved".into())
     }
@@ -1006,7 +1074,10 @@ impl Store {
     pub fn approve_proposal(&self, channel_id: &str, author: &str, id: &str) -> Result<(), String> {
         let p = self.proposal(channel_id, id)?;
         let message = format!("Approve {}'s change to {}: {}", p.agent, p.title, p.summary);
-        records::approve(&self.data, channel_id, id, author, &message)?;
+        // An edit to the doc on disk counts first: then the proposal is stale.
+        self.require_indexed(channel_id)?;
+        self.check_outside(channel_id)?;
+        records::approve(&self.repo(channel_id)?, id, author, &message)?;
         self.reindex(channel_id)?;
         self.post(channel_id, "gild", "system", &format!("{author} approved {}'s change to {}.", p.agent, p.title))?;
         Ok(())
@@ -1014,7 +1085,7 @@ impl Store {
 
     pub fn reject_proposal(&self, channel_id: &str, author: &str, id: &str) -> Result<(), String> {
         let p = self.proposal(channel_id, id)?;
-        records::reject(&self.data, channel_id, id)?;
+        records::reject(&self.repo(channel_id)?, id)?;
         self.post(channel_id, "gild", "system", &format!("{author} rejected {}'s change to {}.", p.agent, p.title))?;
         Ok(())
     }
@@ -1271,26 +1342,74 @@ impl Store {
     }
 }
 
-/// A channel coming back from an export: its chat, and its history (the
-/// truth its table, docs and access are rebuilt from).
+/// A channel coming back from an export or a workspace folder: its chat,
+/// and its history (the truth its table, docs and access are rebuilt from).
 pub struct ImportChannel {
+    /// Its id in the workspace it comes from (kept unless this gild already
+    /// uses it).
+    pub id: Option<String>,
     pub name: String,
     pub topic: String,
     pub messages: Vec<Message>,
+    /// A history to copy in (a bare repository, or another repository's
+    /// `.git`). None: the repository already in the folder, or a new one.
     pub history: Option<PathBuf>,
+    /// The branch gild commits to there (from `gild.json`).
+    pub branch: Option<String>,
+}
+
+/// Where an imported workspace's folder is.
+pub enum ImportTo<'a> {
+    /// A new folder in `~/Gild` (an export: its histories are copied in).
+    NewFolder,
+    /// The folder it is already in (a workspace folder, cloned or copied).
+    InPlace(&'a Path),
 }
 
 impl Store {
-    /// A new workspace from an export. Everything is checked before anything
-    /// is written. Messages keep their authors and times, and wake no one:
-    /// they were said before.
-    pub fn import_workspace(&self, name: &str, channels: Vec<ImportChannel>) -> Result<Workspace, String> {
+    /// A workspace from an export or a workspace folder. Everything is
+    /// checked before anything is written. Messages keep their authors and
+    /// times, and wake no one: they were said before.
+    pub fn import_workspace(&self, id: Option<&str>, name: &str, channels: Vec<ImportChannel>, to: ImportTo) -> Result<Workspace, String> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 60 {
             return Err("The export's workspace name is missing or longer than 60 characters.".into());
         }
-        let mut seen = Vec::new();
+        if channels.is_empty() {
+            return Err("There are no channels to import.".into());
+        }
+        if let ImportTo::InPlace(root) = to {
+            if !records::is_repo(root) {
+                return Err(format!("{} isn't a git repository, so it isn't a gild workspace folder.", root.display()));
+            }
+            if let Some(w) = self.workspace_at(root)? {
+                return Err(format!("That folder is already open in gild, as {w}."));
+            }
+        }
+        // Ids name files and folders: only the shape gild makes, each once.
+        if let Some(w) = id.filter(|w| !folders::valid_id(w)) {
+            return Err(format!("\"{w}\" isn't a workspace id gild makes."));
+        }
+        let mut ids_seen = Vec::new();
         for c in &channels {
+            if let Some(i) = &c.id {
+                if !folders::valid_id(i) {
+                    return Err(format!("#{}'s id \"{i}\" isn't one gild makes.", c.name));
+                }
+                if ids_seen.contains(i) {
+                    return Err(format!("Two channels have the id {i}."));
+                }
+                ids_seen.push(i.clone());
+            }
+            if let Some(b) = c.branch.as_deref().filter(|b| !records::branch_ok(b)) {
+                return Err(format!("#{}'s branch \"{b}\" isn't a branch name gild uses.", c.name));
+            }
+        }
+        let main = folders::main_index(channels.iter().map(|c| c.name.as_str()));
+        let folder_for = |i: usize, name: &str| if i == main { folders::MAIN.to_string() } else { folders::channel_folder(name) };
+        let mut seen = Vec::new();
+        let mut identities: Vec<(String, &str)> = Vec::new();
+        for (i, c) in channels.iter().enumerate() {
             if channel_name(&c.name).as_deref() != Some(c.name.as_str()) {
                 return Err(format!("\"{}\" isn't a channel name gild makes.", c.name));
             }
@@ -1298,11 +1417,25 @@ impl Store {
                 return Err(format!("#{} is in the export twice.", c.name));
             }
             seen.push(c.name.clone());
+            let folder = folder_for(i, &c.name);
+            if let Some((_, other)) = identities.iter().find(|(k, _)| *k == folders::identity(&folder)) {
+                return Err(format!("#{} and #{other} would share one folder on this computer, which doesn't tell their names apart.", c.name));
+            }
+            identities.push((folders::identity(&folder), &c.name));
+            // In place: every channel's folder a real folder inside this one,
+            // never a link out of it, and not another channel's.
+            if let ImportTo::InPlace(root) = to {
+                let dir = folders::safe_dir(root, &folder, c.id.as_deref().unwrap_or(""))?;
+                records::check(&dir)?;
+            }
             if let Some(m) = c.messages.iter().find(|m| !["person", "system", "agent"].contains(&m.kind.as_str()) || m.body.trim().is_empty()) {
                 return Err(format!("A message in #{} has no text or an unknown kind ({}).", c.name, m.kind));
             }
             if let Some(h) = &c.history {
-                gix::open(h).map_err(|e| format!("#{}'s history.git isn't a git repository: {e}", c.name))?;
+                // Only looked at, never opened: its config isn't trusted.
+                if !records::is_git_dir(h) {
+                    return Err(format!("#{}'s history isn't a git repository.", c.name));
+                }
             }
         }
         for c in &channels {
@@ -1319,18 +1452,54 @@ impl Store {
                 }
             }
         }
-        let (ws_id, at) = (new_id(), now_ms());
+        // The ids it had, unless this gild already has them (an export
+        // imported where it was made): then it's a copy, with new ones.
+        let mut taken = id.is_none_or(|w| self.workspaces().map(|ws| ws.iter().any(|x| x.id == w)).unwrap_or(true));
+        for c in &channels {
+            taken |= c.id.as_deref().is_none_or(|i| self.channel(i).map(|x| x.is_some()).unwrap_or(true));
+        }
+        let ws_id = if taken { new_id() } else { id.unwrap_or_default().to_string() };
+        let root = match to {
+            ImportTo::InPlace(root) => root.to_path_buf(),
+            ImportTo::NewFolder => self.free_folder(&self.home, name)?,
+        };
+        std::fs::create_dir_all(&root).map_err(|e| err(&format!("creating the folder {}", root.display()), e))?;
+        // Everything is checked: now write, and if anything fails, forget
+        // the rows written so far (no half-imported workspace).
+        let folders: Vec<String> = channels.iter().enumerate().map(|(i, c)| folder_for(i, &c.name)).collect();
+        match self.import_rows(&ws_id, name, &root, channels, &folders, taken) {
+            Ok(ws) => Ok(ws),
+            Err(e) => {
+                self.forget_workspace(&ws_id);
+                Err(e)
+            }
+        }
+    }
+
+    fn import_rows(&self, ws_id: &str, name: &str, root: &Path, channels: Vec<ImportChannel>, folders: &[String], taken: bool) -> Result<Workspace, String> {
+        let ws_id = ws_id.to_string();
+        let at = now_ms();
         self.run(
             "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
             &[Value::from_text(ws_id.clone()), Value::from_text(name.to_string()), Value::from_i64(at)],
         )?;
+        self.set_workspace_folder(&ws_id, root)?;
         // An imported workspace joins this computer's org; its channels keep
         // the rules their history has (a team from another org matches no one).
         self.ensure_org()?;
+        let mut ids_made = Vec::new();
         for (i, c) in channels.into_iter().enumerate() {
-            let id = new_id();
-            if let Some(h) = &c.history {
-                crate::export::copy_dir(h, &records::repo_path(&self.data, &id))?;
+            let id = if taken { new_id() } else { c.id.clone().unwrap_or_default() };
+            let folder = folders[i].clone();
+            let dir = folders::join(root, &folder);
+            match &c.history {
+                Some(h) => records::copy_repo(h, &dir)?,
+                None if !records::is_repo(&dir) => records::init(&dir)?,
+                None => {}
+            }
+            records::mark(&dir, &id)?;
+            if let Some(b) = &c.branch {
+                records::set_branch(&dir, b)?;
             }
             // Channels are listed by when they were made: keep the export's order.
             let created = at + i as i64;
@@ -1344,6 +1513,8 @@ impl Store {
                     Value::from_i64(created),
                 ],
             )?;
+            self.set_channel_folder(&id, &folder)?;
+            ids_made.push(id.clone());
             let mut ids: HashMap<&str, String> = HashMap::new();
             for m in &c.messages {
                 let new = new_id();
@@ -1367,6 +1538,12 @@ impl Store {
                 )?;
             }
             self.reindex(&id)?;
+        }
+        // gild.json names this gild's ids and org; files already changed in
+        // a folder opened where it is are taken in.
+        self.write_manifest(&ws_id)?;
+        for id in &ids_made {
+            self.check_outside(id)?;
         }
         self.workspaces()?.into_iter().find(|w| w.id == ws_id).ok_or_else(|| "the imported workspace was not saved".into())
     }
@@ -1630,13 +1807,13 @@ impl Store {
 
     pub fn files(&self, channel_id: &str) -> Result<Vec<FileEntry>, String> {
         self.require_channel(channel_id)?;
-        records::files(&self.data, channel_id)
+        records::files(&self.repo(channel_id)?)
     }
 
     /// A file's text (None: it isn't text, or is too big to open).
     pub fn file_text(&self, channel_id: &str, path: &str) -> Result<Option<String>, String> {
         self.require_channel(channel_id)?;
-        let bytes = records::read_file(&self.data, channel_id, path)?.ok_or_else(|| format!("There's no file {path} in this channel."))?;
+        let bytes = records::read_file(&self.repo(channel_id)?, path)?.ok_or_else(|| format!("There's no file {path} in this channel."))?;
         Ok((bytes.len() <= MAX_OPEN).then(|| String::from_utf8(bytes).ok()).flatten())
     }
 
@@ -2470,7 +2647,7 @@ mod tests {
         assert!(store.proposals(&c.id).unwrap().is_empty());
         assert!(store.doc(&c.id, &doc.path).unwrap().body.contains("Bring a pen") && !store.doc(&c.id, &doc.path).unwrap().body.contains("Ask for ID"));
         // What was rejected stays in the history.
-        let repo = gix::open(records::repo_path(&dir, &c.id)).unwrap();
+        let repo = gix::open(store.repo(&c.id).unwrap()).unwrap();
         assert!(repo.find_reference(format!("refs/gild/rejected/{}", p.id).as_str()).is_ok());
 
         // A new doc can be proposed too, and appears only when approved.
@@ -2599,7 +2776,7 @@ mod tests {
 
         // Grants are commits, and they survive losing the index.
         store.set_access(&general.id, DEMO_NAME, &agent.id, Some(Access::Write)).unwrap();
-        let log: Vec<String> = records::history(&dir, &general.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+        let log: Vec<String> = records::history(&store.repo(&general.id).unwrap(), records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
         assert_eq!(log, ["Let intake read and change this channel", "Let intake read this channel", "Open to everyone in Demo's org"]);
         store.run("DELETE FROM grants", &[]).unwrap();
         store.run("DELETE FROM indexed", &[]).unwrap();
@@ -2644,7 +2821,7 @@ mod tests {
         for c in [&general, &payroll] {
             assert_eq!(store.access(&agent.id, &c.id).unwrap(), None);
             assert_eq!(store.access(&other.id, &c.id).unwrap(), Some(Access::Read), "other agents keep theirs");
-            let log: Vec<String> = records::history(&dir, &c.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+            let log: Vec<String> = records::history(&store.repo(&c.id).unwrap(), records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
             assert_eq!(log[0], "Remove ava's access");
         }
         // Its access doesn't come back from history when the index is rebuilt.
@@ -3130,7 +3307,7 @@ mod tests {
         assert_eq!(store.reach(&grok.id, &p8.id).unwrap(), Some((Access::Read, Via::Team { seat: lead.clone() })));
         assert!(store.set_level(&p8.id, DEMO_NAME, &ava.id, Access::Read).is_err(), "only for someone who's in");
         assert!(store.set_rules(&p8.id, DEMO_NAME, false, &["nope".into()]).is_err());
-        let log: Vec<String> = records::history(&dir, &p8.id, records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
+        let log: Vec<String> = records::history(&store.repo(&p8.id).unwrap(), records::ACL_PATH).unwrap().into_iter().map(|c| c.message).collect();
         assert_eq!(log, ["Let grok read this channel", "Let lulu read this channel", "Close to the rest of Demo's org; Open to p8 Runtime Project Lead's team", "Open to everyone in Demo's org"]);
 
         // The team follows the tree: a seat moves with everyone under it.

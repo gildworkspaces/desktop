@@ -9,10 +9,14 @@
 //!   channels/<name>/table.csv      the channel's table, if it has one
 //!   channels/<name>/table.json
 //!   channels/<name>/docs/*.md      the channel's docs, as they are now
-//!   channels/<name>/history.git    the channel's full history: `git clone` it
+//!   workspace/                     a copy of the workspace's folder: every
+//!                                  channel's repository, full history and all
 //!
 //! Every format is written from the same rows (one read per channel), so the
 //! files and the viewer can't disagree.
+//!
+//! Import takes an export, or a workspace folder itself (one with
+//! `gild.json`: a clone, a copy), which it opens where it is.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 use crate::records;
-use crate::store::{Channel, ChannelData, Message, Store};
+use crate::store::{Channel, ChannelData, ImportChannel, ImportTo, Message, Store, WorkspaceFile};
 
 const VIEWER: &str = include_str!("../export-viewer.html");
 
@@ -33,26 +37,6 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| err("creating a folder", e))?;
     }
     fs::write(path, bytes).map_err(|e| err(&format!("writing {}", path.display()), e))
-}
-
-/// Copy a folder. Symbolic links are skipped, never followed: an export
-/// someone hands you can't pull other files from your computer in.
-pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
-    fs::create_dir_all(to).map_err(|e| err("copying history", e))?;
-    for entry in fs::read_dir(from).map_err(|e| err("copying history", e))? {
-        let entry = entry.map_err(|e| err("copying history", e))?;
-        let target = to.join(entry.file_name());
-        let kind = entry.file_type().map_err(|e| err("copying history", e))?;
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), &target).map_err(|e| err("copying history", e))?;
-        }
-    }
-    Ok(())
 }
 
 /// One CSV field: quoted when it has a comma, a quote or a line break.
@@ -144,9 +128,7 @@ pub fn threaded(messages: &[Message]) -> Vec<&Message> {
 /// A folder name from anything a person typed: no separators or dots at the
 /// start, so it stays inside the export.
 fn safe(name: &str) -> String {
-    let s: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '-' }).collect();
-    let s = s.trim().trim_start_matches(['.', '-']).to_string();
-    if s.is_empty() { "untitled".into() } else { s }
+    crate::store::folder_name(name)
 }
 
 /// Write the workspace into a new folder inside `parent` and return it.
@@ -182,12 +164,18 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
             let name = safe(d.path.trim_start_matches("docs/").trim_end_matches(".md"));
             write(&dir.join("docs").join(format!("{name}.md")), &d.body)?;
         }
-        let repo = records::repo_path(store.data_dir(), &c.id);
-        if repo.exists() {
-            copy_dir(&repo, &dir.join("history.git"))?;
-        }
         let docs: Vec<_> = docs.iter().map(|d| json!({ "path": d.path, "title": d.title, "text": d.body })).collect();
         channels.push(json!({ "name": c.name, "topic": c.topic, "messages": threaded(&messages), "table": table, "docs": docs }));
+    }
+    // The workspace's folder: each channel's repository, copied history and
+    // all, its files checked out as they are in its last commit (never what
+    // happens to be on disk), so the copy opens in gild as it is.
+    let file = store.workspace_file(&ws.id)?;
+    for c in &file.channels {
+        let repo = store.repo(&c.id)?;
+        if records::is_repo(&repo) {
+            records::copy_repo(&repo.join(".git"), &crate::store::folder_path(&root.join("workspace"), &c.folder))?;
+        }
     }
     let manifest = json!({
         "workspace": ws.name,
@@ -201,7 +189,7 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
     write(
         &root.join("README.md"),
         format!(
-            "# {}\n\nExported from gild {} on {}.\n\nOpen `export-viewer.html` in a browser to read everything, offline.\n\nEach channel is a folder in `channels/`: `chat.md` and `chat.jsonl` hold the conversation, `table.csv` and `table.json` hold its table (if it has one), `docs/` holds its docs as markdown, and `history.git` is the channel's full history, which `git clone` opens.\n",
+            "# {}\n\nExported from gild {} on {}.\n\nOpen `export-viewer.html` in a browser to read everything, offline.\n\nEach channel is a folder in `channels/`: `chat.md` and `chat.jsonl` hold the conversation, `table.csv` and `table.json` hold its table (if it has one), `docs/` holds its docs as markdown.\n\n`workspace/` is the workspace's folder: `gild.json` and #general's files at the top, every other channel in `workspace/channels/<name>/`, each a git repository with its full history. Import workspace in gild opens this export (or that folder) again.\n",
             ws.name,
             env!("CARGO_PKG_VERSION"),
             day(crate::store::now())
@@ -212,16 +200,47 @@ pub fn export_workspace(store: &Store, workspace_id: &str, parent: &Path, stamp:
 
 const MANIFEST_START: &str = "window.GILD_EXPORT = ";
 
-/// Make an export folder a workspace again. The open files are the source:
-/// each channel's chat from `chat.jsonl` and its history from `history.git`
-/// (its table, docs, access and open proposals are rebuilt from that); the
-/// workspace and channel names and topics come from `data/workspace.js`.
+/// A workspace folder's `gild.json`, checked: every channel in the folder
+/// gild keeps it in.
+fn read_workspace_file(root: &Path) -> Result<WorkspaceFile, String> {
+    let bytes = fs::read(root.join(records::MANIFEST)).map_err(|e| err("reading gild.json", e))?;
+    let file: WorkspaceFile = serde_json::from_slice(&bytes).map_err(|e| err("reading gild.json", e))?;
+    let main = crate::store::main_index(file.channels.iter().map(|c| c.name.as_str()));
+    for (i, c) in file.channels.iter().enumerate() {
+        if crate::store::channel_name(&c.name).as_deref() != Some(c.name.as_str()) {
+            return Err(format!("\"{}\" isn't a channel name gild makes.", c.name));
+        }
+        let want = if i == main { crate::store::MAIN_FOLDER.to_string() } else { crate::store::channel_folder(&c.name) };
+        if c.folder != want {
+            return Err(format!("gild.json says #{} is in {}, but gild keeps it in {want}.", c.name, c.folder));
+        }
+    }
+    Ok(file)
+}
+
+/// Make an export folder a workspace again, or open a workspace folder (one
+/// with `gild.json`) where it is. In an export the open files are the
+/// source: each channel's chat from `chat.jsonl` and its history from
+/// `workspace/` (or, from gild before 0.24, `history.git`), which its
+/// table, docs, access and open proposals are rebuilt from; the workspace
+/// and channel names and topics come from `data/workspace.js`.
 pub fn import_workspace(store: &Store, folder: &Path) -> Result<crate::store::Workspace, String> {
-    let not_export = || "This folder isn't a gild export: it has no data/workspace.js from gild. Pick the folder Export workspace made.".to_string();
+    if folder.join(records::MANIFEST).is_file() {
+        let file = read_workspace_file(folder)?;
+        let channels = file
+            .channels
+            .into_iter()
+            .map(|c| ImportChannel { id: Some(c.id), name: c.name, topic: c.topic, messages: Vec::new(), history: None, branch: c.branch })
+            .collect();
+        return store.import_workspace(Some(&file.id), &file.name, channels, ImportTo::InPlace(folder));
+    }
+    let not_export = || "This folder isn't a gild export or workspace: it has no data/workspace.js or gild.json from gild. Pick the folder Export workspace made, or a workspace's folder.".to_string();
     let js = fs::read_to_string(folder.join("data").join("workspace.js")).map_err(|_| not_export())?;
     let json = js.trim().strip_prefix(MANIFEST_START).and_then(|s| s.strip_suffix(';')).ok_or_else(not_export)?;
     let manifest: serde_json::Value = serde_json::from_str(json).map_err(|e| err("reading data/workspace.js", e))?;
     let name = manifest["workspace"].as_str().ok_or_else(not_export)?;
+    let copied = folder.join("workspace");
+    let file = if copied.join(records::MANIFEST).is_file() { Some(read_workspace_file(&copied)?) } else { None };
     let mut channels = Vec::new();
     for c in manifest["channels"].as_array().ok_or_else(not_export)? {
         let cname = c["name"].as_str().ok_or_else(not_export)?.to_string();
@@ -235,15 +254,23 @@ pub fn import_workspace(store: &Store, folder: &Path) -> Result<crate::store::Wo
                 .collect::<Result<_, _>>()?,
             Err(_) => serde_json::from_value(c["messages"].clone()).map_err(|e| err(&format!("reading #{cname}'s messages"), e))?,
         };
-        let history = dir.join("history.git");
-        channels.push(crate::store::ImportChannel {
+        // A history is copied only from a real folder in the export: never
+        // through a link that would copy another repository on this computer.
+        let (id, history, branch) = match file.as_ref().and_then(|f| f.channels.iter().find(|e| e.name == cname)) {
+            Some(e) => (Some(e.id.clone()), Some(crate::store::safe_dir(&copied, &e.folder, &e.id)?.join(".git")), e.branch.clone()),
+            None => (None, Some(dir.join("history.git")), None),
+        };
+        let real_dir = |h: &PathBuf| fs::symlink_metadata(h).is_ok_and(|m| m.is_dir());
+        channels.push(ImportChannel {
+            id,
             name: cname,
             topic: c["topic"].as_str().unwrap_or("").to_string(),
             messages,
-            history: history.is_dir().then_some(history),
+            history: history.filter(real_dir),
+            branch,
         });
     }
-    store.import_workspace(name, channels)
+    store.import_workspace(file.as_ref().map(|f| f.id.as_str()), name, channels, ImportTo::NewFolder)
 }
 
 #[cfg(test)]
@@ -275,10 +302,17 @@ mod tests {
         assert!(chat.contains("**Demo**") && chat.contains("three more students"), "{chat}");
         let lines: Vec<serde_json::Value> = fs::read_to_string(ch.join("chat.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.len(), 1);
-        // The history is a real git repository with the record's commit in it.
-        let repo = gix::open(ch.join("history.git")).unwrap();
+        // The workspace's folder is in it: real git repositories, the
+        // channel's with its last commit, the files checked out.
+        let copy = out.join("workspace/channels/student-intake");
+        let repo = gix::open(&copy).unwrap();
         let head = repo.head_commit().unwrap();
         assert_eq!(head.message_raw_sloppy().to_string().trim(), "Edit Intake SOP");
+        assert_eq!(fs::read_to_string(copy.join("docs/intake-sop.md")).unwrap(), "# Intake SOP\n\nForms go in the blue folder.\n");
+        assert!(out.join("workspace/gild.json").is_file() && out.join("workspace/.git").is_dir());
+        assert_eq!(records::status(&copy, false).unwrap(), Vec::<String>::new());
+        assert_eq!(records::status(&out.join("workspace"), true).unwrap(), Vec::<String>::new());
+        assert!(!ch.join("history.git").exists(), "the copy is the history now");
         assert_eq!(fs::read_to_string(ch.join("docs/intake-sop.md")).unwrap(), "# Intake SOP\n\nForms go in the blue folder.\n");
         // The viewer and its data sit beside the files, with no network.
         let viewer = fs::read_to_string(out.join("export-viewer.html")).unwrap();
@@ -312,19 +346,12 @@ mod tests {
     }
 
     fn refs(repo: &Path) -> Vec<(String, String)> {
-        let repo = gix::open(repo).unwrap();
-        let mut out: Vec<(String, String)> = repo
-            .references()
-            .unwrap()
-            .all()
-            .unwrap()
-            .map(|r| {
-                let mut r = r.unwrap();
-                (r.name().as_bstr().to_string(), r.peel_to_id().unwrap().to_string())
-            })
-            .collect();
-        out.sort();
-        out
+        records::refs(repo).unwrap()
+    }
+
+    /// A channel's repository in an export's copy of the workspace folder.
+    fn repo_in(export: &Path, channel: &str) -> PathBuf {
+        if channel == "general" { export.join("workspace") } else { export.join("workspace/channels").join(channel) }
     }
 
     #[test]
@@ -374,11 +401,29 @@ mod tests {
             for f in ["table.csv", "table.json", "docs/intake-sop.md"] {
                 assert_eq!(fs::read(x.join(f)).ok(), fs::read(y.join(f)).ok(), "#{c} {f}");
             }
-            assert_eq!(x.join("history.git").exists(), y.join("history.git").exists(), "#{c} history");
-            if x.join("history.git").exists() {
-                assert_eq!(refs(&x.join("history.git")), refs(&y.join("history.git")), "#{c}: the same commits, branches and all");
+            let (rx, ry) = (repo_in(&first, c), repo_in(&second, c));
+            assert!(rx.join(".git").is_dir() && ry.join(".git").is_dir(), "#{c} history");
+            if c == "general" {
+                // The main repository says which org the workspace is in: this
+                // computer's now, in one more commit on the same history.
+                let (before, after) = (refs(&rx), refs(&ry));
+                let repo = gix::open(&ry).unwrap();
+                let head = repo.head_commit().unwrap();
+                assert_eq!(head.message_raw_sloppy().to_string().trim(), "Update gild.json");
+                let branch = before.iter().find(|(r, _)| r.starts_with("refs/heads/") && !r.contains("proposals")).unwrap();
+                assert_eq!(head.parent_ids().next().unwrap().to_string(), branch.1);
+                assert_eq!(before.iter().filter(|r| *r != branch).collect::<Vec<_>>(), after.iter().filter(|(r, _)| r != &branch.0).collect::<Vec<_>>());
+            } else {
+                assert_eq!(refs(&rx), refs(&ry), "#{c}: the same commits, branches and all");
             }
         }
+        // The same workspace: gild.json's ids came back, and every folder is clean.
+        assert_eq!(back.id, ws.id);
+        let root = other.workspace_folder(&back.id).unwrap();
+        assert_eq!(root, b.join("Gild/Front Desk"));
+        assert_eq!(records::status(&root, true).unwrap(), Vec::<String>::new());
+        assert_eq!(records::status(&root.join("channels/student-intake"), false).unwrap(), Vec::<String>::new());
+        assert_eq!(fs::read_to_string(root.join("channels/student-intake/docs/intake-sop.md")).unwrap(), "# Intake SOP\n\nForms go in the blue folder.\n");
         assert!(first.join("channels/student-intake/docs/intake-sop.md").exists() && !empty.id.is_empty());
         drop(other);
         fs::remove_dir_all(base).unwrap();
@@ -400,11 +445,17 @@ mod tests {
         let secret = base.join("secret.txt");
         fs::write(&secret, "private").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&secret, out.join("channels/general/history.git/stolen")).unwrap();
+        {
+            std::os::unix::fs::symlink(&secret, out.join("workspace/.git/stolen")).unwrap();
+            std::os::unix::fs::symlink(&secret, out.join("workspace/docs/stolen.md")).unwrap();
+        }
         let back = import_workspace(&store, &out).unwrap();
+        assert_ne!(back.id, ws.id, "imported where it was made: a copy, with new ids");
         let id = store.channels(&back.id).unwrap()[0].id.clone();
-        assert!(!crate::records::repo_path(store.data_dir(), &id).join("stolen").exists(), "the link wasn't followed");
-        assert_eq!(store.docs(&id).unwrap()[0].title, "Notes");
+        let repo = store.repo(&id).unwrap();
+        assert!(!repo.join(".git/stolen").exists() && !repo.join("docs/stolen.md").exists(), "the links weren't followed");
+        assert_eq!(store.docs(&id).unwrap().iter().map(|d| d.title.as_str()).collect::<Vec<_>>(), ["Notes"]);
+        assert_eq!(repo, base.join("data/Gild/W 2"));
 
         // A hand-edited export with a bad channel name is refused before anything is written.
         let js = fs::read_to_string(out.join("data/workspace.js")).unwrap().replace("\"name\":\"general\"", "\"name\":\"../general\"");
@@ -413,6 +464,37 @@ mod tests {
         assert!(import_workspace(&store, &out).unwrap_err().contains("isn't a channel name"));
         assert_eq!(store.workspaces().unwrap().len(), before);
         drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_export_from_before_0_24_still_imports() {
+        let base = std::env::temp_dir().join(format!("gild-import-old-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("a")).unwrap();
+        fs::create_dir_all(base.join("b")).unwrap();
+        let store = Store::open(&base.join("a")).unwrap();
+        let ws = store.create_workspace("Old").unwrap();
+        let intake = store.create_channel(&ws.id, "intake", "").unwrap();
+        let sop = store.create_doc(&intake.id, DEMO_NAME, "SOP").unwrap();
+        store.save_doc(&intake.id, DEMO_NAME, &sop.path, "# SOP\n\nBlue.\n").unwrap();
+        let out = export_workspace(&store, &ws.id, &base.join("out"), "x").unwrap();
+        // The way 0.23 wrote it: each channel's history as channels/<name>/history.git.
+        for c in ["general", "intake"] {
+            records::copy_dir(&repo_in(&out, c).join(".git"), &out.join("channels").join(c).join("history.git")).unwrap();
+        }
+        fs::remove_dir_all(out.join("workspace")).unwrap();
+        let before = refs(&out.join("channels/intake/history.git"));
+        drop(store);
+        let other = Store::open(&base.join("b")).unwrap();
+        let back = import_workspace(&other, &out).unwrap();
+        let intake2 = other.channels(&back.id).unwrap().into_iter().find(|c| c.name == "intake").unwrap();
+        assert_eq!(other.doc(&intake2.id, &sop.path).unwrap().body, "# SOP\n\nBlue.\n");
+        let dir = other.repo(&intake2.id).unwrap();
+        assert_eq!(refs(&dir), before);
+        assert_eq!(fs::read_to_string(dir.join("docs/sop.md")).unwrap(), "# SOP\n\nBlue.\n");
+        assert_eq!(records::status(&dir, false).unwrap(), Vec::<String>::new());
+        drop(other);
         fs::remove_dir_all(base).unwrap();
     }
 

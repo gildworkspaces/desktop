@@ -112,7 +112,14 @@ export const core = {
   setTheme: (theme: Theme) => invoke<Profile>('set_theme', { theme }),
   version: () => invoke<string>('version'),
   workspaces: () => invoke<Workspace[]>('workspaces'),
-  createWorkspace: (name: string) => invoke<Workspace>('create_workspace', { name }),
+  /** `parent`: the folder to make the workspace's folder in (null: ~/Gild). */
+  createWorkspace: (name: string, parent: string | null = null) => invoke<Workspace>('create_workspace', { name, parent }),
+  defaultWorkspaceParent: () => invoke<string>('default_workspace_parent'),
+  /** The workspace's folder, and what the system's file manager is called ("Show in Finder"). */
+  workspaceFolder: (workspaceId: string) => invoke<{ path: string; show: string }>('workspace_folder', { workspaceId }),
+  showWorkspaceFolder: (workspaceId: string) => invoke<null>('show_workspace_folder', { workspaceId }),
+  /** Why files in the channel's folder weren't taken in (empty: nothing wrong). */
+  folderProblems: (channelId: string) => invoke<string[]>('folder_problems', { channelId }),
   channels: (workspaceId: string) => invoke<Channel[]>('channels', { workspaceId }),
   createChannel: (workspaceId: string, name: string, topic = '') => invoke<Channel>('create_channel', { workspaceId, name, topic }),
   messages: (channelId: string) => invoke<Message[]>('messages', { channelId }),

@@ -7,6 +7,7 @@ mod records;
 mod store;
 mod view;
 mod wake;
+mod watch;
 
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +21,18 @@ use tauri::{Manager, State};
 
 /// The one store, opened when the app starts.
 struct Core(Arc<Mutex<Store>>);
+
+/// What watches the workspace folders (None: the system wouldn't let gild
+/// watch them; changes are then found when gild starts, and before it writes).
+struct Folders(Option<Arc<watch::Watch>>);
+
+impl Folders {
+    fn watch_new(&self, core: &State<Core>) {
+        if let (Some(w), Ok(store)) = (&self.0, core.0.lock()) {
+            w.watch_all(&store);
+        }
+    }
+}
 
 fn with<T>(core: &State<Core>, f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
     let store = core.0.lock().map_err(|_| "the workspace database is unavailable; restart gild".to_string())?;
@@ -69,9 +82,60 @@ fn workspaces(core: State<Core>) -> Result<Vec<Workspace>, String> {
     with(&core, |s| s.workspaces())
 }
 
+/// A new workspace, in a new folder inside `parent` (null: ~/Gild).
 #[tauri::command]
-fn create_workspace(core: State<Core>, name: String) -> Result<Workspace, String> {
-    with(&core, |s| s.create_workspace(&name))
+fn create_workspace(core: State<Core>, folders: State<Folders>, name: String, parent: Option<String>) -> Result<Workspace, String> {
+    let ws = with(&core, |s| s.create_workspace_in(&name, parent.as_deref().map(std::path::Path::new)))?;
+    folders.watch_new(&core);
+    Ok(ws)
+}
+
+/// Where new workspaces go unless you pick another place.
+#[tauri::command]
+fn default_workspace_parent(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(gild_home(&app)?.display().to_string())
+}
+
+fn gild_home(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app.path().home_dir().map_err(|e| format!("finding your home folder: {e}"))?.join("Gild"))
+}
+
+#[derive(Serialize)]
+struct FolderInfo {
+    path: String,
+    /// What the system's file manager is called, for the menu item.
+    show: &'static str,
+}
+
+/// The menu item's name for opening a folder in the system's file manager.
+#[cfg(target_os = "macos")]
+const SHOW_FOLDER: &str = "Show in Finder";
+#[cfg(target_os = "windows")]
+const SHOW_FOLDER: &str = "Show in Explorer";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SHOW_FOLDER: &str = "Show in file manager";
+
+#[tauri::command]
+fn workspace_folder(core: State<Core>, workspace_id: String) -> Result<FolderInfo, String> {
+    let path = with(&core, |s| s.workspace_folder(&workspace_id))?;
+    Ok(FolderInfo { path: path.display().to_string(), show: SHOW_FOLDER })
+}
+
+/// Open the workspace's folder in Finder, Explorer or the file manager.
+#[tauri::command]
+fn show_workspace_folder(app: tauri::AppHandle, core: State<Core>, workspace_id: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = with(&core, |s| s.workspace_folder(&workspace_id))?;
+    if !path.is_dir() {
+        return Err(format!("The workspace's folder, {}, is gone.", path.display()));
+    }
+    app.opener().open_path(path.display().to_string(), None::<&str>).map_err(|e| format!("opening {}: {e}", path.display()))
+}
+
+/// What's wrong with a channel's folder, in plain words (empty: nothing).
+#[tauri::command]
+fn folder_problems(core: State<Core>, channel_id: String) -> Result<Vec<String>, String> {
+    with(&core, |s| Ok(s.folder_problems(&channel_id)))
 }
 
 #[tauri::command]
@@ -568,10 +632,13 @@ fn export_workspace(app: tauri::AppHandle, core: State<Core>, workspace_id: Stri
     Ok(out.display().to_string())
 }
 
-/// Make an export folder (one Export workspace wrote) a workspace again.
+/// Make an export folder (one Export workspace wrote) a workspace again, or
+/// open a workspace's folder (one with gild.json) where it is.
 #[tauri::command]
-fn import_workspace(core: State<Core>, folder: String) -> Result<Workspace, String> {
-    with(&core, |s| export::import_workspace(s, std::path::Path::new(&folder)))
+fn import_workspace(core: State<Core>, folders: State<Folders>, folder: String) -> Result<Workspace, String> {
+    let ws = with(&core, |s| export::import_workspace(s, std::path::Path::new(&folder)))?;
+    folders.watch_new(&core);
+    Ok(ws)
 }
 
 pub fn run() {
@@ -582,7 +649,9 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let mut store = Store::open(&dir)?;
+            // The database stays in the app's data folder; workspaces are
+            // folders in ~/Gild (or wherever each was made).
+            let mut store = Store::open_in(&dir, &gild_home(app.handle())?)?;
             store.seed_if_empty()?;
             // Agents held after a long run: a desktop notification, when
             // Settings › Agents asks for one.
@@ -594,6 +663,12 @@ pub fn run() {
             let core = Arc::new(Mutex::new(store));
             mcp::serve(mcp::Gild { core: core.clone(), app: Some(app.handle().clone()) });
             tauri::async_runtime::spawn(wake::run(core.clone(), Some(app.handle().clone()), endpoint()));
+            // Files changed by other apps: taken in, and the window told.
+            let handle = app.handle().clone();
+            let watching = watch::Watch::start(core.clone(), Box::new(move |channel| {
+                let _ = tauri::Emitter::emit(&handle, "gild://changed", channel);
+            }));
+            app.manage(Folders(watching.ok()));
             app.manage(Core(core));
             Ok(())
         })
@@ -669,6 +744,10 @@ pub fn run() {
             mcp_status,
             export_workspace,
             import_workspace,
+            default_workspace_parent,
+            workspace_folder,
+            show_workspace_folder,
+            folder_problems,
         ])
         .run(tauri::generate_context!())
         .expect("error while running gild desktop");

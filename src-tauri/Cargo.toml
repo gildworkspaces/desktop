@@ -1,6 +1,6 @@
 [package]
 name = "gild-desktop"
-version = "0.23.0"
+version = "0.24.0"
 description = "gild: the open workspace where people and agents work together"
 license = "MIT"
 repository = "https://github.com/gildworkspaces/desktop"
@@ -24,7 +24,14 @@ serde_json = "1.0"
 # engine and the same exact pin as Zega+SQLite (zegadb/zega), so the two can
 # share a file format later.
 turso_core = "=0.8.3"
-gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+# `worktree-mutation` checks a channel's files out; `status` sees what changed
+# outside gild. Still pure Rust: no C, no `git` binary.
+gix = { version = "0.90.0", default-features = false, features = ["sha1", "status", "worktree-mutation"] }
+# Two channel folders that one file system would see as one (case and
+# Unicode form) are told apart before anything is written.
+unicode-normalization = "0.1.26"
+# Notices files changed in a workspace folder by other apps.
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1.54.1", features = ["net", "rt", "macros", "sync", "time", "process", "io-util"] }

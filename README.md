@@ -7,9 +7,36 @@ as members with permissions.
 This is the desktop app. It works on its own computer today; the plan for
 everything after that is the design doc.
 
-## What works (0.23.0)
+## What works (0.24.0)
 
 - A workspaces home: create workspaces, open them.
+- **A workspace is a folder you can open**: `~/Gild/<name>/` unless you pick
+  another place when you create it ("Front Desk 2" if the name is taken).
+  The folder is a git repository holding the workspace and #general;
+  every other channel is its own repository in `channels/<name>/`, which
+  the main one ignores. `gild.json` at the top lists the workspace (id,
+  name, org) and its channels (id, name, topic, folder, remote). Click the
+  workspace's name in the sidebar for **Show in Finder** (Explorer on
+  Windows, the file manager on Linux). Every change gild makes is one
+  commit by its author, and the files on disk match it. Edit or add files
+  there with any other app and gild notices, commits them as you ("Edit
+  outside gild: …") and updates the channel; a broken `.gild/*.json` is
+  left uncommitted and the channel says why. Live chat stays in gild's
+  database: it never goes in git. Data from 0.23 and earlier (a hidden
+  repository per channel in the app's data folder) moves into these
+  folders on the first launch, every commit, author, date and branch kept;
+  each moved repository is checked object by object, and the old ones are
+  kept (not deleted) in the data folder's `migrated-0.24/`. A channel that
+  can't be moved keeps its old history and says why; gild still starts.
+  A history gild copies (moving, importing, exporting) brings only its
+  commits and branches, never its git settings, and gild reads no git
+  config from outside a repository. It won't use a folder, and says why,
+  when its `.git/config` sets `core.worktree`, `core.bare`, a filter
+  driver, an include, `core.hooksPath`, `core.fsmonitor`,
+  `core.sshCommand`, `core.gitProxy`, `core.askPass`, `diff.external`, a
+  diff `textconv` or a merge driver; when `.git` is a link or points
+  elsewhere; when it borrows objects (`objects/info/alternates`); or when
+  `.git/hooks/` holds anything but git's `*.sample` files.
 - Inside a workspace: channels, with the top third of each channel kept for
   its view and the bottom two thirds for messages. **Expand view** flips the
   split.
@@ -145,14 +172,17 @@ everything after that is the design doc.
   team and channels under it are already theirs.
 - **Export.** *Export workspace* in the sidebar writes a folder to
   Documents/gild exports: each channel's chat as markdown and JSON lines, its
-  table as CSV and JSON, its docs as markdown, its full history as a git repository you can clone,
+  table as CSV and JSON, its docs as markdown, a copy of the workspace's
+  folder (`workspace/`: every channel's repository, full history and all),
   and `export-viewer.html`, which browses all of it offline.
 - **Import.** *Import a workspace* on the home screen takes a folder Export
-  workspace made and makes it a workspace again: channels, chat (from
-  `chat.jsonl`), tables, docs, access and open proposals (from
-  `history.git`). Imported chat keeps its authors and times and wakes no
-  one. A test exports, imports and exports again, and checks the two
-  exports match.
+  workspace made and makes it a workspace again, in a new folder: channels,
+  chat (from `chat.jsonl`), tables, docs, access and open proposals (from
+  the repositories in `workspace/`, or `history.git` in an export from
+  0.23). It also takes a workspace's own folder (one with `gild.json`, such
+  as a clone), which it opens where it is. Imported chat keeps its authors
+  and times and wakes no one. A test exports, imports and exports again,
+  and checks the two exports match.
 - **You.** Your card sits at the bottom of the sidebar: picture, name and
   status. Clicking it opens your profile (banner, picture, name, About me)
   with **Edit Profile**, your status (Online, Idle, Do Not Disturb,
@@ -175,12 +205,18 @@ The first run creates a "Demo workspace" with #general.
 - `src/lib/core.ts`: the window's only way to data, the Rust core's commands.
 - `src-tauri/src/store.rs`: the database, written with Turso's Rust engine
   (`turso_core`, the engine Zega+SQLite uses). No C.
-- `src-tauri/src/records.rs`: each channel's records live in a git
-  repository, `channels/<channel id>.git` in the data folder, as
+- `src-tauri/src/store/folders.rs`: where each workspace's folder is,
+  `gild.json`, and moving data from before 0.24 into folders.
+  `src-tauri/src/watch.rs`: notices files changed by other apps (with a
+  scan at startup for what changed while gild was closed).
+- `src-tauri/src/records.rs`: each channel's records live in its git
+  repository in the workspace's folder, as
   `.gild/view.json` and one `.gild/records/<id>.json` per record. Git is the
-  truth: every change is a commit by the person who made it, and the SQLite
+  truth: every change is a commit by the person who made it, written to
+  disk and git's index too (`git status` stays clean), and the SQLite
   tables are an index rebuilt from it (on every write, and on startup when a
-  channel's history has moved past its index). Pure Rust (gitoxide). Docs
+  channel's history has moved past its index). Pure Rust (gitoxide): no
+  `git` binary needed. Docs
   are `docs/<name>.md` in the same repository. An agent's proposed edit is a
   branch, `proposals/<id>`; approving it is a merge commit by the person who
   approved, and rejecting it moves the branch to `refs/gild/rejected/<id>`,
@@ -199,7 +235,8 @@ The first run creates a "Demo workspace" with #general.
   channel's grants live in its git history as `.gild/acl.json`.
 - The database file: `gild.db` in the app's data folder
   (`~/Library/Application Support/gg.gild.desktop/` on macOS). It is a plain
-  SQLite file; `sqlite3` reads it.
+  SQLite file; `sqlite3` reads it. It holds the chat, the index, and where
+  each workspace's folder is.
 
 ## Develop
 
