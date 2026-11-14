@@ -30,9 +30,13 @@ everything after that is the design doc.
   can't be moved keeps its old history and says why; gild still starts.
   A history gild copies (moving, importing, exporting) brings only its
   commits and branches, never its git settings, and gild reads no git
-  config from outside a repository. It won't use a folder whose own git
-  settings could put files elsewhere or run a program (`core.worktree`,
-  filter drivers, includes, hooks and the like), and says so.
+  config from outside a repository. It won't use a folder, and says why,
+  when its `.git/config` sets `core.worktree`, `core.bare`, a filter
+  driver, an include, `core.hooksPath`, `core.fsmonitor`,
+  `core.sshCommand`, `core.gitProxy`, `core.askPass`, `diff.external`, a
+  diff `textconv` or a merge driver; when `.git` is a link or points
+  elsewhere; when it borrows objects (`objects/info/alternates`); or when
+  `.git/hooks/` holds anything but git's `*.sample` files.
 - Inside a workspace: channels, with the top third of each channel kept for
   its view and the bottom two thirds for messages. **Expand view** flips the
   split.

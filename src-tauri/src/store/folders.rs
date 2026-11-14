@@ -1330,6 +1330,60 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    /// A clone of `root`, with `change` made to its #intake's `.git`.
+    fn clone_with(base: &Path, root: &Path, tag: &str, change: impl FnOnce(&Path)) -> PathBuf {
+        let clone = base.join(format!("clone-{tag}"));
+        records::copy_dir(root, &clone).unwrap();
+        change(&clone.join("channels/intake/.git"));
+        clone
+    }
+
+    #[test]
+    fn a_folder_set_up_bare_is_refused() {
+        let base = temp(line!());
+        let a = Store::open(&base.join("a")).unwrap();
+        let (root, _, intake) = workspace(&a);
+        let b = Store::open(&base.join("b")).unwrap();
+        let clone = clone_with(&base, &root, "bare", |git| append(&git.join("config"), "[core]\n\tbare = true\n"));
+        let e = crate::export::import_workspace(&b, &clone).unwrap_err();
+        assert!(e.contains("core.bare"), "{e}");
+        assert!(b.workspaces().unwrap().is_empty());
+        // In a folder gild already has: that channel stops, plainly.
+        append(&root.join("channels/intake/.git/config"), "[core]\n\tbare = true\n");
+        assert!(a.check_outside(&intake.id).unwrap_err().contains("core.bare"));
+        assert!(a.save_doc(&intake.id, DEMO_NAME, "docs/sop.md", "# x\n").is_err());
+        drop((a, b));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_folder_with_hooks_or_borrowed_history_is_refused() {
+        let base = temp(line!());
+        let a = Store::open(&base.join("a")).unwrap();
+        let (root, _, _) = workspace(&a);
+        drop(a);
+        let b = Store::open(&base.join("b")).unwrap();
+        // A hook git would run: refused, naming it. git's samples are fine.
+        let hooked = clone_with(&base, &root, "hook", |git| {
+            fs::create_dir_all(git.join("hooks")).unwrap();
+            fs::write(git.join("hooks/pre-commit.sample"), "#!/bin/sh\n").unwrap();
+            fs::write(git.join("hooks/post-checkout"), "#!/bin/sh\ntouch ran\n").unwrap();
+        });
+        let e = crate::export::import_workspace(&b, &hooked).unwrap_err();
+        assert!(e.contains(".git/hooks/post-checkout") && e.contains("delete it and try again"), "{e}");
+        fs::remove_file(hooked.join("channels/intake/.git/hooks/post-checkout")).unwrap();
+        crate::export::import_workspace(&b, &hooked).expect("with only samples left, it opens");
+        // Objects borrowed from another repository on this computer.
+        let borrowing = clone_with(&base, &root, "alt", |git| {
+            fs::create_dir_all(git.join("objects/info")).unwrap();
+            fs::write(git.join("objects/info/alternates"), format!("{}\n", root.join(".git/objects").display())).unwrap();
+        });
+        let e = crate::export::import_workspace(&b, &borrowing).unwrap_err();
+        assert!(e.contains("objects/info/alternates"), "{e}");
+        drop(b);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn an_export_carries_no_remote_or_credentials() {
         let base = temp(line!());

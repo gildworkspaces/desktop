@@ -189,7 +189,7 @@ pub fn is_repo(dir: &Path) -> bool {
 /// `includeIf` would pull settings in from other files. The rest run
 /// programs in git itself (hooks, fsmonitor, ssh, diff and merge drivers):
 /// refused too, so opening a folder in git after gild can't surprise anyone.
-fn unsafe_setting(git_dir: &Path) -> Result<Option<String>, String> {
+fn unsafe_setting(git_dir: &Path, has_folder: bool) -> Result<Option<String>, String> {
     for name in ["config", "config.worktree"] {
         let path = git_dir.join(name);
         if !path.exists() {
@@ -204,7 +204,10 @@ fn unsafe_setting(git_dir: &Path) -> Result<Option<String>, String> {
                 let bad = matches!(section.as_str(), "filter" | "include" | "includeif")
                     || (section == "core" && ["worktree", "fsmonitor", "hookspath", "sshcommand", "gitproxy", "askpass"].contains(&key.as_str()))
                     || (section == "diff" && (key == "external" || key == "textconv"))
-                    || (section == "merge" && key == "driver");
+                    || (section == "merge" && key == "driver")
+                    // A channel's folder is its files: a "bare" one would
+                    // take none of gild's writes and show none of yours.
+                    || (has_folder && section == "core" && key == "bare" && s.values("bare").last().is_none_or(|v| ["true", "yes", "on", "1", ""].contains(&v.to_string().trim().to_ascii_lowercase().as_str())));
                 if bad {
                     return Ok(Some(format!("{section}{sub}.{key}")));
                 }
@@ -224,7 +227,10 @@ fn open(dir: &Path) -> Result<Option<gix::Repository>, String> {
         return Ok(None);
     }
     let dot_git = dir.join(".git");
-    let git_dir = if std::fs::symlink_metadata(&dot_git).is_ok() {
+    // A channel's folder (with a .git), or one of the bare repositories
+    // gild kept before 0.24, opened only to move it.
+    let has_folder = std::fs::symlink_metadata(&dot_git).is_ok();
+    let git_dir = if has_folder {
         if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
             return Err(format!("{}'s .git isn't a folder (it's a link, or points to another folder), so gild won't use it.", dir.display()));
         }
@@ -235,18 +241,43 @@ fn open(dir: &Path) -> Result<Option<gix::Repository>, String> {
     if git_dir.join("commondir").exists() {
         return Err(format!("{} shares its history with another folder (a linked worktree), so gild won't use it.", dir.display()));
     }
-    if let Some(key) = unsafe_setting(&git_dir)? {
+    if let Some(key) = unsafe_setting(&git_dir, has_folder)? {
         return Err(format!(
-            "{}'s git settings set {key}, which could make git write outside the folder or run a program. gild won't use it until that setting is removed from .git/config.",
+            "{}'s git settings set {key}, which could make git write outside the folder, ignore it, or run a program. gild won't use it until that setting is removed from .git/config.",
             dir.display()
         ));
     }
-    let repo = gix::open_opts(dir, gix::open::Options::isolated()).map_err(|e| err("opening the channel's history", e))?;
-    if let Some(work) = repo.workdir() {
-        let same = matches!((work.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
-        if !same {
-            return Err(format!("{}'s git settings put its files somewhere else, so gild won't use it.", dir.display()));
+    if has_folder {
+        // Objects borrowed from another repository on this computer.
+        for f in ["objects/info/alternates", "objects/info/http-alternates"] {
+            if git_dir.join(f).exists() {
+                return Err(format!("{} borrows history from another repository (.git/{f}), so gild won't use it. Delete that file to use the folder.", dir.display()));
+            }
         }
+        // gild never runs hooks, but the person's own git would. git's
+        // `*.sample` files and the `docs.url` gitoxide's `init` writes are
+        // never run.
+        if let Ok(entries) = std::fs::read_dir(git_dir.join("hooks")) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".sample") && name != "docs.url" {
+                    return Err(format!("{} has a git hook, .git/hooks/{name}, which git would run. gild won't use the folder while it's there: delete it and try again.", dir.display()));
+                }
+            }
+        }
+    }
+    let repo = gix::open_opts(dir, gix::open::Options::isolated()).map_err(|e| err("opening the channel's history", e))?;
+    match repo.workdir() {
+        Some(work) => {
+            let same = matches!((work.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
+            if !same {
+                return Err(format!("{}'s git settings put its files somewhere else, so gild won't use it.", dir.display()));
+            }
+        }
+        None if has_folder => {
+            return Err(format!("{}'s repository has no files (it's set up bare), so gild won't use it.", dir.display()));
+        }
+        None => {}
     }
     Ok(Some(repo))
 }
