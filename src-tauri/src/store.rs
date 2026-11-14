@@ -628,15 +628,41 @@ impl Store {
             let channel = text(&row[0]);
             // A workspace whose folder is gone keeps its index until it's
             // back (its problem says so); it isn't emptied.
-            let Ok(dir) = self.repo(&channel) else { continue };
-            let head = records::head_commit(&dir)?;
-            let indexed = self
-                .query("SELECT commit_id FROM indexed WHERE channel_id = ?1", &[Value::from_text(channel.clone())])?
-                .first()
-                .map(|r| text(&r[0]));
-            if head != indexed {
-                self.reindex(&channel)?;
+            // One channel gild can't read (a broken .gild file a pull brought
+            // in, a repository it won't open) is that channel's problem; the
+            // others, and the app, carry on.
+            if let Err(e) = self.catch_up_channel(&channel) {
+                self.add_problem(&channel, e);
             }
+        }
+        Ok(())
+    }
+
+    /// Re-index a channel if its history moved past its index.
+    fn catch_up_channel(&self, channel: &str) -> Result<bool, String> {
+        let Ok(dir) = self.repo(channel) else { return Ok(false) };
+        if records::head_commit(&dir)? != self.indexed_commit(channel)? {
+            self.reindex(channel)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn indexed_commit(&self, channel: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .query("SELECT commit_id FROM indexed WHERE channel_id = ?1", &[Value::from_text(channel.to_string())])?
+            .first()
+            .map(|r| text(&r[0])))
+    }
+
+    /// Refuse to write when the history moved outside gild (a `git pull`, a
+    /// commit, a checkout) since gild last indexed it: what's on screen may
+    /// be older than what's there now. The index catches up first.
+    fn require_indexed(&self, channel: &str) -> Result<(), String> {
+        let dir = self.repo(channel)?;
+        if records::head_commit(&dir)? != self.indexed_commit(channel)? {
+            self.reindex(channel)?;
+            return Err("This channel changed outside gild just now, so gild didn't save over it. Try again.".into());
         }
         Ok(())
     }
@@ -695,6 +721,7 @@ impl Store {
     /// index follows it. What a person changed in the folder outside gild
     /// goes in first, as its own commit, so gild never writes over it.
     fn write(&self, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+        self.require_indexed(channel_id)?;
         self.check_outside(channel_id)?;
         records::commit(&self.repo(channel_id)?, author, message, files)?;
         self.reindex(channel_id)
@@ -1048,6 +1075,7 @@ impl Store {
         let p = self.proposal(channel_id, id)?;
         let message = format!("Approve {}'s change to {}: {}", p.agent, p.title, p.summary);
         // An edit to the doc on disk counts first: then the proposal is stale.
+        self.require_indexed(channel_id)?;
         self.check_outside(channel_id)?;
         records::approve(&self.repo(channel_id)?, id, author, &message)?;
         self.reindex(channel_id)?;
@@ -1397,13 +1425,17 @@ impl Store {
             // In place: every channel's folder a real folder inside this one,
             // never a link out of it, and not another channel's.
             if let ImportTo::InPlace(root) = to {
-                folders::safe_dir(root, &folder, c.id.as_deref().unwrap_or(""))?;
+                let dir = folders::safe_dir(root, &folder, c.id.as_deref().unwrap_or(""))?;
+                records::check(&dir)?;
             }
             if let Some(m) = c.messages.iter().find(|m| !["person", "system", "agent"].contains(&m.kind.as_str()) || m.body.trim().is_empty()) {
                 return Err(format!("A message in #{} has no text or an unknown kind ({}).", c.name, m.kind));
             }
             if let Some(h) = &c.history {
-                gix::open(h).map_err(|e| format!("#{}'s history isn't a git repository: {e}", c.name))?;
+                // Only looked at, never opened: its config isn't trusted.
+                if !records::is_git_dir(h) {
+                    return Err(format!("#{}'s history isn't a git repository.", c.name));
+                }
             }
         }
         for c in &channels {

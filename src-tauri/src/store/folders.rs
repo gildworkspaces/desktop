@@ -369,6 +369,10 @@ impl Store {
     pub(super) fn write_manifest(&self, workspace_id: &str) -> Result<(), String> {
         let Some(main) = self.main_channel(workspace_id)? else { return Ok(()) };
         let dir = self.repo(&main)?;
+        // gild.json comes from the index's channel list, not from anything
+        // on screen: a history that moved first (a migration, a pull) is
+        // indexed, then gild.json goes on top.
+        self.catch_up_channel(&main)?;
         let mut bytes = serde_json::to_vec_pretty(&self.workspace_file(workspace_id)?).map_err(|e| err("writing gild.json", e))?;
         bytes.push(b'\n');
         let had = records::read_file(&dir, records::MANIFEST)?;
@@ -398,11 +402,10 @@ impl Store {
         let found = records::check_outside(&dir, &self.me()?, self.is_main(channel_id)?)?;
         let problems: Vec<String> = found.problems.iter().map(|p| format!("In #{name}'s folder: {p}")).collect();
         let problems_changed = self.set_problems(channel_id, problems);
-        let changed = found.commit.is_some() || problems_changed;
-        if found.commit.is_some() {
-            self.reindex(channel_id)?;
-        }
-        Ok(changed)
+        // A commit gild made, or one made with git (pull, commit, reset,
+        // checkout): either way the index follows the history.
+        let moved = self.catch_up_channel(channel_id)?;
+        Ok(found.commit.is_some() || moved || problems_changed)
     }
 
     /// At start: every channel, as gild wasn't watching while it was closed.
@@ -455,9 +458,14 @@ impl Store {
                     None => continue,
                 },
             };
-            let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-            if parts.iter().any(|p| p == ".git") {
-                return Ok(None);
+            let mut parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            // In a .git, only HEAD and the refs count (the history moved);
+            // they belong to the repository the .git is in.
+            if let Some(i) = parts.iter().position(|p| p == ".git") {
+                if !crate::watch::moves_history(path) {
+                    return Ok(None);
+                }
+                parts.truncate(i);
             }
             if parts.first().map(String::as_str) == Some(records::CHANNELS_DIR) {
                 let Some(sub) = parts.get(1) else { return Ok(None) };
@@ -482,10 +490,8 @@ impl Store {
     /// kept, not deleted, in `<data>/migrated-0.24/`.
     pub(super) fn ensure_folders(&self) -> Result<(), String> {
         let legacy = self.data.join("channels");
-        // Still moving: a channel with no history yet may get an empty one.
-        let moving = legacy.is_dir();
         for ws in self.workspaces()? {
-            if let Err(e) = self.ensure_workspace_folder(&ws.id, &ws.name, moving) {
+            if let Err(e) = self.ensure_workspace_folder(&ws.id, &ws.name) {
                 for c in self.channels(&ws.id).unwrap_or_default() {
                     self.add_problem(&c.id, e.clone());
                 }
@@ -497,12 +503,12 @@ impl Store {
         Ok(())
     }
 
-    fn ensure_workspace_folder(&self, workspace_id: &str, name: &str, moving: bool) -> Result<(), String> {
+    fn ensure_workspace_folder(&self, workspace_id: &str, name: &str) -> Result<(), String> {
         let channels = self.channels(workspace_id)?;
         let root = match self.workspace_root(workspace_id)? {
             Some(root) => {
-                if !root.is_dir() && !channels.iter().any(|c| self.legacy_repo(&c.id).is_some()) {
-                    // Moved or deleted by someone: never start it again empty.
+                if !root.is_dir() {
+                    // Moved or deleted by someone: never made again.
                     let gone = format!("This workspace's folder, {}, is gone. Put it back to use the workspace again.", root.display());
                     for c in &channels {
                         self.add_problem(&c.id, gone.clone());
@@ -513,16 +519,16 @@ impl Store {
             }
             None => {
                 let root = self.free_folder(&self.home, name)?;
+                std::fs::create_dir_all(&root).map_err(|e| err(&format!("creating the folder {}", root.display()), e))?;
                 self.set_workspace_folder(workspace_id, &root)?;
                 root
             }
         };
-        std::fs::create_dir_all(&root).map_err(|e| err(&format!("creating the folder {}", root.display()), e))?;
         let main = main_index(channels.iter().map(|c| c.name.as_str()));
         // Every channel's folder first, and which one each would land in on
         // a file system that ignores case and Unicode form: two channels that
         // would share one are never moved over each other.
-        let mut placed: Vec<(&Channel, String, bool)> = Vec::new();
+        let mut placed: Vec<&Channel> = Vec::new();
         let mut seen: std::collections::HashMap<String, String> = Default::default();
         for (i, c) in channels.iter().enumerate() {
             let (folder, new_row) = match self.folder_of(&c.id)? {
@@ -538,11 +544,29 @@ impl Store {
                 continue;
             }
             seen.insert(identity(&folder), c.name.clone());
-            placed.push((c, folder, new_row));
+            // A channel that never had a history (no old repository, moved or
+            // not, and no folder until now) starts with an empty one, here and
+            // only now. Any other channel without its folder is a problem.
+            let kept = self.data.join(MIGRATED).join(format!("{}.git", c.id));
+            if new_row && self.legacy_repo(&c.id).is_none() && !kept.exists() {
+                let started = safe_dir(&root, &folder, &c.id).and_then(|dir| {
+                    if records::is_repo(&dir) {
+                        return Ok(());
+                    }
+                    records::init(&dir)?;
+                    records::mark(&dir, &c.id)
+                });
+                if let Err(e) = started {
+                    self.add_problem(&c.id, e);
+                }
+                continue;
+            }
+            placed.push(c);
         }
         stop_here("placed")?;
-        for (c, folder, new_row) in placed {
-            if let Err(e) = self.move_channel(c, &root, &folder, new_row || moving) {
+        for c in placed {
+            let folder = self.folder_of(&c.id)?.unwrap_or_default();
+            if let Err(e) = self.move_channel(c, &root, &folder) {
                 self.add_problem(&c.id, e);
             }
         }
@@ -550,9 +574,9 @@ impl Store {
     }
 
     /// Move one channel's old history into its folder, checked before the old
-    /// one is put away. `may_start` lets a channel that never had a history
-    /// get an empty repository (only while moving from the old layout).
-    fn move_channel(&self, c: &Channel, root: &Path, folder: &str, may_start: bool) -> Result<(), String> {
+    /// one is put away. Never makes a repository for a channel whose old one
+    /// isn't there: a missing folder is the channel's problem (`repo`).
+    fn move_channel(&self, c: &Channel, root: &Path, folder: &str) -> Result<(), String> {
         let dir = safe_dir(root, folder, &c.id)?;
         if let Some(from) = self.legacy_repo(&c.id) {
             // Only into a folder that's empty, or this channel's own move that
@@ -574,9 +598,6 @@ impl Store {
             std::fs::create_dir_all(&kept).map_err(|e| fail(e.to_string()))?;
             std::fs::rename(&from, kept.join(format!("{}.git", c.id))).map_err(|e| fail(e.to_string()))?;
             stop_here("renamed")?;
-        } else if !records::is_repo(&dir) && may_start {
-            records::init(&dir)?;
-            records::mark(&dir, &c.id)?;
         }
         Ok(())
     }
@@ -1244,6 +1265,154 @@ mod tests {
         assert!(b.workspaces().unwrap().is_empty(), "no half-imported workspace");
         assert!(b.query("SELECT 1 FROM channels", &[]).unwrap().is_empty() && b.query("SELECT 1 FROM messages", &[]).unwrap().is_empty());
         drop(b);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn append(path: &Path, text: &str) {
+        let had = fs::read_to_string(path).unwrap_or_default();
+        fs::write(path, format!("{had}{text}")).unwrap();
+    }
+
+    /// Settings someone could put in a repository they hand you.
+    fn hostile(victim: &Path, marker: &Path) -> String {
+        let touch = format!("touch '{}'", marker.display());
+        format!(
+            "[core]\n\tworktree = {}\n[filter \"evil\"]\n\tsmudge = {touch}; cat\n\tclean = {touch}; cat\n\tprocess = {touch}\n\trequired = true\n[remote \"origin\"]\n\turl = https://user:hunter2@example.com/x.git\n[credential]\n\thelper = store\n",
+            victim.display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_history_writes_nothing_outside_and_runs_nothing() {
+        let base = temp(line!());
+        let a = Store::open(&base.join("a")).unwrap();
+        let (root, _, intake) = workspace(&a);
+        let dir = root.join("channels/intake");
+        // Every file goes through the "evil" filter, by .gitattributes.
+        fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        a.check_outside(&intake.id).unwrap();
+        let ws = a.workspaces().unwrap()[0].id.clone();
+        let out = crate::export::export_workspace(&a, &ws, &base.join("out"), "x").unwrap();
+        drop(a);
+        let (victim, marker) = (base.join("victim"), base.join("ran"));
+        fs::create_dir_all(&victim).unwrap();
+        let copied = out.join("workspace/channels/intake/.git");
+        append(&copied.join("config"), &hostile(&victim, &marker));
+        fs::create_dir_all(copied.join("objects/info")).unwrap();
+        fs::write(copied.join("objects/info/alternates"), format!("{}\n", base.join("a").display())).unwrap();
+        // Importing the export: its history comes in, its settings don't.
+        let b = Store::open(&base.join("b")).unwrap();
+        let back = crate::export::import_workspace(&b, &out).unwrap();
+        let intake2 = b.channels(&back.id).unwrap().into_iter().find(|c| c.name == "intake").unwrap();
+        let dir2 = b.repo(&intake2.id).unwrap();
+        assert_eq!(file(&dir2, "docs/sop.md"), "# SOP\n\nBlue.\n", "checked out where it belongs");
+        b.save_doc(&intake2.id, DEMO_NAME, "docs/sop.md", "# SOP\n\nRed.\n").unwrap();
+        b.check_outside(&intake2.id).unwrap();
+        assert!(fs::read_dir(&victim).unwrap().next().is_none(), "nothing was written outside the folder");
+        assert!(!marker.exists(), "no filter command ran");
+        let config = fs::read_to_string(dir2.join(".git/config")).unwrap();
+        assert!(!config.contains("worktree") && !config.contains("filter") && !config.contains("hunter2"), "{config}");
+        assert!(!dir2.join(".git/objects/info/alternates").exists());
+        // A folder opened where it is, with those settings: refused, plainly,
+        // and still nothing runs or is written.
+        let clone = base.join("clone");
+        records::copy_dir(&root, &clone).unwrap();
+        append(&clone.join("channels/intake/.git/config"), &hostile(&victim, &marker));
+        let e = crate::export::import_workspace(&b, &clone).unwrap_err();
+        assert!(e.contains("core.worktree") && e.contains("could make git write outside the folder"), "{e}");
+        // And in a folder gild already has: its channel stops, with that problem.
+        append(&dir2.join(".git/config"), &hostile(&victim, &marker));
+        assert!(b.check_outside(&intake2.id).unwrap_err().contains("core.worktree"));
+        assert!(b.save_doc(&intake2.id, DEMO_NAME, "docs/sop.md", "# x\n").is_err());
+        assert!(fs::read_dir(&victim).unwrap().next().is_none() && !marker.exists());
+        drop(b);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_export_carries_no_remote_or_credentials() {
+        let base = temp(line!());
+        let a = Store::open(&base.join("a")).unwrap();
+        let (root, _, _) = workspace(&a);
+        for d in [root.clone(), root.join("channels/intake")] {
+            append(&d.join(".git/config"), "[remote \"origin\"]\n\turl = https://user:hunter2@example.com/x.git\n[credential]\n\thelper = store\n");
+        }
+        let ws = a.workspaces().unwrap()[0].id.clone();
+        let out = crate::export::export_workspace(&a, &ws, &base.join("out"), "x").unwrap();
+        for d in [out.join("workspace"), out.join("workspace/channels/intake"), out.join("workspace/channels/quiet")] {
+            let config = fs::read_to_string(d.join(".git/config")).unwrap();
+            assert!(!config.contains("remote") && !config.contains("credential") && !config.contains("hunter2"), "{}: {config}", d.display());
+        }
+        drop(a);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_missing_folder_stays_missing_while_another_move_is_stuck() {
+        let base = temp(line!());
+        let data = base.join("data");
+        old_layout_with(&data, &[(C1, "general"), (C2, "student-intake"), (C3, "notes")], 3);
+        // #student-intake can't move (its objects are gone): stuck for good.
+        let objects = old(&data, C2).join("objects");
+        fs::remove_dir_all(&objects).unwrap();
+        fs::create_dir_all(&objects).unwrap();
+        let store = Store::open(&data).unwrap();
+        let root = store.workspace_folder(W1).unwrap();
+        assert!(store.doc(C3, "docs/sop.md").is_ok(), "#notes moved");
+        drop(store);
+        // #notes' folder goes missing: a problem, its index kept, never re-made.
+        let notes = root.join("channels/notes");
+        fs::rename(&notes, base.join("notes-away")).unwrap();
+        let store = Store::open(&data).unwrap();
+        assert!(store.folder_problems(C3).iter().any(|p| p.contains("is gone. Put it back")), "{:?}", store.folder_problems(C3));
+        assert_eq!(store.doc(C3, "docs/sop.md").unwrap().body, "# SOP\n\nRed.\n", "the index is kept");
+        assert!(!notes.exists(), "never made again empty");
+        drop(store);
+        // The whole workspace folder goes missing: the same.
+        fs::rename(&root, base.join("root-away")).unwrap();
+        let store = Store::open(&data).unwrap();
+        assert!(store.folder_problems(C1).iter().any(|p| p.contains("workspace's folder") && p.contains("is gone")), "{:?}", store.folder_problems(C1));
+        assert!(!root.exists(), "the workspace's folder is never made again");
+        assert_eq!(store.doc(C1, "docs/sop.md").unwrap().body, "# SOP\n\nRed.\n");
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_channel_gild_cant_read_doesnt_stop_gild() {
+        let base = temp(line!());
+        let data = base.join("a");
+        let store = Store::open(&data).unwrap();
+        let (root, general, intake) = workspace(&store);
+        drop(store);
+        // A pull brings in a broken view (committed with git, not through gild).
+        let dir = root.join("channels/intake");
+        records::commit(&dir, "someone", "Broken view", &[(records::VIEW_PATH.into(), b"{ nope".to_vec())]).unwrap();
+        let store = Store::open(&data).expect("gild starts");
+        assert!(store.folder_problems(&intake.id).iter().any(|p| p.contains("view.json")), "{:?}", store.folder_problems(&intake.id));
+        assert!(store.channel_data(&general.id).is_ok() && store.doc(&intake.id, "docs/sop.md").is_ok(), "the rest works");
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn changes_made_with_git_are_taken_in() {
+        let base = temp(line!());
+        let store = Store::open(&base.join("a")).unwrap();
+        let (root, _, intake) = workspace(&store);
+        let dir = root.join("channels/intake");
+        // A commit made with git while gild runs (a pull, say).
+        records::commit(&dir, "someone", "Pulled", &[("docs/sop.md".into(), b"# SOP\n\nPulled.\n".to_vec())]).unwrap();
+        // Saving over it before gild has looked: refused, and gild looks.
+        let e = store.save_doc(&intake.id, DEMO_NAME, "docs/sop.md", "# SOP\n\nStale.\n").unwrap_err();
+        assert!(e.contains("changed outside gild just now"), "{e}");
+        assert_eq!(store.doc(&intake.id, "docs/sop.md").unwrap().body, "# SOP\n\nPulled.\n");
+        // Another one, found by the scan.
+        records::commit(&dir, "someone", "Pulled again", &[("docs/sop.md".into(), b"# SOP\n\nAgain.\n".to_vec())]).unwrap();
+        assert!(store.check_outside(&intake.id).unwrap());
+        assert_eq!(store.doc(&intake.id, "docs/sop.md").unwrap().body, "# SOP\n\nAgain.\n");
+        drop(store);
         fs::remove_dir_all(base).unwrap();
     }
 

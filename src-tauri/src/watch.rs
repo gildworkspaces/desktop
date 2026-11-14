@@ -20,6 +20,19 @@ const QUIET: Duration = Duration::from_millis(400);
 /// The longest a run of changes waits, even if they keep coming.
 const AT_MOST: Duration = Duration::from_secs(3);
 
+fn inside_git(path: &std::path::Path) -> bool {
+    path.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// `.git/HEAD`, `.git/packed-refs`, or anything in `.git/refs/`.
+pub fn moves_history(path: &std::path::Path) -> bool {
+    let parts: Vec<_> = path.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    match parts.iter().rposition(|p| p == ".git") {
+        Some(i) => matches!(parts.get(i + 1).map(String::as_str), Some("HEAD" | "packed-refs" | "refs")),
+        None => false,
+    }
+}
+
 /// Told the id of each channel whose files or problems changed.
 pub type OnChange = Box<dyn Fn(&str) + Send + 'static>;
 
@@ -38,8 +51,10 @@ impl Watch {
                 return;
             }
             for path in event.paths {
-                // git's own bookkeeping (gild's commits write there too).
-                if !path.components().any(|c| c.as_os_str() == ".git") {
+                // Inside .git only what says the history moved (a pull,
+                // commit, reset or checkout made with git): HEAD and the refs.
+                // The rest (objects, the index gild writes) isn't news.
+                if !inside_git(&path) || moves_history(&path) {
                     let _ = tx.send(path);
                 }
             }
@@ -117,6 +132,39 @@ mod tests {
         let log = store.doc_history(&intake.id, "docs/from-elsewhere.md").unwrap();
         assert_eq!((log[0].author.as_str(), log[0].message.as_str()), (DEMO_NAME, "Edit outside gild: docs/from-elsewhere.md"));
         drop(store);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_commit_made_with_git_is_taken_in_while_gild_runs() {
+        let base = std::env::temp_dir().join(format!("gild-watch-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        let store = Store::open(&base.join("data")).unwrap();
+        let ws = store.create_workspace("W").unwrap();
+        let intake = store.create_channel(&ws.id, "intake", "").unwrap();
+        let dir = store.workspace_folder(&ws.id).unwrap().join("channels/intake");
+        let core = Arc::new(Mutex::new(store));
+        let (tx, rx) = mpsc::channel::<String>();
+        let tx = Mutex::new(tx);
+        let _watch = Watch::start(core.clone(), Box::new(move |c| { let _ = tx.lock().unwrap().send(c.to_string()); })).unwrap();
+        // A fetch-and-update made with git: only .git changes on disk (a new
+        // commit on the branch; no file in the folder is touched).
+        let repo = gix::open(&dir).unwrap();
+        let parent = repo.head_id().unwrap().detach();
+        let mut editor = repo.edit_tree(repo.head_tree_id().unwrap().detach()).unwrap();
+        let blob = repo.write_blob(b"# Pulled\n").unwrap();
+        editor.upsert("docs/pulled.md", gix::objs::tree::EntryKind::Blob, blob).unwrap();
+        let tree = editor.write().unwrap().detach();
+        let who = gix::actor::Signature { name: "someone".into(), email: "s@x".into(), time: gix::date::Time { seconds: 1, offset: 0 } };
+        let mut time = gix::date::parse::TimeBuf::default();
+        let branch = repo.head_name().unwrap().unwrap().as_bstr().to_string();
+        let who = who.to_ref(&mut time);
+        repo.commit_as(who, who, branch.as_str(), "Pulled", tree, [parent]).unwrap();
+        drop(repo);
+        let told = rx.recv_timeout(Duration::from_secs(20)).expect("the commit was noticed");
+        assert_eq!(told, intake.id);
+        assert_eq!(core.lock().unwrap().doc(&intake.id, "docs/pulled.md").unwrap().title, "Pulled");
         let _ = std::fs::remove_dir_all(base);
     }
 }

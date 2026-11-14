@@ -181,11 +181,87 @@ pub fn is_repo(dir: &Path) -> bool {
     dir.join(".git").exists() || (dir.join("HEAD").is_file() && dir.join("objects").is_dir())
 }
 
+/// Settings in a repository's own config that gild won't work with. In
+/// gitoxide 0.90, `core.worktree` moves where files are checked out and
+/// written (gix/src/open/repository.rs), and `filter.<driver>.clean`,
+/// `.smudge` and `.process` run commands through the shell during checkout
+/// and status (gix-filter, picked by `.gitattributes`). `include` and
+/// `includeIf` would pull settings in from other files. The rest run
+/// programs in git itself (hooks, fsmonitor, ssh, diff and merge drivers):
+/// refused too, so opening a folder in git after gild can't surprise anyone.
+fn unsafe_setting(git_dir: &Path) -> Result<Option<String>, String> {
+    for name in ["config", "config.worktree"] {
+        let path = git_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let file = gix::config::File::from_path_no_includes(path, gix::config::Source::Local).map_err(|e| err("reading the repository's git settings", e))?;
+        for s in file.sections() {
+            let section = s.header().name().to_string().to_ascii_lowercase();
+            let sub = s.header().subsection_name().map(|x| format!(".{x}")).unwrap_or_default();
+            for key in s.value_names() {
+                let key = key.to_ascii_lowercase();
+                let bad = matches!(section.as_str(), "filter" | "include" | "includeif")
+                    || (section == "core" && ["worktree", "fsmonitor", "hookspath", "sshcommand", "gitproxy", "askpass"].contains(&key.as_str()))
+                    || (section == "diff" && (key == "external" || key == "textconv"))
+                    || (section == "merge" && key == "driver");
+                if bad {
+                    return Ok(Some(format!("{section}{sub}.{key}")));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Open a repository the safe way: never with a `.git` that is a link or a
+/// pointer to another folder, never when its own config sets something in
+/// `unsafe_setting`, and with no settings from outside it (no global or
+/// system git config, no environment): a filter driver in someone's
+/// `~/.gitconfig` doesn't run either. Its files must be in `dir`.
 fn open(dir: &Path) -> Result<Option<gix::Repository>, String> {
     if !is_repo(dir) {
         return Ok(None);
     }
-    gix::open(dir).map(Some).map_err(|e| err("opening the channel's history", e))
+    let dot_git = dir.join(".git");
+    let git_dir = if std::fs::symlink_metadata(&dot_git).is_ok() {
+        if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
+            return Err(format!("{}'s .git isn't a folder (it's a link, or points to another folder), so gild won't use it.", dir.display()));
+        }
+        dot_git
+    } else {
+        dir.to_path_buf()
+    };
+    if git_dir.join("commondir").exists() {
+        return Err(format!("{} shares its history with another folder (a linked worktree), so gild won't use it.", dir.display()));
+    }
+    if let Some(key) = unsafe_setting(&git_dir)? {
+        return Err(format!(
+            "{}'s git settings set {key}, which could make git write outside the folder or run a program. gild won't use it until that setting is removed from .git/config.",
+            dir.display()
+        ));
+    }
+    let repo = gix::open_opts(dir, gix::open::Options::isolated()).map_err(|e| err("opening the channel's history", e))?;
+    if let Some(work) = repo.workdir() {
+        let same = matches!((work.canonicalize(), dir.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        if !same {
+            return Err(format!("{}'s git settings put its files somewhere else, so gild won't use it.", dir.display()));
+        }
+    }
+    Ok(Some(repo))
+}
+
+/// Whether gild will use the repository in `dir` (see `open`): Ok if there
+/// is none, or one that's safe.
+pub fn check(dir: &Path) -> Result<(), String> {
+    open(dir).map(|_| ())
+}
+
+/// Whether `git_dir` looks like a repository's history to copy (its HEAD and
+/// objects): nothing in it is opened or trusted.
+pub fn is_git_dir(git_dir: &Path) -> bool {
+    let real = |p: &Path, dir: bool| std::fs::symlink_metadata(p).is_ok_and(|m| if dir { m.is_dir() } else { m.is_file() });
+    real(git_dir, true) && real(&git_dir.join("HEAD"), false) && real(&git_dir.join("objects"), true)
 }
 
 /// Make `dir` a repository with its files checked out, if it isn't one.
@@ -199,8 +275,23 @@ fn open_or_init(dir: &Path) -> Result<gix::Repository, String> {
     }
     std::fs::create_dir_all(dir).map_err(|e| err("creating the channel's folder", e))?;
     gix::init(dir).map_err(|e| err("creating the channel's history", e))?;
-    own_config(&dir.join(".git"))?;
-    gix::open(dir).map_err(|e| err("opening the channel's history", e))
+    fresh_config(&dir.join(".git"))?;
+    open_existing(dir)
+}
+
+/// A repository gild made, moved or copied gets a config of its own,
+/// written from scratch: none of another repository's settings (remotes and
+/// their passwords, credential helpers, a worktree elsewhere, filters) come
+/// with a copy. The file system's details are probed, as `git init` does.
+fn fresh_config(git_dir: &Path) -> Result<(), String> {
+    let caps = gix::fs::Capabilities::probe(git_dir);
+    let text = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = {}\n\tlogallrefupdates = true\n\tignorecase = {}\n\tprecomposeunicode = {}\n",
+        caps.executable_bit, caps.ignore_case, caps.precompose_unicode
+    );
+    std::fs::write(git_dir.join("config"), text).map_err(|e| err("setting up the channel's history", e))?;
+    let _ = std::fs::remove_file(git_dir.join("config.worktree"));
+    own_config(git_dir)
 }
 
 /// An existing repository: gild never makes one where one is missing,
@@ -1043,20 +1134,43 @@ pub fn head_tree(dir: &Path) -> Result<Option<String>, String> {
 }
 
 /// A repository in `dir` with the history in `git_dir` (a bare repository,
-/// or another one's `.git`): copied, made gild's (see `own_config`), and
-/// HEAD's files checked out over whatever is there.
+/// or another one's `.git`), and HEAD's files checked out over whatever is
+/// there. Only the history is copied (objects, refs, packed-refs, HEAD):
+/// never another repository's config, hooks or `objects/info/alternates`
+/// (which would read objects from elsewhere on this computer). The copy
+/// gets a config of gild's own (`fresh_config`).
 pub fn copy_repo(git_dir: &Path, dir: &Path) -> Result<(), String> {
-    gix::open(git_dir).map_err(|e| err("opening the history to copy", e))?;
+    if !is_git_dir(git_dir) {
+        return Err(format!("{} isn't a git repository's history.", git_dir.display()));
+    }
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).map_err(|e| err("reading the history's HEAD", e))?;
+    let head = head.trim();
+    let named = head.strip_prefix("ref: ").is_some_and(branch_ok);
+    if !named && !(head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(format!("{}'s HEAD isn't a branch or a commit.", git_dir.display()));
+    }
     let target = dir.join(".git");
-    copy_dir(git_dir, &target)?;
-    own_config(&target)?;
+    for part in ["objects", "refs"] {
+        let from = git_dir.join(part);
+        if std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_dir()) {
+            copy_dir(&from, &target.join(part))?;
+        }
+    }
+    for f in ["objects/info/alternates", "objects/info/http-alternates"] {
+        let _ = std::fs::remove_file(target.join(f));
+    }
+    if std::fs::symlink_metadata(git_dir.join("packed-refs")).is_ok_and(|m| m.is_file()) {
+        std::fs::copy(git_dir.join("packed-refs"), target.join("packed-refs")).map_err(|e| err("copying history", e))?;
+    }
+    std::fs::write(target.join("HEAD"), format!("{head}\n")).map_err(|e| err("copying history", e))?;
+    fresh_config(&target)?;
     checkout_head(dir)
 }
 
 /// Write every file of HEAD's tree into the folder and make git's index
 /// match: what `git clone` does after it has the history.
 pub fn checkout_head(dir: &Path) -> Result<(), String> {
-    let repo = gix::open(dir).map_err(|e| err("opening the channel's history", e))?;
+    let repo = open_existing(dir)?;
     let Some(root) = repo.workdir().map(Path::to_path_buf) else { return Err("The channel's history has no folder to check out into.".into()) };
     let Some(id) = head(&repo) else { return Ok(()) };
     let mut index = repo.index_from_tree(&tree_of(&repo, id)?.id).map_err(|e| err("reading history", e))?;
