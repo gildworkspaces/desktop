@@ -25,7 +25,9 @@ everything after that is the design doc.
   database: it never goes in git. Data from 0.23 and earlier (a hidden
   repository per channel in the app's data folder) moves into these
   folders on the first launch, every commit, author, date and branch kept;
-  the old repositories are deleted only once the moved ones match.
+  each moved repository is checked object by object, and the old ones are
+  kept (not deleted) in the data folder's `migrated-0.24/`. A channel that
+  can't be moved keeps its old history and says why; gild still starts.
 - Inside a workspace: channels, with the top third of each channel kept for
   its view and the bottom two thirds for messages. **Expand view** flips the
   split.
