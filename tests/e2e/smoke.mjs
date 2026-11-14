@@ -272,7 +272,9 @@ try {
   assert.match(await bar.getAttribute('textContent'), /Controlled by @intake/)
   await driver.wait(until.elementLocated(By.xpath("//div[contains(@class,'fbody')]//p[contains(., 'top drawer')]")), 10000)
   await driver.findElement(By.xpath("//div[contains(@class,'controlbar')]//button[.='Take over']")).click()
-  await driver.wait(async () => (await driver.findElements(By.css('.controlbar'))).length === 0, 10000)
+  // WebKitGTK's driver can throw StaleElementReferenceError from findElements
+  // while the bar is being removed: that counts as "not gone yet", and it looks again.
+  await driver.wait(async () => (await driver.findElements(By.css('.controlbar')).catch(() => null))?.length === 0, 10000)
   const refusedEdit = await mcp({ jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'markdown_append', arguments: { channel_id: intakeId, path: doc.path, text: 'x' } } }, init.session)
   assert.equal(refusedEdit.json.result.isError, true)
   assert.match(refusedEdit.json.result.content[0].text, /took over the view/)
