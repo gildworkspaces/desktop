@@ -69,14 +69,23 @@ function Home({ me, onOpen }: { me: Me; onOpen: (w: Workspace) => void }) {
   const [list, setList] = useState<Workspace[] | null>(null)
   const [name, setName] = useState('')
   const [error, setError] = useState('')
+  // Where the new workspace's folder goes: ~/Gild unless you pick a place.
+  const [home, setHome] = useState('')
+  const [parent, setParent] = useState<string | null>(null)
 
   useEffect(() => { core.workspaces().then(setList, e => setError(errorText(e))) }, [])
+  useEffect(() => { core.defaultWorkspaceParent().then(setHome, () => setHome('')) }, [])
+
+  async function pickPlace() {
+    const folder = await openDialog({ directory: true, title: 'Where to keep the workspace’s folder' })
+    if (typeof folder === 'string') setParent(folder)
+  }
 
   async function create(e: React.FormEvent) {
     e.preventDefault()
     setError('')
     try {
-      const ws = await core.createWorkspace(name)
+      const ws = await core.createWorkspace(name, parent)
       setName('')
       onOpen(ws)
     } catch (err) { setError(errorText(err)) }
@@ -112,6 +121,11 @@ function Home({ me, onOpen }: { me: Me; onOpen: (w: Workspace) => void }) {
             <input id="new-workspace" className="field" placeholder="Name, e.g. Front Desk" value={name} onChange={e => setName(e.target.value)} />
             <button className="primary" disabled={!name.trim()}>Create workspace</button>
           </div>
+          <div className="place">
+            <span className="faint">Folder: <span className="mono">{(parent ?? home) || '~/Gild'}</span></span>
+            <button type="button" className="link" onClick={pickPlace}>Change…</button>
+            {parent && <button type="button" className="link" onClick={() => setParent(null)}>Use {home || '~/Gild'}</button>}
+          </div>
           {error && <p className="error">{error}</p>}
         </form>
       </div>
@@ -123,7 +137,7 @@ function Home({ me, onOpen }: { me: Me; onOpen: (w: Workspace) => void }) {
 function ImportWorkspace({ onImported }: { onImported: (w: Workspace) => void }) {
   const [state, setState] = useState<{ busy: boolean; error?: string }>({ busy: false })
   async function pick() {
-    const folder = await openDialog({ directory: true, title: 'Pick a folder Export workspace made' })
+    const folder = await openDialog({ directory: true, title: 'Pick a folder Export workspace made, or a workspace’s folder' })
     if (typeof folder !== 'string') return
     setState({ busy: true })
     try { onImported(await core.importWorkspace(folder)) } catch (e) { setState({ busy: false, error: errorText(e) }) }
@@ -131,7 +145,7 @@ function ImportWorkspace({ onImported }: { onImported: (w: Workspace) => void })
   return (
     <div className="importbox">
       <button className="ghost" onClick={pick} disabled={state.busy}>{state.busy ? 'Importing…' : 'Import a workspace'}</button>
-      <span className="faint" style={{ fontSize: 13 }}>From a folder Export workspace made: its channels, chat, tables, docs and full history come back.</span>
+      <span className="faint" style={{ fontSize: 13 }}>From a folder Export workspace made (its channels, chat, tables, docs and full history come back), or a workspace’s own folder, one with gild.json, which opens where it is.</span>
       {state.error && <p className="error" style={{ flexBasis: '100%', margin: 0 }}>{state.error}</p>}
     </div>
   )
@@ -155,10 +169,7 @@ function WorkspaceView({ me, workspace, onPlace, onBack }: {
       <nav className="side" aria-label="Channels">
         <div className="sidescroll">
           <button className="back" onClick={onBack}>← All workspaces</button>
-          <div className="wsname">
-            <div className="tile" style={{ background: tint(workspace.name) }} aria-hidden="true">{initial(workspace.name)}</div>
-            <span>{workspace.name}</span>
-          </div>
+          <WorkspaceMenu workspace={workspace} />
           <div className="group">
             <div className="grouphead"><span className="label">Channels</span><PlusButton label="Create a channel" onClick={() => setNaming(true)} /></div>
             {channels.map(c => (
@@ -189,6 +200,44 @@ function WorkspaceView({ me, workspace, onPlace, onBack }: {
           }}
           onClose={() => setNaming(false)}
         />
+      )}
+    </div>
+  )
+}
+
+/** The workspace's name; it opens a menu with its folder, which opens in
+ *  Finder, Explorer or the file manager. */
+function WorkspaceMenu({ workspace }: { workspace: Workspace }) {
+  const [open, setOpen] = useState(false)
+  const [folder, setFolder] = useState<{ path: string; show: string } | null>(null)
+  const [error, setError] = useState('')
+  const box = useRef<HTMLDivElement>(null)
+  useEffect(() => { core.workspaceFolder(workspace.id).then(setFolder, e => setError(errorText(e))) }, [workspace.id])
+  useEffect(() => {
+    if (!open) return
+    const away = (e: MouseEvent) => { if (box.current && !box.current.contains(e.target as Node)) setOpen(false) }
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', away)
+    document.addEventListener('keydown', esc)
+    return () => { document.removeEventListener('mousedown', away); document.removeEventListener('keydown', esc) }
+  }, [open])
+  async function show() {
+    setError('')
+    try { await core.showWorkspaceFolder(workspace.id); setOpen(false) } catch (e) { setError(errorText(e)) }
+  }
+  return (
+    <div className="wsmenu" ref={box}>
+      <button className="wsname" onClick={() => setOpen(o => !o)} aria-expanded={open} aria-haspopup="menu">
+        <div className="tile" style={{ background: tint(workspace.name) }} aria-hidden="true">{initial(workspace.name)}</div>
+        <span>{workspace.name}</span>
+      </button>
+      {open && (
+        <div className="smenu wsitems" role="menu" aria-label={workspace.name}>
+          <button role="menuitem" onClick={show} disabled={!folder}>
+            <span className="stext">{folder?.show ?? 'Show the folder'}<span className="mono" title={folder?.path}>{folder?.path}</span></span>
+          </button>
+          {error && <p className="error" style={{ margin: '4px 10px' }}>{error}</p>}
+        </div>
       )}
     </div>
   )
@@ -229,6 +278,9 @@ function ChannelView({ channel }: { channel: Channel }) {
   const refresh = () => setVersion(v => v + 1)
   useEffect(() => { core.messages(channel.id).then(setMessages, e => setError(errorText(e))) }, [channel.id, version])
   useEffect(() => { core.channelDocs(channel.id).then(setDocs, e => setError(errorText(e))) }, [channel.id, version])
+  // Files in the channel's folder gild couldn't take in (a broken .gild file).
+  const [problems, setProblems] = useState<string[]>([])
+  useEffect(() => { core.folderProblems(channel.id).then(setProblems, () => setProblems([])) }, [channel.id, version])
   // A channel with docs and no table opens on its docs.
   useEffect(() => { if (!chosen && count === null && docs && (docs.docs.length > 0 || docs.proposals.length > 0)) setMode('docs') }, [chosen, count, docs])
   const show = (m: 'table' | 'board' | 'docs' | 'files') => { setChosen(true); setMode(m) }
@@ -269,6 +321,7 @@ function ChannelView({ channel }: { channel: Channel }) {
         <button className="ghost" onClick={() => { setThreadId(null); setPanel(p => (p === 'activity' ? null : 'activity')) }}>Activity</button>
         <button className="ghost" onClick={() => setExpanded(x => !x)}>{expanded ? 'Collapse view' : 'Expand view'}</button>
       </header>
+      {problems.map(p => <p key={p} className="error folderproblem" role="alert">{p}</p>)}
       <section className="viewpane" aria-label="Channel view" style={{ flex: `${expanded ? 2 : 1} 1 0` }}>
         {mode === 'files'
           ? <FilesPane channelId={channel.id} onEditing={() => setExpanded(true)} />

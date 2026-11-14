@@ -1,6 +1,7 @@
 //! A channel's data: its view and its records, kept in a git repository per
-//! channel (`<data>/channels/<channel id>.git`, bare). Git is the truth; the
-//! SQLite tables in `store.rs` are an index rebuilt from it.
+//! channel, an ordinary one with its files checked out, in the workspace's
+//! folder (see `store/folders.rs`). Git is the truth; the SQLite tables in
+//! `store.rs` are an index rebuilt from it.
 //!
 //! In the repository:
 //!   .gild/acl.json              who besides the workspace's people may use
@@ -15,9 +16,12 @@
 //! approves it (a merge commit) or rejects it (the branch moves to
 //! `refs/gild/rejected/<id>`, so what was proposed stays in the history).
 //!
-//! Every change is one commit, written by the person who made it. Pure Rust
-//! (gitoxide): no C and no `git` binary needed.
+//! Every change is one commit, written by the person who made it, and the
+//! files on disk and git's index match that commit after every write. Files
+//! changed outside gild are committed as the person (`check_outside`). Pure
+//! Rust (gitoxide): no C and no `git` binary needed.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::BString;
@@ -141,6 +145,12 @@ pub fn diff(before: &str, after: &str) -> Vec<DiffLine> {
 }
 
 pub const DOCS_DIR: &str = "docs";
+/// The workspace file at the root of a workspace's main repository.
+pub const MANIFEST: &str = "gild.json";
+const HIDDEN_MANIFEST: &str = MANIFEST;
+/// Where the other channels' repositories are, in the main repository's
+/// folder (which ignores it).
+pub const CHANNELS_DIR: &str = "channels";
 const PROPOSALS: &str = "refs/heads/proposals/";
 const REJECTED: &str = "refs/gild/rejected/";
 
@@ -157,21 +167,76 @@ fn err(context: &str, e: impl std::fmt::Display) -> String {
     format!("{context}: {e}")
 }
 
-pub fn repo_path(data: &Path, channel_id: &str) -> PathBuf {
-    data.join("channels").join(format!("{channel_id}.git"))
-}
-
 pub fn record_path(id: &str) -> String {
     format!("{RECORDS_DIR}/{id}.json")
 }
 
-fn open_or_init(path: &Path) -> Result<gix::Repository, String> {
-    if path.exists() {
-        gix::open(path).map_err(|e| err("opening the channel's history", e))
-    } else {
-        std::fs::create_dir_all(path).map_err(|e| err("creating the channel's history", e))?;
-        gix::init_bare(path).map_err(|e| err("creating the channel's history", e))
+/// Files gild never takes into a channel's history: what file managers
+/// leave in every folder they show. Kept in each repository's
+/// `.git/info/exclude`, so git ignores them too without a commit.
+const JUNK: &str = ".DS_Store\nThumbs.db\ndesktop.ini\n";
+
+/// Whether `dir` holds a repository (with files, or bare).
+pub fn is_repo(dir: &Path) -> bool {
+    dir.join(".git").exists() || (dir.join("HEAD").is_file() && dir.join("objects").is_dir())
+}
+
+fn open(dir: &Path) -> Result<Option<gix::Repository>, String> {
+    if !is_repo(dir) {
+        return Ok(None);
     }
+    gix::open(dir).map(Some).map_err(|e| err("opening the channel's history", e))
+}
+
+/// Make `dir` a repository with its files checked out, if it isn't one.
+pub fn init(dir: &Path) -> Result<(), String> {
+    open_or_init(dir).map(|_| ())
+}
+
+fn open_or_init(dir: &Path) -> Result<gix::Repository, String> {
+    if let Some(repo) = open(dir)? {
+        return Ok(repo);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| err("creating the channel's folder", e))?;
+    gix::init(dir).map_err(|e| err("creating the channel's history", e))?;
+    own_config(&dir.join(".git"))?;
+    gix::open(dir).map_err(|e| err("opening the channel's history", e))
+}
+
+/// Settings for a repository gild made or moved: it has files (not bare),
+/// its files are written byte for byte (no line-ending changes, whatever
+/// the computer's git is set to), and file managers' junk is ignored.
+fn own_config(git_dir: &Path) -> Result<(), String> {
+    let path = git_dir.join("config");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "[core]\n".into());
+    let mut out = String::new();
+    let mut core = false;
+    for line in text.lines() {
+        let key = line.trim().split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        if line.trim().starts_with('[') {
+            core = line.trim().eq_ignore_ascii_case("[core]");
+        } else if core && (key == "bare" || key == "autocrlf") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if core && line.trim().eq_ignore_ascii_case("[core]") {
+            out.push_str("\tbare = false\n\tautocrlf = false\n");
+        }
+    }
+    if !text.lines().any(|l| l.trim().eq_ignore_ascii_case("[core]")) {
+        out.push_str("[core]\n\tbare = false\n\tautocrlf = false\n");
+    }
+    std::fs::write(&path, out).map_err(|e| err("setting up the channel's history", e))?;
+    let info = git_dir.join("info");
+    std::fs::create_dir_all(&info).map_err(|e| err("setting up the channel's history", e))?;
+    let exclude = info.join("exclude");
+    let had = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !had.contains(".DS_Store") {
+        std::fs::write(&exclude, format!("{had}{}{JUNK}", if had.is_empty() || had.ends_with('\n') { "" } else { "\n" }))
+            .map_err(|e| err("setting up the channel's history", e))?;
+    }
+    Ok(())
 }
 
 fn head(repo: &gix::Repository) -> Option<ObjectId> {
@@ -179,34 +244,91 @@ fn head(repo: &gix::Repository) -> Option<ObjectId> {
 }
 
 /// The commit a channel's repository is at, if it has one.
-pub fn head_commit(data: &Path, channel_id: &str) -> Result<Option<String>, String> {
-    let path = repo_path(data, channel_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+pub fn head_commit(dir: &Path) -> Result<Option<String>, String> {
+    let Some(repo) = open(dir)? else { return Ok(None) };
     Ok(head(&repo).map(|id| id.to_string()))
 }
 
 /// Write `files` (path → bytes) as one commit by `author`, and return its id.
-pub fn commit(data: &Path, channel_id: &str, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<String, String> {
-    let repo = open_or_init(&repo_path(data, channel_id))?;
+pub fn commit(dir: &Path, author: &str, message: &str, files: &[(String, Vec<u8>)]) -> Result<String, String> {
+    let repo = open_or_init(dir)?;
+    let changes: Vec<(String, Option<Vec<u8>>)> = files.iter().map(|(p, b)| (p.clone(), Some(b.clone()))).collect();
+    let fresh = put_files(&repo, &changes)?;
     let parent = head(&repo);
-    let id = commit_on(&repo, "HEAD", parent, parent.into_iter().collect(), files, author, message)?;
+    let id = commit_on(&repo, "HEAD", parent, parent.into_iter().collect(), &changes, author, message)?;
+    sync_index(&repo, id, &fresh)?;
     Ok(id.to_string())
 }
 
-/// One commit: `base`'s tree with `files` written over it, with `parents`,
-/// moving `reference` to it.
-fn commit_on(
-    repo: &gix::Repository,
-    reference: &str,
-    base: Option<ObjectId>,
-    parents: Vec<ObjectId>,
-    files: &[(String, Vec<u8>)],
-    author: &str,
-    message: &str,
-) -> Result<ObjectId, String> {
+/// A path gild writes: relative, `/`-separated, and never into `.git`.
+fn disk_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let mut out = root.to_path_buf();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.eq_ignore_ascii_case(".git") || part.contains('\\') {
+            return Err(format!("{path} isn't a path gild writes."));
+        }
+        out.push(part);
+    }
+    Ok(out)
+}
+
+fn stat_of(path: &Path) -> Result<gix::index::entry::Stat, String> {
+    let meta = gix::index::fs::Metadata::from_path_no_follow(path).map_err(|e| err("reading a file's details", e))?;
+    gix::index::entry::Stat::from_fs(&meta).map_err(|e| err("reading a file's details", e))
+}
+
+/// Write the changes into the repository's folder (none for a bare one),
+/// and return each written file's details as they are now.
+fn put_files(repo: &gix::Repository, changes: &[(String, Option<Vec<u8>>)]) -> Result<HashMap<String, gix::index::entry::Stat>, String> {
+    let mut fresh = HashMap::new();
+    let Some(root) = repo.workdir() else { return Ok(fresh) };
+    for (path, bytes) in changes {
+        let file = disk_path(root, path)?;
+        match bytes {
+            Some(bytes) => {
+                if let Some(dir) = file.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| err(&format!("writing {path}"), e))?;
+                }
+                std::fs::write(&file, bytes).map_err(|e| err(&format!("writing {path}"), e))?;
+                fresh.insert(path.clone(), stat_of(&file)?);
+            }
+            None => {
+                if file.exists() {
+                    std::fs::remove_file(&file).map_err(|e| err(&format!("removing {path}"), e))?;
+                }
+            }
+        }
+    }
+    Ok(fresh)
+}
+
+/// Make git's index the tree of `commit`. A file's details (size, times)
+/// come from `fresh` when gild just wrote or read it, else from the old
+/// index if the file didn't change; otherwise they're left empty, so git
+/// compares that file's bytes the next time it looks.
+fn sync_index(repo: &gix::Repository, commit: ObjectId, fresh: &HashMap<String, gix::index::entry::Stat>) -> Result<(), String> {
+    if repo.workdir().is_none() {
+        return Ok(());
+    }
+    let tree = tree_of(repo, commit)?.id;
+    let mut index = repo.index_from_tree(&tree).map_err(|e| err("updating git's index", e))?;
+    let old = repo.open_index().ok();
+    for (entry, path) in index.entries_mut_with_paths() {
+        let key = path.to_string();
+        if let Some(stat) = fresh.get(&key) {
+            entry.stat = *stat;
+        } else if let Some(o) = old.as_ref().and_then(|o| o.entry_by_path(path)) {
+            if o.id == entry.id && o.mode == entry.mode {
+                entry.stat = o.stat;
+            }
+        }
+    }
+    index.write(Default::default()).map_err(|e| err("updating git's index", e))?;
+    Ok(())
+}
+
+/// The tree of `base` with `changes` (path → new bytes, or None: removed).
+fn tree_with(repo: &gix::Repository, base: Option<ObjectId>, changes: &[(String, Option<Vec<u8>>)]) -> Result<ObjectId, String> {
     let base = match base {
         Some(id) => repo
             .find_commit(id)
@@ -216,11 +338,36 @@ fn commit_on(
         None => repo.empty_tree().id,
     };
     let mut editor = repo.edit_tree(base).map_err(|e| err("preparing the change", e))?;
-    for (path, bytes) in files {
-        let blob = repo.write_blob(bytes).map_err(|e| err("writing a file", e))?;
-        editor.upsert(path.as_str(), EntryKind::Blob, blob).map_err(|e| err("adding a file", e))?;
+    for (path, bytes) in changes {
+        match bytes {
+            Some(bytes) => {
+                let blob = repo.write_blob(bytes).map_err(|e| err("writing a file", e))?;
+                editor.upsert(path.as_str(), EntryKind::Blob, blob).map_err(|e| err("adding a file", e))?;
+            }
+            None => {
+                editor.remove(path.as_str()).map_err(|e| err("removing a file", e))?;
+            }
+        }
     }
-    let tree = editor.write().map_err(|e| err("writing the change", e))?;
+    Ok(editor.write().map_err(|e| err("writing the change", e))?.detach())
+}
+
+/// One commit: `base`'s tree with `changes` written over it, with
+/// `parents`, moving `reference` to it.
+fn commit_on(
+    repo: &gix::Repository,
+    reference: &str,
+    base: Option<ObjectId>,
+    parents: Vec<ObjectId>,
+    changes: &[(String, Option<Vec<u8>>)],
+    author: &str,
+    message: &str,
+) -> Result<ObjectId, String> {
+    let tree = tree_with(repo, base, changes)?;
+    commit_tree(repo, reference, tree, parents, author, message)
+}
+
+fn commit_tree(repo: &gix::Repository, reference: &str, tree: ObjectId, parents: Vec<ObjectId>, author: &str, message: &str) -> Result<ObjectId, String> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -248,13 +395,9 @@ fn blob_text(repo: &gix::Repository, tree: &gix::Tree<'_>, path: &str) -> Result
 
 /// Everything at the repository's current commit: the source the index is
 /// built from.
-pub fn snapshot(data: &Path, channel_id: &str) -> Result<Snapshot, String> {
+pub fn snapshot(dir: &Path) -> Result<Snapshot, String> {
     let empty = || Snapshot { commit: None, acl: Acl::default(), view: None, records: vec![], docs: vec![] };
-    let path = repo_path(data, channel_id);
-    if !path.exists() {
-        return Ok(empty());
-    }
-    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+    let Some(repo) = open(dir)? else { return Ok(empty()) };
     let Some(id) = head(&repo) else {
         return Ok(empty());
     };
@@ -321,13 +464,10 @@ pub struct FileEntry {
 }
 
 /// Every file at the repository's current commit, by path, except gild's own
-/// `.gild/` folder (the table's records, access, the view's settings).
-pub fn files(data: &Path, channel_id: &str) -> Result<Vec<FileEntry>, String> {
-    let path = repo_path(data, channel_id);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+/// `.gild/` folder (the table's records, access, the view's settings) and,
+/// in a workspace's main repository, `gild.json` and `.gitignore`.
+pub fn files(dir: &Path) -> Result<Vec<FileEntry>, String> {
+    let Some(repo) = open(dir)? else { return Ok(Vec::new()) };
     let Some(id) = head(&repo) else { return Ok(Vec::new()) };
     let tree = tree_of(&repo, id)?;
     let mut out = Vec::new();
@@ -340,7 +480,7 @@ fn walk(repo: &gix::Repository, tree: &gix::Tree<'_>, prefix: &str, out: &mut Ve
     for entry in tree.iter() {
         let entry = entry.map_err(|e| err("reading the files", e))?;
         let name = entry.filename().to_string();
-        if prefix.is_empty() && name == ".gild" {
+        if prefix.is_empty() && [".gild", HIDDEN_MANIFEST, ".gitignore"].contains(&name.as_str()) {
             continue;
         }
         let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
@@ -356,12 +496,8 @@ fn walk(repo: &gix::Repository, tree: &gix::Tree<'_>, prefix: &str, out: &mut Ve
 }
 
 /// A file's bytes at the repository's current commit (None: no such file).
-pub fn read_file(data: &Path, channel_id: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
-    let repo_dir = repo_path(data, channel_id);
-    if !repo_dir.exists() {
-        return Ok(None);
-    }
-    let repo = gix::open(&repo_dir).map_err(|e| err("opening the channel's history", e))?;
+pub fn read_file(dir: &Path, path: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(repo) = open(dir)? else { return Ok(None) };
     let Some(id) = head(&repo) else { return Ok(None) };
     let tree = tree_of(&repo, id)?;
     let bytes = blob_text(&repo, &tree, path)?;
@@ -386,10 +522,10 @@ fn text_of(repo: &gix::Repository, blob: Option<ObjectId>) -> Result<Option<Stri
 
 /// Put `body` at `path` on a new branch `proposals/<id>`, on top of the
 /// channel's current history. The channel's docs don't change.
-pub fn propose(data: &Path, channel_id: &str, id: &str, author: &str, message: &str, path: &str, body: &[u8]) -> Result<(), String> {
-    let repo = open_or_init(&repo_path(data, channel_id))?;
+pub fn propose(dir: &Path, id: &str, author: &str, message: &str, path: &str, body: &[u8]) -> Result<(), String> {
+    let repo = open_or_init(dir)?;
     let base = head(&repo).ok_or("This channel has no history to propose a change to.")?;
-    let files = [(path.to_string(), body.to_vec())];
+    let files = [(path.to_string(), Some(body.to_vec()))];
     commit_on(&repo, &format!("{PROPOSALS}{id}"), Some(base), vec![base], &files, author, message)?;
     Ok(())
 }
@@ -417,12 +553,8 @@ fn proposal_parts(repo: &gix::Repository, id: &str) -> Result<(ObjectId, ObjectI
 }
 
 /// Every open proposal, oldest first.
-pub fn proposals(data: &Path, channel_id: &str) -> Result<Vec<RawProposal>, String> {
-    let path = repo_path(data, channel_id);
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let repo = gix::open(&path).map_err(|e| err("opening the channel's history", e))?;
+pub fn proposals(dir: &Path) -> Result<Vec<RawProposal>, String> {
+    let Some(repo) = open(dir)? else { return Ok(vec![]) };
     let current = head(&repo);
     let mut ids = Vec::new();
     let platform = repo.references().map_err(|e| err("reading proposals", e))?;
@@ -456,22 +588,25 @@ pub fn proposals(data: &Path, channel_id: &str) -> Result<Vec<RawProposal>, Stri
 /// Take a proposal into the channel's history as a merge commit by
 /// `author`: the doc becomes what the agent proposed, and both the agent's
 /// commit and the approval stay in the history.
-pub fn approve(data: &Path, channel_id: &str, id: &str, author: &str, message: &str) -> Result<(), String> {
-    let repo = gix::open(repo_path(data, channel_id)).map_err(|e| err("opening the channel's history", e))?;
+pub fn approve(dir: &Path, id: &str, author: &str, message: &str) -> Result<(), String> {
+    let repo = open(dir)?.ok_or("This channel has no history.")?;
     let (commit, parent, path) = proposal_parts(&repo, id)?;
     let current = head(&repo).ok_or("This channel has no history.")?;
     if blob_at(&repo, Some(parent), &path)? != blob_at(&repo, Some(current), &path)? {
         return Err("The doc changed after this was proposed. Reject it and ask for a fresh proposal.".into());
     }
     let body = text_of(&repo, blob_at(&repo, Some(commit), &path)?)?.unwrap_or_default();
-    commit_on(&repo, "HEAD", Some(current), vec![current, commit], &[(path, body.into_bytes())], author, message)?;
+    let changes = [(path, Some(body.into_bytes()))];
+    let fresh = put_files(&repo, &changes)?;
+    let merged = commit_on(&repo, "HEAD", Some(current), vec![current, commit], &changes, author, message)?;
+    sync_index(&repo, merged, &fresh)?;
     delete_proposal(&repo, id)
 }
 
 /// Close a proposal without taking it. Its commit stays reachable from
 /// `refs/gild/rejected/<id>`, so the history keeps what was proposed.
-pub fn reject(data: &Path, channel_id: &str, id: &str) -> Result<(), String> {
-    let repo = gix::open(repo_path(data, channel_id)).map_err(|e| err("opening the channel's history", e))?;
+pub fn reject(dir: &Path, id: &str) -> Result<(), String> {
+    let repo = open(dir)?.ok_or("This channel has no history.")?;
     let (commit, _, _) = proposal_parts(&repo, id)?;
     repo.reference(format!("{REJECTED}{id}").as_str(), commit, gix::refs::transaction::PreviousValue::MustNotExist, "rejected")
         .map_err(|e| err("keeping the rejected proposal", e))?;
@@ -487,12 +622,8 @@ fn delete_proposal(repo: &gix::Repository, id: &str) -> Result<(), String> {
 
 /// The commits that changed `path`, newest first, following the first parent
 /// (a channel's history is a line: one writer).
-pub fn history(data: &Path, channel_id: &str, path: &str) -> Result<Vec<Change>, String> {
-    let repo_dir = repo_path(data, channel_id);
-    if !repo_dir.exists() {
-        return Ok(vec![]);
-    }
-    let repo = gix::open(&repo_dir).map_err(|e| err("opening the channel's history", e))?;
+pub fn history(dir: &Path, path: &str) -> Result<Vec<Change>, String> {
+    let Some(repo) = open(dir)? else { return Ok(vec![]) };
     let blob_at = |id: ObjectId| -> Result<Option<ObjectId>, String> {
         let tree = repo.find_commit(id).and_then(|c| c.tree()).map_err(|e| err("reading history", e))?;
         Ok(tree.lookup_entry_by_path(path).map_err(|e| err("reading history", e))?.map(|e| e.object_id()))
@@ -520,4 +651,286 @@ pub fn history(data: &Path, channel_id: &str, path: &str) -> Result<Vec<Change>,
         next = parent;
     }
     Ok(out)
+}
+
+/// How a file in a channel's folder differs from its last commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Edit {
+    Changed,
+    Added,
+    Removed,
+}
+
+/// What differs between a repository's folder and git's index, as git sees
+/// it (`.gitignore` and `.git/info/exclude` apply). In a workspace's main
+/// repository the other channels' folders aren't its files.
+fn folder_edits(repo: &gix::Repository, main: bool) -> Result<Vec<(String, Edit)>, String> {
+    use gix::status::index_worktree::Item;
+    use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+    let mut out = Vec::new();
+    if repo.workdir().is_none() {
+        return Ok(out);
+    }
+    let platform = repo
+        .status(gix::progress::Discard)
+        .map_err(|e| err("looking at the channel's folder", e))?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .index_worktree_rewrites(None);
+    for item in platform.into_index_worktree_iter(Vec::new()).map_err(|e| err("looking at the channel's folder", e))? {
+        let item = item.map_err(|e| err("looking at the channel's folder", e))?;
+        let (path, edit) = match &item {
+            Item::Modification { rela_path, status, .. } => match status {
+                EntryStatus::Change(Change::Removed) => (rela_path.to_string(), Edit::Removed),
+                EntryStatus::Change(_) => (rela_path.to_string(), Edit::Changed),
+                _ => continue,
+            },
+            Item::DirectoryContents { entry, .. } => {
+                if entry.status != gix::dir::entry::Status::Untracked || entry.disk_kind == Some(gix::dir::entry::Kind::Repository) {
+                    continue;
+                }
+                (entry.rela_path.to_string(), Edit::Added)
+            }
+            Item::Rewrite { .. } => continue,
+        };
+        if main && (path == CHANNELS_DIR || path.starts_with(&format!("{CHANNELS_DIR}/"))) {
+            continue;
+        }
+        out.push((path, edit));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Everything in a repository that doesn't match its last commit: files on
+/// disk that differ from git's index, and index entries that differ from
+/// HEAD. Empty means `git status` is clean.
+pub fn status(dir: &Path, main: bool) -> Result<Vec<String>, String> {
+    let Some(repo) = open(dir)? else { return Ok(vec![]) };
+    let mut out: Vec<String> = folder_edits(&repo, main)?.into_iter().map(|(p, e)| format!("{e:?}: {p}")).collect();
+    if repo.workdir().is_some() {
+        let index = repo.index_or_empty().map_err(|e| err("reading git's index", e))?;
+        let want = match head(&repo) {
+            Some(id) => repo.index_from_tree(&tree_of(&repo, id)?.id).map_err(|e| err("reading history", e))?,
+            None => gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path()),
+        };
+        let entries = |f: &gix::index::State| -> BTreeMap<String, (ObjectId, u32)> {
+            f.entries_with_paths_by_filter_map(|_, e| Some((e.id, e.mode.bits()))).map(|(p, v)| (p.to_string(), v)).collect()
+        };
+        let (have, want) = (entries(&index), entries(&want));
+        for (path, v) in &want {
+            if have.get(path) != Some(v) {
+                out.push(format!("Not in the index: {path}"));
+            }
+        }
+        out.extend(have.keys().filter(|p| !want.contains_key(*p)).map(|p| format!("Only in the index: {p}")));
+    }
+    Ok(out)
+}
+
+/// gild's own files must parse: a broken one is never committed.
+fn check_gild_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let parsed = if path == ACL_PATH {
+        serde_json::from_slice::<Acl>(bytes).map(|_| ())
+    } else if path == VIEW_PATH {
+        serde_json::from_slice::<View>(bytes).map(|_| ())
+    } else if path.starts_with(&format!("{RECORDS_DIR}/")) && path.ends_with(".json") {
+        serde_json::from_slice::<Record>(bytes).map(|_| ())
+    } else if path == MANIFEST {
+        serde_json::from_slice::<serde_json::Value>(bytes).map(|_| ())
+    } else {
+        return Ok(());
+    };
+    parsed.map_err(|e| e.to_string())
+}
+
+/// What `check_outside` did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Outside {
+    /// The commit it made, if any.
+    pub commit: Option<String>,
+    pub paths: Vec<String>,
+    /// Files it left as they are, and why, in plain words.
+    pub problems: Vec<String>,
+}
+
+/// Commit what changed in the channel's folder outside gild (another
+/// editor, a file copied in) as one commit by `author`. A broken gild file
+/// (`.gild/*.json`) and links are left out and named in `problems`.
+pub fn check_outside(dir: &Path, author: &str, main: bool) -> Result<Outside, String> {
+    let mut out = Outside::default();
+    let Some(repo) = open(dir)? else { return Ok(out) };
+    let Some(root) = repo.workdir().map(Path::to_path_buf) else { return Ok(out) };
+    let edits = folder_edits(&repo, main)?;
+    if edits.is_empty() {
+        return Ok(out);
+    }
+    let mut changes = Vec::new();
+    let mut fresh = HashMap::new();
+    for (path, edit) in edits {
+        let Ok(file) = disk_path(&root, &path) else { continue };
+        if edit == Edit::Removed {
+            changes.push((path, None));
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&file) else { continue };
+        if meta.file_type().is_symlink() {
+            out.problems.push(format!("{path} is a link: gild keeps files, not links, so it left it out."));
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        // The details before the bytes: a change while reading shows next time.
+        let stat = stat_of(&file)?;
+        let bytes = std::fs::read(&file).map_err(|e| err(&format!("reading {path}"), e))?;
+        if let Err(e) = check_gild_file(&path, &bytes) {
+            out.problems.push(format!("{path} isn't valid ({e}), so gild left it as it is. Fix it or undo the change."));
+            continue;
+        }
+        fresh.insert(path.clone(), stat);
+        changes.push((path, Some(bytes)));
+    }
+    if changes.is_empty() {
+        return Ok(out);
+    }
+    let parent = head(&repo);
+    let tree = tree_with(&repo, parent, &changes)?;
+    let base = match parent {
+        Some(p) => Some(tree_of(&repo, p)?.id),
+        None => None,
+    };
+    if base == Some(tree) {
+        // The files are what the last commit says (an index that fell
+        // behind): nothing to commit, only the index to bring up to date.
+        if let Some(p) = parent {
+            sync_index(&repo, p, &fresh)?;
+        }
+        return Ok(out);
+    }
+    out.paths = changes.iter().map(|(p, _)| p.clone()).collect();
+    let named: Vec<&str> = out.paths.iter().take(5).map(String::as_str).collect();
+    let more = out.paths.len().saturating_sub(named.len());
+    let message = format!("Edit outside gild: {}{}", named.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() });
+    let id = commit_tree(&repo, "HEAD", tree, parent.into_iter().collect(), author, &message)?;
+    sync_index(&repo, id, &fresh)?;
+    out.commit = Some(id.to_string());
+    Ok(out)
+}
+
+/// Copy a folder. Symbolic links are skipped, never followed: a folder
+/// someone hands you can't pull other files from your computer in.
+pub fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| err("copying history", e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| err("copying history", e))? {
+        let entry = entry.map_err(|e| err("copying history", e))?;
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| err("copying history", e))?;
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            // Copying again over an earlier copy (a move that stopped
+            // halfway): git's objects are read-only and never change, so
+            // what's already there and the same stays; anything else is
+            // replaced.
+            if target.exists() {
+                if std::fs::read(&target).ok() == std::fs::read(entry.path()).ok() {
+                    continue;
+                }
+                std::fs::remove_file(&target).map_err(|e| err("copying history", e))?;
+            }
+            std::fs::copy(entry.path(), &target).map_err(|e| err("copying history", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every ref and where it points (HEAD as the branch it names), sorted.
+pub fn refs(dir: &Path) -> Result<Vec<(String, String)>, String> {
+    let Some(repo) = open(dir)? else { return Ok(vec![]) };
+    let mut out = Vec::new();
+    let platform = repo.references().map_err(|e| err("reading refs", e))?;
+    for r in platform.all().map_err(|e| err("reading refs", e))? {
+        let r = r.map_err(|e| err("reading refs", e))?;
+        let to = match r.target() {
+            gix::refs::TargetRef::Object(id) => id.to_string(),
+            gix::refs::TargetRef::Symbolic(name) => format!("ref: {}", name.as_bstr()),
+        };
+        out.push((r.name().as_bstr().to_string(), to));
+    }
+    let head = repo.head_name().map_err(|e| err("reading HEAD", e))?.map(|n| n.as_bstr().to_string());
+    out.push(("HEAD".into(), head.map(|n| format!("ref: {n}")).unwrap_or_else(|| self::head(&repo).map(|i| i.to_string()).unwrap_or_default())));
+    out.sort();
+    Ok(out)
+}
+
+/// The tree HEAD's commit has, if there is one.
+pub fn head_tree(dir: &Path) -> Result<Option<String>, String> {
+    let Some(repo) = open(dir)? else { return Ok(None) };
+    match head(&repo) {
+        Some(id) => Ok(Some(tree_of(&repo, id)?.id.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// A repository in `dir` with the history in `git_dir` (a bare repository,
+/// or another one's `.git`): copied, made gild's (see `own_config`), and
+/// HEAD's files checked out over whatever is there.
+pub fn copy_repo(git_dir: &Path, dir: &Path) -> Result<(), String> {
+    gix::open(git_dir).map_err(|e| err("opening the history to copy", e))?;
+    let target = dir.join(".git");
+    copy_dir(git_dir, &target)?;
+    own_config(&target)?;
+    checkout_head(dir)
+}
+
+/// Write every file of HEAD's tree into the folder and make git's index
+/// match: what `git clone` does after it has the history.
+pub fn checkout_head(dir: &Path) -> Result<(), String> {
+    let repo = gix::open(dir).map_err(|e| err("opening the channel's history", e))?;
+    let Some(root) = repo.workdir().map(Path::to_path_buf) else { return Err("The channel's history has no folder to check out into.".into()) };
+    let Some(id) = head(&repo) else { return Ok(()) };
+    let mut index = repo.index_from_tree(&tree_of(&repo, id)?.id).map_err(|e| err("reading history", e))?;
+    let mut options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| err("checking out the channel's files", e))?;
+    options.destination_is_initially_empty = false;
+    options.overwrite_existing = true;
+    let objects = repo.objects.clone().into_arc().map_err(|e| err("checking out the channel's files", e))?;
+    let outcome = gix::worktree::state::checkout(
+        &mut index,
+        root,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::new(false),
+        options,
+    )
+    .map_err(|e| err("checking out the channel's files", e))?;
+    if let Some(e) = outcome.errors.first() {
+        return Err(format!("checking out {}: {}", e.path, e.error));
+    }
+    if let Some(c) = outcome.collisions.first() {
+        return Err(format!("checking out {}: something else is in the way", c.path));
+    }
+    index.write(Default::default()).map_err(|e| err("updating git's index", e))?;
+    Ok(())
+}
+
+/// Whether the repository in `dir` has exactly `old`'s history (every ref,
+/// and HEAD's tree) and a clean folder.
+pub fn same_history(old: &Path, dir: &Path, main: bool) -> Result<(), String> {
+    if refs(old)? != refs(dir)? {
+        return Err("its branches don't match the old history".into());
+    }
+    if head_tree(old)? != head_tree(dir)? {
+        return Err("its files don't match the old history".into());
+    }
+    let left = status(dir, main)?;
+    if !left.is_empty() {
+        return Err(format!("its folder doesn't match its history ({})", left.join(", ")));
+    }
+    Ok(())
 }

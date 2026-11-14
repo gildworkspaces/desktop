@@ -279,6 +279,27 @@ try {
   assert.equal(refusedEdit.json.result.isError, true)
   assert.match(refusedEdit.json.result.content[0].text, /took over the view/)
   console.log('view: the agent edited in the shared view; Take over gave it back')
+
+  // The workspace is a folder on disk: gild.json lists its channels, and the
+  // doc saved in the window is a file in the channel's own repository.
+  const where = await driver.executeAsyncScript(`
+    const done = arguments[arguments.length - 1]
+    const call = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+    call('workspaces').then(ws => call('workspace_folder', { workspaceId: ws[0].id })).then(done, e => done({ error: String(e) }))
+  `)
+  assert.equal(where.error, undefined, where.error)
+  const wsFile = JSON.parse(readFileSync(join(where.path, 'gild.json'), 'utf8'))
+  assert.equal(wsFile.name, 'Demo workspace')
+  assert.deepEqual(wsFile.channels.map(c => [c.name, c.folder]), [['general', '.'], ['student-intake', 'channels/student-intake']])
+  assert.ok(existsSync(join(where.path, '.git')) && existsSync(join(where.path, 'channels/student-intake/.git')), 'each channel is a repository')
+  assert.match(readFileSync(join(where.path, 'channels/student-intake', doc.path), 'utf8'), /red folder, top drawer/)
+  // The workspace's menu offers to open it in the file manager (not clicked:
+  // CI has no file manager to open).
+  await driver.findElement(By.css('.side .wsname')).click()
+  const showItem = await driver.wait(until.elementLocated(By.css(".wsitems button[role='menuitem']")), 10000)
+  assert.match(await showItem.getText(), /Show in file manager/)
+  await driver.findElement(By.css('.side .wsname')).click()
+  console.log('folder:', where.path, where.show)
   await driver.findElement(By.xpath("//button[contains(@class,'tab') and normalize-space(.)='Docs']")).click()
 
   // @mentions wake the agent: the command from setup runs with the mention
@@ -369,7 +390,10 @@ try {
   const dir = `${out}/channels/student-intake`
   assert.equal(readFileSync(`${dir}/table.csv`, 'utf8').split('\n')[1], 'Jordan Lee,Northside,,Docs needed')
   assert.match(readFileSync(`${dir}/chat.md`, 'utf8'), /Northside sent three more students\./)
-  assert.ok(existsSync(`${dir}/history.git/HEAD`), 'the history is a git repository')
+  const copied = `${out}/workspace/channels/student-intake`
+  assert.ok(existsSync(`${copied}/.git/HEAD`), 'the history is a git repository')
+  assert.ok(existsSync(`${out}/workspace/gild.json`), 'the export holds the workspace folder')
+  assert.match(readFileSync(`${copied}/docs/intake-sop.md`, 'utf8'), /red folder/)
   assert.match(readFileSync(`${dir}/docs/intake-sop.md`, 'utf8'), /red folder/)
   assert.ok(existsSync(`${out}/export-viewer.html`))
   console.log('exported:', out)
@@ -397,9 +421,10 @@ try {
   const dir2 = `${imported.again}/channels/student-intake`
   assert.equal(readFileSync(`${dir2}/table.csv`, 'utf8'), readFileSync(`${dir}/table.csv`, 'utf8'))
   assert.equal(readFileSync(`${dir2}/docs/intake-sop.md`, 'utf8'), readFileSync(`${dir}/docs/intake-sop.md`, 'utf8'))
-  const tip = d => { const head = readFileSync(`${d}/history.git/HEAD`, 'utf8').trim().replace(/^ref: /, ''); return readFileSync(`${d}/history.git/${head}`, 'utf8').trim() }
-  assert.match(tip(dir), /^[0-9a-f]{40}$/)
-  assert.equal(tip(dir2), tip(dir), 'the same history, commit for commit')
+  const tip = d => { const head = readFileSync(`${d}/.git/HEAD`, 'utf8').trim().replace(/^ref: /, ''); return readFileSync(`${d}/.git/${head}`, 'utf8').trim() }
+  const copied2 = `${imported.again}/workspace/channels/student-intake`
+  assert.match(tip(copied), /^[0-9a-f]{40}$/)
+  assert.equal(tip(copied2), tip(copied), 'the same history, commit for commit')
   await driver.findElement(By.xpath("//button[contains(., 'All workspaces')]")).click()
   const cards = await driver.wait(until.elementsLocated(By.css('button.card')), 10000)
   assert.equal(cards.length, 2, 'the imported workspace is on the home screen')
