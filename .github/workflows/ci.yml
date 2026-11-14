@@ -5,10 +5,11 @@ on:
   pull_request:
 permissions:
   contents: read
-# Addis APS 11 says fresh mirab VMs. This org has no mirab runner yet, so the
-# jobs use the temporary host runners (Sami, 30 Oct). Each job runs inside a
-# fresh container that gets the checkout through stdin and writes nothing
-# back, so nothing is installed or left on the host.
+# This repo is public, so ordinary CI runs on GitHub-hosted runners (APS 11 as
+# amended by Sami, 10-12 Nov). Our own runners refuse public repos (their
+# runner group doesn't allow them), so a pull request from a fork never runs
+# on a fleet machine. Each job runs inside a fresh container that gets the
+# checkout through stdin, the same as it did on our runners.
 jobs:
   ci:
     strategy:
@@ -16,7 +17,7 @@ jobs:
       matrix:
         job: [web, native, app]
     name: ${{ matrix.job }}
-    runs-on: host-linux-x64
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: tar -c --exclude=.git . | docker run --rm -i node:24-bookworm bash -c 'mkdir /w && tar -x -C /w && cd /w && ci/linux.sh ${{ matrix.job }}'
